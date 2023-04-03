@@ -93,7 +93,7 @@ if __name__ == '__main__':
     favorite_lists_config = [
         {
             "uid": UPPER_UID,
-            "list_name_re": "午睡",  # 好听的翻唱.* # piano.*
+            "list_name_re": "piano.*",
             "convert_type": "wav"
         }
     ]
@@ -104,7 +104,7 @@ if __name__ == '__main__':
         ), TaskProgressColumn(), TimeElapsedColumn(), TimeRemainingColumn()
     )
     progress.start()
-    # 主入口
     loop = asyncio.new_event_loop()
     loop.run_until_complete(
         get_videos_from_favorite_list_by_cfg(credential=credential, config_list=favorite_lists_config, progress=progress))
+    progress.stop()

@@ -19,7 +19,6 @@ async def main(credential, uid):
     print(list_info)
 
 if __name__ == '__main__':
-    # 创建参数处理器
     parser = argparse.ArgumentParser()
     parser.add_argument('-buvid3', type=str, help='user buvid3')
     parser.add_argument('-bili_jct', type=str, help='user bili_jct')

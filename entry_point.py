@@ -17,7 +17,7 @@ def download_videos_from_given_upper_favorite_list(credential, uid, convert_type
         ), TaskProgressColumn(), TimeElapsedColumn(), TimeRemainingColumn()
     ) if progress else None
     progress.start() if progress else None
-    # 主入口
+    # entry
     loop = asyncio.new_event_loop()
     loop.run_until_complete(
         get_videos_from_favorite_list_by_cfg(credential=credential, config_list=favorite_lists_config, progress=progress))
@@ -31,7 +31,7 @@ def download_videos_from_given_favorite_list_id(credential, fid, convert_type="w
         ), TaskProgressColumn(), TimeElapsedColumn(), TimeRemainingColumn()
     ) if progress else None
     progress.start() if progress else None
-    # 主入口
+    # entry
     loop = asyncio.new_event_loop()
     loop.run_until_complete(
         videos_converter_from_given_favorite_list_id(credential=credential, convert_type=convert_type, favorite_list_id=fid, progress=progress))
@@ -46,7 +46,7 @@ def download_video_from_given_bvid(convert_type, bv_id, credential, page_idx=0, 
         ), TaskProgressColumn(), TimeElapsedColumn(), TimeRemainingColumn()
     ) if progress else None
     progress.start() if progress else None
-    # 主入口
+    # entry
     loop = asyncio.new_event_loop()
     loop.run_until_complete(
         video_converter(credential=credential, convert_type=convert_type, bv_id=bv_id,

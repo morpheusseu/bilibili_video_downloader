@@ -20,7 +20,7 @@ ACCOUNT = {}
 
 MAX_TRY_TIME = 3
 destination_location = "W:"
-# FFMPEG 可执行文件路径，最好加入环境变量
+# FFMPEG exe filepath, best add into system variable
 FFMPEG_PATH = "ffmpeg"
 
 
@@ -125,12 +125,11 @@ async def video_converter(convert_type, bv_id, credential, page_idx=0, cid=None,
             print("'.{}' is unsupported".format(cvt_type))
             return
     video_skip, audio_skip = type_skip_dict[get_skip_type(convert_type)]
-    # 实例化 Video 类
     video_ins = video.Video(bvid=bv_id, credential=credential)
     video_info = static_info if static_info else await video_ins.get_info()
     v_title = video_info["title"]
     v_upper = video_info["owner"]["name"]
-    # 获取视频下载链接
+    # get download url
     url = await retry_task(func=video_ins.get_download_url, max_retry_time=5, progress=progress)(page_index=page_idx, cid=cid)
     if url is None:
         return
@@ -153,7 +152,7 @@ async def video_converter(convert_type, bv_id, credential, page_idx=0, cid=None,
             print("{} skipped".format(output_filepath))
         return
     async with aiohttp.ClientSession() as sess:
-        # 下载视频流
+        # get video stream
         if video_skip:
             video_stream_index = progress.add_task(
                 '[yellow]skip video stream', total=0) if progress else None
@@ -171,7 +170,7 @@ async def video_converter(convert_type, bv_id, credential, page_idx=0, cid=None,
                         progress.update(video_stream_index, advance=len(
                             chunk)) if progress else None
                         f.write(chunk)
-        # 下载音频流
+        # get audio stream
         if audio_skip:
             audio_stream_index = progress.add_task(
                 '[yellow]skip audio stream', total=0) if progress else None
@@ -191,7 +190,7 @@ async def video_converter(convert_type, bv_id, credential, page_idx=0, cid=None,
                         f.write(chunk)
         progress.update(video_convert_index, description='[blue]converting {}.{} from {}'.format(
             v_title, convert_type, v_upper)) if progress else None
-        # 混流
+        # mix streams
         convert_via_ffmpeg(
             output_type=convert_type,
             input_files=[audio_temp_file] if video_skip else [
@@ -199,7 +198,7 @@ async def video_converter(convert_type, bv_id, credential, page_idx=0, cid=None,
             output_file=sanitize_filename(v_title),
             progress=progress
         )
-        # 删除临时文件
+        # delete temp file
         if not video_skip:
             os.remove(video_temp_file)
         if not audio_skip:
@@ -220,23 +219,3 @@ async def video_converter_batch(video_infos, convert_type, credential, progress)
         import random
         time.sleep(random.randint(1, 4))
         yield
-
-
-if __name__ == '__main__':
-    print(sanitize_filename(r"【AI ai\Neuro】world.execute(me); 【sovit3.0】.wav"))
-    exit(0)
-    # 初始化实例
-    target_vedio_BV = "BV1N24y1i7TG"
-    console = Console()
-    progress = Progress(
-        SpinnerColumn(), '{task.description}', BarColumn(), MofNCompleteColumn(
-        ), TaskProgressColumn(), TimeElapsedColumn(), TimeRemainingColumn()
-    )
-    progress.start()
-    # 实例化 Credential 类
-    credential = Credential(
-        sessdata=SESSDATA, bili_jct=BILI_JCT, buvid3=BUVID3)
-    # 主入口
-    loop = asyncio.new_event_loop()
-    loop.run_until_complete(video_converter(
-        convert_type="wav", bv_id=target_vedio_BV, credential=credential))

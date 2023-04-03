@@ -1,0 +1,31 @@
+[
+    {
+        "name": "download video from given bv_id",
+        "func_id": 0,
+        "params":{
+                    "bv_id": "",
+                    "convert_type": "wav",
+                    "page_idx": "0"
+                },
+        "func_name": "download_video_from_given_bvid"
+    },
+    {
+        "name": "download videos from given upper's favorite list",
+        "func_id": 10,
+        "params":{
+                    "uid": "",
+                    "list_name_re": "",
+                    "convert_type": "wav"
+                },
+        "func_name": "download_videos_from_given_upper_favorite_list"
+    },
+    {
+        "name": "download videos from given favorite list id",
+        "func_id": 11,
+        "params":{
+                    "fid": "",
+                    "convert_type": "wav"
+                },
+        "func_name": "download_videos_from_given_favorite_list_id"
+    }
+]

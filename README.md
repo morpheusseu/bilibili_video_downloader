@@ -19,7 +19,8 @@ To use this downloader, you can follow these steps:
 1. Clone this repository to your local machine.
 2. Install Python 3.10 if you haven't already.
 3. Install the required packages by running `pip install -r requirements.txt` in your terminal.
-4. Run `python main_window.py` in your terminal to start the GUI.
+4. Install [ffmpeg](https://ffmpeg.org/download.html) and update it into environment path(it use ffmpeg to mix streams).
+5. Run `python main_window.py` in your terminal to start the GUI.
 
 ## Modes
 
@@ -54,7 +55,8 @@ In mode 3, you can download all videos from a favorite list owned by a specific 
 1. 将此存储库克隆到本地计算机。
 2. 如果尚未安装，请安装 Python 3.10。
 3. 运行 `pip install -r requirements.txt` 以在终端中安装所需的软件包。
-4. 在终端中运行 `python main_window.py` 以启动 GUI。
+4. 安装[ffmpeg](https://ffmpeg.org/download.html)并将它的路径更新到环境变量（ffmpeg 用于混流）。
+5. 在终端中运行 `python main_window.py` 以启动 GUI。
 
 ---
 

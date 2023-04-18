@@ -7,6 +7,7 @@ from PyQt5.QtGui import QPalette, QColor, QIcon
 
 from utility.util import abspath_s
 sys.path.append(abspath_s(__file__, "../utility"))
+sys.path.append(abspath_s(__file__, "../widget"))
 
 
 class SettingPage(QDockWidget):

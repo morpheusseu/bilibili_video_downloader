@@ -1,9 +1,11 @@
 from copy import deepcopy
 from PyQt5 import QtWidgets
 from PyQt5.QtWidgets import QVBoxLayout, QHBoxLayout, QWidget, QCheckBox
+from multiprocessing import Process
+from threading import Thread, Lock
 
 
-def process(conf):
+def process_(conf):
     import entry_point as ep
     func_name = conf["func_name"]
     params = conf["params"]
@@ -55,7 +57,36 @@ class ParamsWidget(QWidget):
         target_cfg = deepcopy(self.cfg)
         target_cfg["params"]["credential"] = self.parent.credential
         target_cfg["params"]["progress"] = None if self.debug else True
-        process(conf=target_cfg)
+        from waiting_bar import start_new_bar
+        from entry_point import process
+        p = Process(target=start_new_bar, kwargs={
+                    "func": process, "params_dict": {"conf": target_cfg}})
+        p.start()
+        v = {1: True}
+        l = Lock()
+        Thread(target=self.waiting_worker, args=[p, v, l,]).start()
+        Thread(target=self.updating_worker, args=[v, l,]).start()
+
+    def waiting_worker(self, worker_proc, val, lock):
+        self.btn_submit.setEnabled(False)
+        worker_proc.join()
+        with lock:
+            val[1] = False
+
+    def updating_worker(self, val, lock):
+        import time
+        default_text = self.btn_submit.text()
+        i = 1
+        dot = ['', '.', '..', '...']
+        while i < 4:
+            self.btn_submit.setText("Executing {}".format(dot[i]))
+            with lock:
+                if not val[1]:
+                    break
+            time.sleep(0.5)
+            i = i + 1 if i < 3 else 1
+        self.btn_submit.setText(default_text)
+        self.btn_submit.setEnabled(True)
 
     def debug_mode(self):
         self.debug = self.check_rich.isChecked()

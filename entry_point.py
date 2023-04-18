@@ -1,5 +1,16 @@
 import asyncio
+import sys
 from rich.progress import Progress, BarColumn, MofNCompleteColumn, SpinnerColumn, TaskProgressColumn, TimeElapsedColumn, TimeRemainingColumn
+
+
+def process(conf):
+    ep = sys.modules[__name__]
+    func_name = conf["func_name"]
+    params = conf["params"]
+    if hasattr(ep, func_name):
+        getattr(ep, func_name)(**params)
+    else:
+        raise ValueError("func '{}' not defined")
 
 
 def download_videos_from_given_upper_favorite_list(credential, uid, convert_type="wav", list_name_re="", progress=None):

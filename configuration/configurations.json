@@ -27,5 +27,14 @@
                     "convert_type": "wav"
                 },
         "func_name": "download_videos_from_given_favorite_list_id"
+    },
+    {
+        "name": "download videos from given link (adjustment)",
+        "func_id": 100,
+        "params":{
+            "web_link": "",
+            "convert_type":"wav"
+        },
+        "func_name": "download_videos_from_given_link_adjustment"
     }
 ]

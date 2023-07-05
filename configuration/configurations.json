@@ -1,7 +1,16 @@
 [
     {
-        "name": "download video from given bv_id",
+        "name": "download videos from given link (adjustment)",
         "func_id": 0,
+        "params":{
+            "web_link": "",
+            "convert_type":"wav"
+        },
+        "func_name": "download_videos_from_given_link_adjustment"
+    },
+    {
+        "name": "download video from given bv_id",
+        "func_id": 1,
         "params":{
                     "bv_id": "",
                     "convert_type": "wav",
@@ -27,14 +36,5 @@
                     "convert_type": "wav"
                 },
         "func_name": "download_videos_from_given_favorite_list_id"
-    },
-    {
-        "name": "download videos from given link (adjustment)",
-        "func_id": 100,
-        "params":{
-            "web_link": "",
-            "convert_type":"wav"
-        },
-        "func_name": "download_videos_from_given_link_adjustment"
     }
 ]

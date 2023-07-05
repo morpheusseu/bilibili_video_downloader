@@ -37,7 +37,7 @@ async def get_video_infos_from_favorite_list_by_id(media_id, credential, pruned=
     return video_infos_list_pruned if pruned else video_infos_list
 
 
-async def videos_converter_from_given_favorite_list(favorite_lists, credential, convert_type='wav', progress=None):
+async def videos_converter_from_given_favorite_list(favorite_lists, credential, convert_type='wav', progress=None, conn=None):
     favorite_lists = favorite_lists if isinstance(
         favorite_lists, list) else [favorite_lists]
     list_convert_index = progress.add_task(
@@ -61,7 +61,7 @@ async def videos_converter_from_given_favorite_list(favorite_lists, credential, 
                             advance=1) if progress else None
 
 
-async def videos_converter_from_given_favorite_list_id(favorite_list_id, credential, convert_type='wav', progress=None):
+async def videos_converter_from_given_favorite_list_id(favorite_list_id, credential, convert_type='wav', progress=None, conn=None):
     video_infos = await get_video_infos_from_favorite_list_by_id(media_id=favorite_list_id, credential=credential)
     list_convert_index = progress.add_task(
         '[green]get videos from favorite list-{}'.format(favorite_list_id), total=len(video_infos)) if progress else None
@@ -77,7 +77,7 @@ async def videos_converter_from_given_favorite_list_id(favorite_list_id, credent
                         advance=1) if progress else None
 
 
-async def get_videos_from_favorite_list_by_cfg(credential, config_list, progress=None):
+async def get_videos_from_favorite_list_by_cfg(credential, config_list, progress=None, conn=None):
     """
         config_list = [{"uid":uid, "lise_name_re":lise_name_re, "convert_type":convert_type}, {...}, ...]
     """

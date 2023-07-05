@@ -103,7 +103,11 @@ async def get_video_info(video_ins: video.Video):
     return infos
 
 
-async def video_converter(convert_type, bv_id, credential, page_idx=0, cid=None, progress=None, static_info=None):
+all_pages = False
+
+
+async def video_converter(convert_type, bv_id, credential, page_idx=0, cid=None, progress=None, conn=None, static_info=None):
+    global all_pages
     type_skip_dict = {
         # (video_skip, audio_skip)
         "audio_only": (True, False),
@@ -127,86 +131,112 @@ async def video_converter(convert_type, bv_id, credential, page_idx=0, cid=None,
     video_skip, audio_skip = type_skip_dict[get_skip_type(convert_type)]
     video_ins = video.Video(bvid=bv_id, credential=credential)
     video_info = static_info if static_info else await video_ins.get_info()
+    v_num = int(video_info["videos"])
     v_title = video_info["title"]
     v_upper = video_info["owner"]["name"]
-    # get download url
-    url = await retry_task(func=video_ins.get_download_url, max_retry_time=5, progress=progress)(page_index=page_idx, cid=cid)
-    if url is None:
-        return
+    v_pages = video_info["pages"]
+    # print(video_info)
+    _destination_location = destination_location
 
-    HEADERS = {
-        "User-Agent": "Mozilla/5.0",
-        "Referer": "https://www.bilibili.com/"
-    }
-    video_temp_file = abspath_s(destination_location, 'video_temp.m4s')
-    audio_temp_file = abspath_s(destination_location, 'audio_temp.m4s')
-    video_convert_index = progress.add_task(
-        '[blue]get {}.{} from {}'.format(v_title, convert_type, v_upper), total=1) if progress else None
-    output_filepath = abspath_s(destination_location,
-                                '.'.join([sanitize_filename(v_title), convert_type]))
-    print('Q => {}'.format(output_filepath)) if progress is None else None
-    if os.path.isfile(output_filepath):
-        progress.update(video_convert_index,
-                        description='[yellow][Skip] {}.{}'.format(v_title, convert_type), advance=1) if progress else None
-        if progress is None:
-            print("{} skipped".format(output_filepath))
-        return
-    async with aiohttp.ClientSession() as sess:
-        # get video stream
-        if video_skip:
-            video_stream_index = progress.add_task(
-                '[yellow]skip video stream', total=0) if progress else None
-        else:
-            video_url = url["dash"]["video"][0]['baseUrl']
-            async with sess.get(video_url, headers=HEADERS) as resp:
-                length = resp.headers.get('content-length')
+    async def download_via_cid(video_ins=video_ins, progress=progress, page_idx=page_idx, cid=cid):
+        # get download url
+        url = await retry_task(func=video_ins.get_download_url, max_retry_time=5, progress=progress)(page_index=page_idx, cid=cid)
+        if url is None:
+            return
+
+        HEADERS = {
+            "User-Agent": "Mozilla/5.0",
+            "Referer": "https://www.bilibili.com/"
+        }
+        video_temp_file = abspath_s(_destination_location, 'video_temp.m4s')
+        audio_temp_file = abspath_s(_destination_location, 'audio_temp.m4s')
+        video_convert_index = progress.add_task(
+            '[blue]get {}.{} from {}'.format(v_title, convert_type, v_upper), total=1) if progress else None
+        output_filepath = abspath_s(_destination_location,
+                                    '.'.join([sanitize_filename(v_title), convert_type]))
+        print('Q => {}'.format(output_filepath)) if progress is None else None
+        print(output_filepath, os.path.isfile(output_filepath))
+        if os.path.isfile(output_filepath):
+            progress.update(video_convert_index,
+                            description='[yellow][Skip] {}.{}'.format(v_title, convert_type), advance=1) if progress else None
+            if progress is None:
+                print("{} skipped".format(output_filepath))
+            return
+        async with aiohttp.ClientSession() as sess:
+            # get video stream
+            if video_skip:
                 video_stream_index = progress.add_task(
-                    '[green]get video stream', total=int(length)) if progress else None
-                with open(video_temp_file, 'wb') as f:
-                    while True:
-                        chunk = await resp.content.read(1024)
-                        if not chunk:
-                            break
-                        progress.update(video_stream_index, advance=len(
-                            chunk)) if progress else None
-                        f.write(chunk)
-        # get audio stream
-        if audio_skip:
-            audio_stream_index = progress.add_task(
-                '[yellow]skip audio stream', total=0) if progress else None
-        else:
-            audio_url = url["dash"]["audio"][0]['baseUrl']
-            async with sess.get(audio_url, headers=HEADERS) as resp:
-                length = resp.headers.get('content-length')
+                    '[yellow]skip video stream', total=0) if progress else None
+            else:
+                video_url = url["dash"]["video"][0]['baseUrl']
+                async with sess.get(video_url, headers=HEADERS) as resp:
+                    length = resp.headers.get('content-length')
+                    video_stream_index = progress.add_task(
+                        '[green]get video stream', total=int(length)) if progress else None
+                    cur_task = [
+                        x for x in progress.tasks if x.id == video_stream_index][0] if progress else None
+                    with open(video_temp_file, 'wb') as f:
+                        while True:
+                            chunk = await resp.content.read(1024)
+                            if not chunk:
+                                break
+                            progress.update(video_stream_index, advance=len(
+                                chunk)) if progress else None
+                            f.write(chunk)
+                            # conn.send("v{}/{}".format(cur_task.fields['completed'], cur_task.fields['total'])) if progress else None
+            # get audio stream
+            if audio_skip:
                 audio_stream_index = progress.add_task(
-                    '[blue]get audio stream', total=int(length)) if progress else None
-                with open(audio_temp_file, 'wb') as f:
-                    while True:
-                        chunk = await resp.content.read(1024)
-                        if not chunk:
-                            break
-                        progress.update(audio_stream_index, advance=len(
-                            chunk)) if progress else None
-                        f.write(chunk)
-        progress.update(video_convert_index, description='[blue]converting {}.{} from {}'.format(
-            v_title, convert_type, v_upper)) if progress else None
-        # mix streams
-        convert_via_ffmpeg(
-            output_type=convert_type,
-            input_files=[audio_temp_file] if video_skip else [
-                video_temp_file] if audio_skip else [audio_temp_file, video_temp_file],
-            output_file=sanitize_filename(v_title),
-            progress=progress
-        )
-        # delete temp file
-        if not video_skip:
-            os.remove(video_temp_file)
-        if not audio_skip:
-            os.remove(audio_temp_file)
-        progress.remove_task(video_stream_index) if progress else None
-        progress.remove_task(audio_stream_index) if progress else None
-        progress.update(video_convert_index, advance=1, description='[green][Done] get {}.{} from {}'.format(
-            v_title, convert_type, v_upper)) if progress else None
+                    '[yellow]skip audio stream', total=0) if progress else None
+            else:
+                audio_url = url["dash"]["audio"][0]['baseUrl']
+                async with sess.get(audio_url, headers=HEADERS) as resp:
+                    length = resp.headers.get('content-length')
+                    audio_stream_index = progress.add_task(
+                        '[blue]get audio stream', total=int(length)) if progress else None
+                    cur_task = [
+                        x for x in progress.tasks if x.id == audio_stream_index][0] if progress else None
+                    with open(audio_temp_file, 'wb') as f:
+                        while True:
+                            chunk = await resp.content.read(1024)
+                            if not chunk:
+                                break
+                            progress.update(audio_stream_index, advance=len(
+                                chunk)) if progress else None
+                            f.write(chunk)
+                            # print(dir(progress), '\n\n\n', audio_stream_index, progress.tasks, cur_task.fields)
+                            # conn.send("a{}/{}".format(cur_task.completed, cur_task.total)) if progress else None # every itr has to draw, it cost much
+            progress.update(video_convert_index, description='[blue]converting {}.{} from {}'.format(
+                v_title, convert_type, v_upper)) if progress else None
+            # mix streams
+            convert_via_ffmpeg(
+                output_type=convert_type,
+                input_files=[audio_temp_file] if video_skip else [
+                    video_temp_file] if audio_skip else [audio_temp_file, video_temp_file],
+                output_file=output_filepath.split('.')[0],
+                progress=progress
+            )
+            # delete temp file
+            if not video_skip:
+                os.remove(video_temp_file)
+            if not audio_skip:
+                os.remove(audio_temp_file)
+            progress.remove_task(video_stream_index) if progress else None
+            progress.remove_task(audio_stream_index) if progress else None
+            progress.update(video_convert_index, advance=1, description='[green][Done] get {}.{} from {}'.format(
+                v_title, convert_type, v_upper)) if progress else None
+
+    if all_pages and v_num > 1:
+        _destination_location = abspath_s(
+            destination_location, sanitize_filename(v_title))
+        os.mkdir(_destination_location) if not os.path.isdir(
+            _destination_location) else None
+        for page in v_pages:
+            cid = page["cid"]
+            v_title = page["part"]
+            await download_via_cid(cid=cid)
+    else:
+        await download_via_cid()
 
 
 async def video_converter_batch(video_infos, convert_type, credential, progress):

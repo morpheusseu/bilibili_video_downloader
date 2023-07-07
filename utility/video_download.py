@@ -7,7 +7,8 @@ from bilibili_api import video, Credential
 from rich.console import Console
 from rich.progress import Progress, BarColumn, MofNCompleteColumn, SpinnerColumn, TaskProgressColumn, TimeElapsedColumn, TimeRemainingColumn
 from pathvalidate import sanitize_filename
-from util import abspath_s, retry_task
+from util import abspath_s, retry_task, transmit_progress_msg_thread
+from threading import Thread
 
 passport = abspath_s(__file__, "../../configuration/passport.json")
 user_config = abspath_s(
@@ -155,7 +156,6 @@ async def video_converter(convert_type, bv_id, credential, page_idx=0, cid=None,
         output_filepath = abspath_s(_destination_location,
                                     '.'.join([sanitize_filename(v_title), convert_type]))
         print('Q => {}'.format(output_filepath)) if progress is None else None
-        print(output_filepath, os.path.isfile(output_filepath))
         if os.path.isfile(output_filepath):
             progress.update(video_convert_index,
                             description='[yellow][Skip] {}.{}'.format(v_title, convert_type), advance=1) if progress else None
@@ -175,6 +175,8 @@ async def video_converter(convert_type, bv_id, credential, page_idx=0, cid=None,
                         '[green]get video stream', total=int(length)) if progress else None
                     cur_task = [
                         x for x in progress.tasks if x.id == video_stream_index][0] if progress else None
+                    Thread(target=transmit_progress_msg_thread, kwargs={
+                           "task": cur_task, "conn": conn, "level": 0, "extra_msg_before": "vp", "slot_sec": 0.01}).start() if progress else None
                     with open(video_temp_file, 'wb') as f:
                         while True:
                             chunk = await resp.content.read(1024)
@@ -183,7 +185,6 @@ async def video_converter(convert_type, bv_id, credential, page_idx=0, cid=None,
                             progress.update(video_stream_index, advance=len(
                                 chunk)) if progress else None
                             f.write(chunk)
-                            # conn.send("v{}/{}".format(cur_task.fields['completed'], cur_task.fields['total'])) if progress else None
             # get audio stream
             if audio_skip:
                 audio_stream_index = progress.add_task(
@@ -196,6 +197,8 @@ async def video_converter(convert_type, bv_id, credential, page_idx=0, cid=None,
                         '[blue]get audio stream', total=int(length)) if progress else None
                     cur_task = [
                         x for x in progress.tasks if x.id == audio_stream_index][0] if progress else None
+                    Thread(target=transmit_progress_msg_thread, kwargs={
+                           "task": cur_task, "conn": conn, "level": 0, "extra_msg_before": "ap", "slot_sec": 0.01}).start() if progress else None
                     with open(audio_temp_file, 'wb') as f:
                         while True:
                             chunk = await resp.content.read(1024)
@@ -204,8 +207,6 @@ async def video_converter(convert_type, bv_id, credential, page_idx=0, cid=None,
                             progress.update(audio_stream_index, advance=len(
                                 chunk)) if progress else None
                             f.write(chunk)
-                            # print(dir(progress), '\n\n\n', audio_stream_index, progress.tasks, cur_task.fields)
-                            # conn.send("a{}/{}".format(cur_task.completed, cur_task.total)) if progress else None # every itr has to draw, it cost much
             progress.update(video_convert_index, description='[blue]converting {}.{} from {}'.format(
                 v_title, convert_type, v_upper)) if progress else None
             # mix streams

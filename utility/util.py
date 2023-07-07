@@ -1,6 +1,6 @@
 import os
 import time
-import asyncio
+# import asyncio
 
 
 def abspath_s(*arg):
@@ -24,6 +24,15 @@ def retry_task(func, max_retry_time=3, msg="dealing", progress=None):
             get_url_index, description='[red][Failed]{} ({} times retried)'.format(msg, max_retry_time)) if progress else None
         return None
     return wrapper
+
+
+def transmit_progress_msg_thread(task, conn, level, extra_msg_before='', extra_msg_after='', slot_sec=0.02):
+    from time import sleep
+    while not task.finished:
+        msg = '{}:{}|{}|{}'.format(
+            level, extra_msg_before, '{}/{}'.format(task.completed, task.total), extra_msg_after)
+        conn.send(msg)
+        sleep(slot_sec) if slot_sec >= 0.02 else sleep(0.02)
 
 
 '''

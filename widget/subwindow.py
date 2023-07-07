@@ -102,8 +102,8 @@ class ParamsWidget(QWidget):
             with lock:
                 if not val[1]:
                     break
-            time.sleep(0.5)
-            i = i + 1 if i < 3 else 1
+            time.sleep(0.001)
+            # i = i + 1 if i < 3 else 1
         self.btn_submit.setText(default_text)
         self.btn_submit.setEnabled(True)
 

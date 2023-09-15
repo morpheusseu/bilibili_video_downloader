@@ -39,14 +39,25 @@ def transmit_progress_msg_thread(task, conn, level, extra_msg_before='', extra_m
 
 
 def transmit_progress_msg(task, conn, level, extra_msg_before='', extra_msg_after=''):
-    msg = '{}@{}:{}|{}|{}'.format(
-        level, task.description, extra_msg_before, '{}/{}'.format(task.completed, task.total), extra_msg_after)
+    if task is None:
+        msg = '{}@{}:{}|{}|{}'.format(level, '|', extra_msg_before, '|', extra_msg_after)
+    else:
+        msg = '{}@{}:{}|{}|{}'.format(
+            level, task.description, extra_msg_before, '{}/{}'.format(task.completed, task.total), extra_msg_after)
     conn.send(msg)
 
 
 def time_format_sec2hhmmss(sec):
     from time import strftime, gmtime
     return strftime("%H:%M:%S", gmtime(int(sec)))
+
+
+def get_self_user_info(credential):
+    from bilibili_api.user import get_self_info
+    from asyncio import new_event_loop
+    user_info = new_event_loop().run_until_complete(get_self_info(credential=credential))
+    return user_info
+
 
 
 '''

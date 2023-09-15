@@ -146,11 +146,14 @@ class ParamsWidget(QWidget):
                     if conn.poll():
                         message = conn.recv()
                         if isinstance(message, str):
-                            if message.startswith('1@'):
+                            if message.startswith('0@'):
+                                self.console1.setText(message.split('@')[1])
+                            elif message.startswith('1@'):
                                 self.append_text4thread(message.split('@')[1])
                                 # self.console.appendPlainText(message.split('@')[1])
-                            else:
-                                self.console1.setText(message.split('@')[1])
+                            elif message.startswith('5@'):
+                                url = [x for x in message.split('@')[1][2:].split('|') if x][0]
+                                self.parent.dock_present_page.load_image_from_url(url)
                 except Exception as e:
                     print('conn end#{}'.format(str(e)))
                     conn.close()

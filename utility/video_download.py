@@ -137,6 +137,7 @@ async def video_converter(convert_type, bv_id, credential, page_idx=0, cid=None,
     v_num = 1 if "videos" not in video_info else int(video_info["videos"])
     v_title = video_info["title"]
     v_upper = video_info["owner"]["name"]
+    v_pic = video_info["pic"]
     v_pages = [] if "pages" not in video_info else video_info["pages"]
     # print(video_info)
     _destination_location = destination_location
@@ -172,6 +173,7 @@ async def video_converter(convert_type, bv_id, credential, page_idx=0, cid=None,
             if progress is None:
                 print("{} skipped".format(output_filepath))
             return
+        transmit_progress_msg(task=None, level=5, conn=conn, extra_msg_before=v_pic) if progress else None
         async with aiohttp.ClientSession() as sess:
             # get video stream
             if video_skip:

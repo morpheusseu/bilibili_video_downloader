@@ -1,3 +1,7 @@
 configuration/user_configurations.json
 configuration/passport.json
 __pycache__/
+venv/
+image.png
+qrcode.png
+tmp.json

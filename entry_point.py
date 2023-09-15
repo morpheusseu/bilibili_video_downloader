@@ -1,7 +1,7 @@
 import asyncio
-import sys
 from rich.progress import Progress, BarColumn, MofNCompleteColumn, SpinnerColumn, TaskProgressColumn, TimeElapsedColumn, TimeRemainingColumn
-# all_pages = False
+# necessary sys
+import sys
 
 
 def process(conf, conn):
@@ -9,9 +9,8 @@ def process(conf, conn):
     func_name = conf["func_name"]
     params = conf["params"]
     params["conn"] = conn
-    # global all_pages
     import utility.video_download as vd
-    vd.all_pages = True if params["all_pages"] == True else False
+    vd.all_pages = True if params["all_pages"] is True else False
     del params["all_pages"]
 
     if hasattr(ep, func_name):

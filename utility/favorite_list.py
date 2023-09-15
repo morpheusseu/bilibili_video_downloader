@@ -54,10 +54,11 @@ async def videos_converter_from_given_favorite_list(favorite_lists, credential, 
             v_bvid = v_info["bvid"]
             v_title = v_info["title"]
             v_upper = v_info["upper"]
-            await video_converter(convert_type=convert_type, bv_id=v_bvid, credential=credential, page_idx=0, progress=progress, static_info={"title": v_title, "owner": v_info["owner"]}, conn=conn)
-            import time
-            import random
-            time.sleep(random.randint(1, 4))
+            static_info = {"title": v_title, "owner": v_info["owner"]}
+            await video_converter(convert_type=convert_type, bv_id=v_bvid, credential=credential, page_idx=0, progress=progress, static_info=None if progress else static_info, conn=conn)
+            from time import sleep
+            from random import randint
+            sleep(randint(1, 4))
             progress.update(list_convert_index,
                             advance=1) if progress else None
 
@@ -76,9 +77,8 @@ async def videos_converter_from_given_favorite_list_id(favorite_list_id, credent
         v_bvid = v_info["bvid"]
         v_title = v_info["title"]
         v_upper = v_info["upper"]
-        print(v_bvid, v_title, v_upper)
-        await video_converter(convert_type=convert_type, bv_id=v_bvid, credential=credential, page_idx=0, progress=progress, static_info={"title": v_title, "owner": v_info["owner"]}, conn=conn)
-        print(v_bvid, v_title, v_upper)
+        static_info = {"title": v_title, "owner": v_info["owner"]}
+        await video_converter(convert_type=convert_type, bv_id=v_bvid, credential=credential, page_idx=0, progress=progress, static_info=None if progress else static_info, conn=conn)
         sleep(randint(1, 10) * 0.1)
         progress.update(list_convert_index,
                         advance=1) if progress else None

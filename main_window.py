@@ -2,12 +2,97 @@ import os
 import sys
 import json
 from PyQt5 import QtWidgets
-from PyQt5.QtWidgets import QApplication, QMainWindow, QVBoxLayout, QHBoxLayout, QDockWidget, QWidget, QComboBox, QPushButton
-from PyQt5.QtGui import QPalette, QColor, QIcon
+from PyQt5.QtWidgets import QApplication, QMainWindow, QVBoxLayout, QHBoxLayout, QDockWidget, QWidget, QComboBox, QPushButton, QLabel
+from PyQt5.QtGui import QPalette, QColor, QIcon, QPixmap
+from PyQt5.QtCore import Qt
+from asyncio import new_event_loop
+from requests import get as req_get
+from threading import Thread
+from multiprocessing import Process
+from time import sleep
 
-from utility.util import abspath_s
+from utility.util import abspath_s, get_self_user_info
+from utility.qrcode_login import Login
 sys.path.append(abspath_s(__file__, "../utility"))
 sys.path.append(abspath_s(__file__, "../widget"))
+
+
+class PresentPage(QDockWidget):
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.parent = parent
+        self.online = False
+        self.main_widget = QWidget()
+        self.setFeatures(QDockWidget.DockWidgetMovable)
+        self.image_label = QLabel()
+        # self.image_label.setFixedWidth(250)
+        layout = QVBoxLayout()
+        layout.addWidget(self.image_label, alignment=Qt.AlignCenter)
+        self.main_widget.setLayout(layout)
+        self.setWidget(self.main_widget)
+        self.setWindowTitle("Present Page")
+        Thread(target=self.get_user, args=[self.parent.credential, ]).start()
+
+    def get_user(self, credential):
+        from bilibili_api.user import get_self_info
+        loop = new_event_loop()
+        while True:
+            try:
+                try:
+                    self.isHidden()
+                except RuntimeError:
+                    return
+                p = Process(target=get_self_user_info, kwargs={'credential': credential})
+                p.start()
+                p.join()
+                if p.exitcode == 1:
+                    raise NotImplementedError
+                if self.online:
+                    # heart beats
+                    continue
+                user_info = loop.run_until_complete(get_self_info(credential=credential))
+                print(user_info)
+                self.setWindowTitle(f"welcome! {user_info['name']} (lv.{5})")
+                self.load_image_from_url(user_info['face'])
+                self.online = True
+                sleep(1)
+            except NotImplementedError:
+                self.setWindowTitle("please login via qrcode")
+                ins = Login(show_qrcode_method=self.load_image, after_method=self.process_cookies)
+                t = Thread(target=ins.login, args=[])
+                t.start()
+                break
+
+    def process_cookies(self, cookies):
+        print(f'get cookies {cookies}')
+        setting_page = self.parent.dock_setting_page
+        setting_page: SettingPage
+        for key in cookies:
+            if key.lower() == 'sessdata':
+                getattr(setting_page, "lineedit_SESSDATA").setText(cookies[key])
+            elif key.lower() == 'bili_jct':
+                getattr(setting_page, "lineedit_BILI_JCT").setText(cookies[key])
+            elif key.lower() == 'buvid3':
+                getattr(setting_page, "lineedit_BUVID3").setText(cookies[key])
+        setting_page.on_button_click()
+        Thread(target=self.get_user, args=[self.parent.credential, ]).start()
+
+    def load_image_from_url(self, url):
+        # Save the image data to a file
+        with open('image.png', 'wb') as f:
+            f.write(req_get(url).content)
+        # Load the image into a QPixmap
+        pixmap = QPixmap('image.png')
+        pixmap = pixmap.scaled(250, 250, Qt.KeepAspectRatio)
+        self.setFixedSize(pixmap.width()+50, pixmap.height()+50)
+        self.image_label.setPixmap(pixmap)
+
+    def load_image(self, filepath):
+        pixmap = QPixmap()
+        pixmap.load(filepath)
+        self.setFixedSize(pixmap.width()+50, pixmap.height()+50)
+        self.image_label.setPixmap(pixmap)
 
 
 class SettingPage(QDockWidget):
@@ -18,8 +103,7 @@ class SettingPage(QDockWidget):
         self.parent = parent
         self.init_values()
         self.main_widget = QWidget()
-        self.setFeatures(
-            QDockWidget.DockWidgetMovable | QDockWidget.DockWidgetFloatable)
+        self.setFeatures(QDockWidget.DockWidgetMovable | QDockWidget.DockWidgetFloatable)
         self.setWindowTitle("Bilibili-api settings")
         with open(self.user_config) as r_f:
             self.user_cfg_content = json.load(r_f)
@@ -84,8 +168,7 @@ class OperatePage(QDockWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.parent = parent
-        self.setFeatures(
-            QDockWidget.DockWidgetMovable | QDockWidget.DockWidgetFloatable)
+        self.setFeatures(QDockWidget.NoDockWidgetFeatures)
         self.init_value()
         self.setWindowTitle("Bilibili-api operator")
         self.main_widget = QWidget()
@@ -142,11 +225,13 @@ class MainWindow(QMainWindow):
         self.setWindowIcon(QIcon(abspath_s(__file__, "../icon.png")))
         self.dock_setting_page = SettingPage(parent=self)
         self.dock_operate_page = OperatePage(parent=self)
+        self.dock_present_page = PresentPage(parent=self)
         self.change_style(self)
         self.change_style(self.dock_setting_page)
         self.change_style(self.dock_operate_page)
         self.addDockWidget(1, self.dock_operate_page)
         self.addDockWidget(2, self.dock_setting_page)
+        self.addDockWidget(2, self.dock_present_page)
 
     @property
     def credential(self):

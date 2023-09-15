@@ -26,13 +26,27 @@ def retry_task(func, max_retry_time=3, msg="dealing", progress=None):
     return wrapper
 
 
-def transmit_progress_msg_thread(task, conn, level, extra_msg_before='', extra_msg_after='', slot_sec=0.02):
+def transmit_progress_msg_thread(task, conn, level, extra_msg_before='', extra_msg_after='', slot_sec=0.02, mk_complete=True):
     from time import sleep
     while not task.finished:
-        msg = '{}:{}|{}|{}'.format(
-            level, extra_msg_before, '{}/{}'.format(task.completed, task.total), extra_msg_after)
-        conn.send(msg)
+        transmit_progress_msg(
+            task, conn, level, extra_msg_before, extra_msg_after)
         sleep(slot_sec) if slot_sec >= 0.02 else sleep(0.02)
+    if mk_complete:
+        msg = '{}@{}:{}|{}|{}'.format(level, task.description, extra_msg_before,
+                                      '{}/{}'.format(task.total, task.total), extra_msg_after)
+        conn.send(msg)
+
+
+def transmit_progress_msg(task, conn, level, extra_msg_before='', extra_msg_after=''):
+    msg = '{}@{}:{}|{}|{}'.format(
+        level, task.description, extra_msg_before, '{}/{}'.format(task.completed, task.total), extra_msg_after)
+    conn.send(msg)
+
+
+def time_format_sec2hhmmss(sec):
+    from time import strftime, gmtime
+    return strftime("%H:%M:%S", gmtime(int(sec)))
 
 
 '''

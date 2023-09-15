@@ -53,7 +53,7 @@ def download_videos_from_given_favorite_list_id(credential, fid, convert_type="w
     # entry
     loop = asyncio.new_event_loop()
     loop.run_until_complete(
-        videos_converter_from_given_favorite_list_id(credential=credential, convert_type=convert_type, favorite_list_id=fid, progress=progress))
+        videos_converter_from_given_favorite_list_id(credential=credential, convert_type=convert_type, favorite_list_id=fid, progress=progress, conn=conn))
     progress.stop() if progress else None
 
 

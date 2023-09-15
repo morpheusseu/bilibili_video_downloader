@@ -34,7 +34,9 @@ class TaskBar(QDialog):
 
 
 def start_new_bar(func, params_dict):
+    '''
     import sys
     app = QApplication(sys.argv)
     TaskBar(func=func, params_dict=params_dict)
-    sys.exit(app.exec_())
+    sys.exit(app.exec_())'''
+    func(**params_dict)

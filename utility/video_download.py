@@ -7,7 +7,7 @@ from bilibili_api import video, Credential
 from rich.console import Console
 from rich.progress import Progress, BarColumn, MofNCompleteColumn, SpinnerColumn, TaskProgressColumn, TimeElapsedColumn, TimeRemainingColumn
 from pathvalidate import sanitize_filename
-from util import abspath_s, retry_task, transmit_progress_msg_thread
+from util import abspath_s, retry_task, transmit_progress_msg_thread, transmit_progress_msg, time_format_sec2hhmmss
 from threading import Thread
 
 passport = abspath_s(__file__, "../../configuration/passport.json")
@@ -105,10 +105,12 @@ async def get_video_info(video_ins: video.Video):
 
 
 all_pages = False
+max_progress_index_count = 5
 
 
 async def video_converter(convert_type, bv_id, credential, page_idx=0, cid=None, progress=None, conn=None, static_info=None):
     global all_pages
+    global max_progress_index_count
     type_skip_dict = {
         # (video_skip, audio_skip)
         "audio_only": (True, False),
@@ -132,10 +134,10 @@ async def video_converter(convert_type, bv_id, credential, page_idx=0, cid=None,
     video_skip, audio_skip = type_skip_dict[get_skip_type(convert_type)]
     video_ins = video.Video(bvid=bv_id, credential=credential)
     video_info = static_info if static_info else await video_ins.get_info()
-    v_num = int(video_info["videos"])
+    v_num = 1 if "videos" not in video_info else int(video_info["videos"])
     v_title = video_info["title"]
     v_upper = video_info["owner"]["name"]
-    v_pages = video_info["pages"]
+    v_pages = [] if "pages" not in video_info else video_info["pages"]
     # print(video_info)
     _destination_location = destination_location
 
@@ -153,12 +155,20 @@ async def video_converter(convert_type, bv_id, credential, page_idx=0, cid=None,
         audio_temp_file = abspath_s(_destination_location, 'audio_temp.m4s')
         video_convert_index = progress.add_task(
             '[blue]get {}.{} from {}'.format(v_title, convert_type, v_upper), total=1) if progress else None
+        video_convert_task = [
+            x for x in progress.tasks if x.id == video_convert_index][0] if progress else None
+        if progress and len(progress.tasks) > max_progress_index_count:
+            finished_1st_task_id = [
+                task.id for task in progress.tasks if task.finished][0]
+            progress.remove_task(finished_1st_task_id)
         output_filepath = abspath_s(_destination_location,
                                     '.'.join([sanitize_filename(v_title), convert_type]))
         print('Q => {}'.format(output_filepath)) if progress is None else None
         if os.path.isfile(output_filepath):
             progress.update(video_convert_index,
                             description='[yellow][Skip] {}.{}'.format(v_title, convert_type), advance=1) if progress else None
+            transmit_progress_msg(task=video_convert_task,
+                                  conn=conn, level=1, extra_msg_after=time_format_sec2hhmmss(video_convert_task.finished_time if video_convert_task.finished_time else 0)) if progress else None
             if progress is None:
                 print("{} skipped".format(output_filepath))
             return
@@ -185,6 +195,8 @@ async def video_converter(convert_type, bv_id, credential, page_idx=0, cid=None,
                             progress.update(video_stream_index, advance=len(
                                 chunk)) if progress else None
                             f.write(chunk)
+                    progress.update(video_convert_index, total=video_convert_task.total + cur_task.total, completed=video_convert_task.completed +
+                                    cur_task.completed, finished_time=cur_task.finished_time if not video_convert_task.finished_time else video_convert_task.finished_time+cur_task.finished_time) if progress else None
             # get audio stream
             if audio_skip:
                 audio_stream_index = progress.add_task(
@@ -207,6 +219,8 @@ async def video_converter(convert_type, bv_id, credential, page_idx=0, cid=None,
                             progress.update(audio_stream_index, advance=len(
                                 chunk)) if progress else None
                             f.write(chunk)
+                    progress.update(video_convert_index, total=video_convert_task.total + cur_task.total, completed=video_convert_task.completed +
+                                    cur_task.completed, finished_time=cur_task.finished_time if not video_convert_task.finished_time else video_convert_task.finished_time+cur_task.finished_time) if progress else None
             progress.update(video_convert_index, description='[blue]converting {}.{} from {}'.format(
                 v_title, convert_type, v_upper)) if progress else None
             # mix streams
@@ -214,7 +228,8 @@ async def video_converter(convert_type, bv_id, credential, page_idx=0, cid=None,
                 output_type=convert_type,
                 input_files=[audio_temp_file] if video_skip else [
                     video_temp_file] if audio_skip else [audio_temp_file, video_temp_file],
-                output_file=output_filepath.split('.')[0],
+                # output_filepath.split('.')[0],
+                output_file='.'.join(output_filepath.split('.')[:-1]),
                 progress=progress
             )
             # delete temp file
@@ -224,8 +239,10 @@ async def video_converter(convert_type, bv_id, credential, page_idx=0, cid=None,
                 os.remove(audio_temp_file)
             progress.remove_task(video_stream_index) if progress else None
             progress.remove_task(audio_stream_index) if progress else None
-            progress.update(video_convert_index, advance=1, description='[green][Done] get {}.{} from {}'.format(
-                v_title, convert_type, v_upper)) if progress else None
+            progress.update(video_convert_index, description='[green][Done] get {}.{} from {}'.format(
+                v_title, convert_type, v_upper), advance=1) if progress else None
+            transmit_progress_msg(task=video_convert_task,
+                                  conn=conn, level=1, extra_msg_after=time_format_sec2hhmmss(video_convert_task.finished_time if video_convert_task.finished_time else 0)) if progress else None
 
     if all_pages and v_num > 1:
         _destination_location = abspath_s(
@@ -235,7 +252,11 @@ async def video_converter(convert_type, bv_id, credential, page_idx=0, cid=None,
         for page in v_pages:
             cid = page["cid"]
             v_title = page["part"]
-            await download_via_cid(cid=cid)
+            try:
+                await download_via_cid(cid=cid)
+            except Exception as e:
+                print('error:{}.dvc'.format(str(e)))
+            time.sleep(0.1)
     else:
         await download_via_cid()
 

@@ -3,6 +3,7 @@ from bilibili_api import favorite_list, Credential
 import asyncio
 import re
 from rich.progress import Progress, BarColumn, MofNCompleteColumn, SpinnerColumn, TaskProgressColumn, TimeElapsedColumn, TimeRemainingColumn
+from util import transmit_progress_msg
 
 UPPER_UID = 398421039
 ITEM_PER_PAGE = 20
@@ -53,7 +54,7 @@ async def videos_converter_from_given_favorite_list(favorite_lists, credential, 
             v_bvid = v_info["bvid"]
             v_title = v_info["title"]
             v_upper = v_info["upper"]
-            await video_converter(convert_type=convert_type, bv_id=v_bvid, credential=credential, page_idx=0, progress=progress, static_info={"title": v_title, "owner": v_info["owner"]})
+            await video_converter(convert_type=convert_type, bv_id=v_bvid, credential=credential, page_idx=0, progress=progress, static_info={"title": v_title, "owner": v_info["owner"]}, conn=conn)
             import time
             import random
             time.sleep(random.randint(1, 4))
@@ -62,19 +63,27 @@ async def videos_converter_from_given_favorite_list(favorite_lists, credential, 
 
 
 async def videos_converter_from_given_favorite_list_id(favorite_list_id, credential, convert_type='wav', progress=None, conn=None):
+    from time import sleep
+    from random import randint
     video_infos = await get_video_infos_from_favorite_list_by_id(media_id=favorite_list_id, credential=credential)
     list_convert_index = progress.add_task(
         '[green]get videos from favorite list-{}'.format(favorite_list_id), total=len(video_infos)) if progress else None
+    list_convert_task = [task for task in progress.tasks if task.id ==
+                         list_convert_index][0] if progress else None
+    transmit_progress_msg(task=list_convert_task,
+                          conn=conn, level=1, extra_msg_before="[Begin]") if progress else None
     for v_info in video_infos:
         v_bvid = v_info["bvid"]
         v_title = v_info["title"]
         v_upper = v_info["upper"]
-        await video_converter(convert_type=convert_type, bv_id=v_bvid, credential=credential, page_idx=0, progress=progress, static_info={"title": v_title, "owner": v_info["owner"]})
-        import time
-        import random
-        time.sleep(random.randint(1, 4))
+        print(v_bvid, v_title, v_upper)
+        await video_converter(convert_type=convert_type, bv_id=v_bvid, credential=credential, page_idx=0, progress=progress, static_info={"title": v_title, "owner": v_info["owner"]}, conn=conn)
+        print(v_bvid, v_title, v_upper)
+        sleep(randint(1, 10) * 0.1)
         progress.update(list_convert_index,
                         advance=1) if progress else None
+    transmit_progress_msg(task=list_convert_task,
+                          conn=conn, level=1, extra_msg_before="[Finished]") if progress else None
 
 
 async def get_videos_from_favorite_list_by_cfg(credential, config_list, progress=None, conn=None):
@@ -86,7 +95,7 @@ async def get_videos_from_favorite_list_by_cfg(credential, config_list, progress
         list_name_re = cfg["list_name_re"]
         convert_type = cfg["convert_type"]
         target_favorite_lists = await get_favorite_lists_from_upper_by_uid(uid=uid, credential=credential, re_query=list_name_re)
-        await videos_converter_from_given_favorite_list(favorite_lists=target_favorite_lists, credential=credential, convert_type=convert_type, progress=progress)
+        await videos_converter_from_given_favorite_list(favorite_lists=target_favorite_lists, credential=credential, convert_type=convert_type, progress=progress, conn=conn)
 
 
 if __name__ == '__main__':

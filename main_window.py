@@ -1,20 +1,18 @@
 import os
 import sys
 import json
-from PyQt5 import QtWidgets
-from PyQt5.QtWidgets import QApplication, QMainWindow, QVBoxLayout, QHBoxLayout, QDockWidget, QWidget, QComboBox, QPushButton, QLabel
+from PyQt5.QtWidgets import QApplication, QMainWindow, QVBoxLayout, QHBoxLayout, QDockWidget, QWidget, QComboBox, QPushButton, QLabel, QLineEdit
 from PyQt5.QtGui import QPalette, QColor, QIcon, QPixmap
 from PyQt5.QtCore import Qt
 from asyncio import new_event_loop
 from requests import get as req_get
-from threading import Thread
-from multiprocessing import Process
+from threading import Thread, Lock
+from multiprocessing import freeze_support
 from time import sleep
-
-from utility.util import abspath_s, get_self_user_info
+from bilibili_api.user import get_self_info
+from bilibili_api import Credential
+from utility.util import abspath_s
 from utility.qrcode_login import Login
-sys.path.append(abspath_s(__file__, "../utility"))
-sys.path.append(abspath_s(__file__, "../widget"))
 
 
 class PresentPage(QDockWidget):
@@ -32,51 +30,81 @@ class PresentPage(QDockWidget):
         self.main_widget.setLayout(layout)
         self.setWidget(self.main_widget)
         self.setWindowTitle("Present Page")
-        Thread(target=self.get_user, args=[self.parent.credential, ]).start()
+        self.pwd_is_dirty = False
+        self.lock = Lock()
+        Thread(target=self.get_user, args=[lambda :self.parent.credential, ]).start()
 
-    def get_user(self, credential):
-        from bilibili_api.user import get_self_info
+
+    def dirty(self):
+        with self.lock:
+            val = self.pwd_is_dirty
+            self.pwd_is_dirty = False
+        return val
+
+    def set_dirty(self):
+        # once passport updated
+        with self.lock:
+            self.pwd_is_dirty = True
+
+    @staticmethod
+    def _get_self_user_info(credential, flag):
+        try:
+            new_event_loop().run_until_complete(get_self_info(credential=credential))
+        except Exception:
+            flag[0] = False
+            return
+        flag[0] = True
+
+    def get_user(self, credential_getter):
         loop = new_event_loop()
+        flag = [False]
         while True:
             try:
                 try:
                     self.isHidden()
                 except RuntimeError:
                     return
-                p = Process(target=get_self_user_info, kwargs={'credential': credential})
-                p.start()
-                p.join()
-                if p.exitcode == 1:
+                t = Thread(target=self._get_self_user_info, kwargs={'credential': credential_getter(), 'flag': flag})
+                t.start()
+                t.join()
+                if flag[0] is False:
                     raise NotImplementedError
                 if self.online:
                     # heart beats
                     continue
-                user_info = loop.run_until_complete(get_self_info(credential=credential))
-                print(user_info)
-                self.setWindowTitle(f"welcome! {user_info['name']} (lv.{5})")
+                user_info = loop.run_until_complete(get_self_info(credential=credential_getter()))
+                self.setWindowTitle(f"welcome! {user_info['name']} (lv.{user_info['level']})")
                 self.load_image_from_url(user_info['face'])
                 self.online = True
                 sleep(1)
             except NotImplementedError:
-                self.setWindowTitle("please login via qrcode")
-                ins = Login(show_qrcode_method=self.load_image, after_method=self.process_cookies)
+                self.online = False
+                try:
+                    self.setWindowTitle("please login via qrcode")
+                except NotImplementedError as e:
+                    # Windows Deleted might be
+                    print(f"Widgets Deleted: {e}")
+                    exit(0)
+                ins = Login(show_qrcode_method=self.load_image, after_method=self.process_cookies, interrupt_judge=self.dirty)
                 t = Thread(target=ins.login, args=[])
                 t.start()
+                t.join()
                 break
 
     def process_cookies(self, cookies):
-        print(f'get cookies {cookies}')
-        setting_page = self.parent.dock_setting_page
-        setting_page: SettingPage
-        for key in cookies:
-            if key.lower() == 'sessdata':
-                getattr(setting_page, "lineedit_SESSDATA").setText(cookies[key])
-            elif key.lower() == 'bili_jct':
-                getattr(setting_page, "lineedit_BILI_JCT").setText(cookies[key])
-            elif key.lower() == 'buvid3':
-                getattr(setting_page, "lineedit_BUVID3").setText(cookies[key])
-        setting_page.on_button_click()
-        Thread(target=self.get_user, args=[self.parent.credential, ]).start()
+        if cookies:
+            print(f'get cookies {cookies}')
+            setting_page = self.parent.dock_setting_page
+            setting_page: SettingPage
+            for key in cookies:
+                if key.lower() == 'sessdata':
+                    getattr(setting_page, "lineedit_SESSDATA").setText(cookies[key])
+                elif key.lower() == 'bili_jct':
+                    getattr(setting_page, "lineedit_BILI_JCT").setText(cookies[key])
+                elif key.lower() == 'buvid3':
+                    getattr(setting_page, "lineedit_BUVID3").setText(cookies[key])
+            setting_page.on_button_click()
+        Thread(target=self.get_user, args=[lambda :self.parent.credential, ]).start()
 
     def load_image_from_url(self, url):
         # Save the image data to a file
@@ -110,12 +138,13 @@ class SettingPage(QDockWidget):
         with open(self.passport) as r_f:
             self.passport_content = json.load(r_f)
         dynamic_widgets = []
-        for group in [self.passport_content, self.user_cfg_content]:
+        for idx, group in enumerate([self.passport_content, self.user_cfg_content]):
             for key in group:
-                setattr(self, "label_{}".format(key), QtWidgets.QLabel())
+                setattr(self, "label_{}".format(key), QLabel())
                 getattr(self, "label_{}".format(key)).setText(key)
-                setattr(self, "lineedit_{}".format(key), QtWidgets.QLineEdit())
+                setattr(self, "lineedit_{}".format(key), QLineEdit())
                 getattr(self, "lineedit_{}".format(key)).setText(group[key])
+                getattr(self, "lineedit_{}".format(key)).setEchoMode(QLineEdit.PasswordEchoOnEdit) if idx == 0 else None
                 if key in self.passport_content:
                     getattr(self, "lineedit_{}".format(key)).textChanged.connect(
                         lambda text, key=key: self.passport_content.update({key: text}))
@@ -149,11 +178,10 @@ class SettingPage(QDockWidget):
         self.credential = None
 
     def get_credential(self):
-        self.on_button_click()
+        # self.on_button_click()
         return self.credential
 
     def on_button_click(self):
-        from bilibili_api import Credential
         self.credential = Credential(
             sessdata=getattr(self, "lineedit_SESSDATA").text(),
             bili_jct=getattr(self, "lineedit_BILI_JCT").text(),
@@ -162,6 +190,7 @@ class SettingPage(QDockWidget):
         from utility.video_download import save_user_cfg, save_passport
         save_user_cfg(self.user_cfg_content)
         save_passport(self.passport_content)
+        self.parent.dock_present_page.set_dirty()
 
 
 class OperatePage(QDockWidget):
@@ -230,8 +259,9 @@ class MainWindow(QMainWindow):
         self.change_style(self.dock_setting_page)
         self.change_style(self.dock_operate_page)
         self.addDockWidget(1, self.dock_operate_page)
-        self.addDockWidget(2, self.dock_setting_page)
         self.addDockWidget(2, self.dock_present_page)
+        self.addDockWidget(2, self.dock_setting_page)
+        self.dock_setting_page.on_button_click()
 
     @property
     def credential(self):
@@ -257,13 +287,11 @@ class MainWindow(QMainWindow):
 
 def main():
     app = QApplication(sys.argv)
-    win = MainWindow()
+    win = MainWindow() # this line cause infinitely reopen, the origin is multiprocess, freeze_support needed
     win.show()
     sys.exit(app.exec_())
 
 
 if __name__ == "__main__":
-    '''with open(abspath_s(__file__, '../configuration/configurations.json'), 'r') as r_f:
-        conf = json.load(r_f)
-    print(conf)'''
+    freeze_support()
     main()

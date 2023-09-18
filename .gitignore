@@ -1,7 +1,11 @@
 configuration/user_configurations.json
 configuration/passport.json
 __pycache__/
+.idea/
 venv/
+build/
+dist/
+*.spec
 image.png
 qrcode.png
 tmp.json

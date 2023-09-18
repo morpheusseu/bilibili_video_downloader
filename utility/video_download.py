@@ -7,12 +7,17 @@ from bilibili_api import video, Credential
 from rich.console import Console
 from rich.progress import Progress, BarColumn, MofNCompleteColumn, SpinnerColumn, TaskProgressColumn, TimeElapsedColumn, TimeRemainingColumn
 from pathvalidate import sanitize_filename
-from util import abspath_s, retry_task, transmit_progress_msg_thread, transmit_progress_msg, time_format_sec2hhmmss
+
+from utility.util import abspath_s, retry_task, transmit_progress_msg_thread, transmit_progress_msg, time_format_sec2hhmmss
 from threading import Thread
+import sys
 
 passport = abspath_s(__file__, "../../configuration/passport.json")
-user_config = abspath_s(
-    __file__, "../../configuration/user_configurations.json")
+user_config = abspath_s(__file__, "../../configuration/user_configurations.json")
+if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+    # Running as compiled
+    passport = abspath_s(sys._MEIPASS, "configuration/passport.json")
+    user_config = abspath_s(sys._MEIPASS, "configuration/user_configurations.json")
 
 SESSDATA = ""
 BILI_JCT = ""
@@ -133,6 +138,7 @@ async def video_converter(convert_type, bv_id, credential, page_idx=0, cid=None,
             return
     video_skip, audio_skip = type_skip_dict[get_skip_type(convert_type)]
     video_ins = video.Video(bvid=bv_id, credential=credential)
+    print(f"in {__file__} get video_ins {video_ins} with credit {credential} and bvid {bv_id}")
     video_info = static_info if static_info else await video_ins.get_info()
     v_num = 1 if "videos" not in video_info else int(video_info["videos"])
     v_title = video_info["title"]

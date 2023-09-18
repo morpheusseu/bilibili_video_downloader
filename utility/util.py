@@ -1,6 +1,5 @@
 import os
 import time
-# import asyncio
 
 
 def abspath_s(*arg):
@@ -50,13 +49,6 @@ def transmit_progress_msg(task, conn, level, extra_msg_before='', extra_msg_afte
 def time_format_sec2hhmmss(sec):
     from time import strftime, gmtime
     return strftime("%H:%M:%S", gmtime(int(sec)))
-
-
-def get_self_user_info(credential):
-    from bilibili_api.user import get_self_info
-    from asyncio import new_event_loop
-    user_info = new_event_loop().run_until_complete(get_self_info(credential=credential))
-    return user_info
 
 
 

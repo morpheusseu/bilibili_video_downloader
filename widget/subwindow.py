@@ -4,6 +4,8 @@ from PyQt5.QtCore import pyqtSignal
 from PyQt5.QtWidgets import QVBoxLayout, QHBoxLayout, QWidget, QCheckBox, QPlainTextEdit, QLayout, QLineEdit
 from multiprocessing import Process, Pipe
 from threading import Thread, Lock
+from widget.waiting_bar import start_new_bar
+from entry_point import process
 
 
 def process_(conf):
@@ -46,8 +48,7 @@ class ParamsWidget(QWidget):
         self.check_rich.stateChanged.connect(lambda: self.debug_mode())
         self.check_all_pages = QCheckBox()
         self.check_all_pages.setText("all pages")
-        self.check_all_pages.stateChanged.connect(
-            lambda: self.all_pages_mode())
+        self.check_all_pages.stateChanged.connect(lambda: self.all_pages_mode())
 
         self.widgets.append(
             [self.check_dev, self.check_rich, self.check_all_pages, self.btn_submit])
@@ -97,10 +98,9 @@ class ParamsWidget(QWidget):
         target_cfg["params"]["credential"] = self.parent.credential
         target_cfg["params"]["progress"] = None if self.debug else True
         target_cfg["params"]["all_pages"] = True if self.all_pages else False
-        from waiting_bar import start_new_bar
-        from entry_point import process
         main_conn, worker_conn = Pipe()
         if self.check_dev.isChecked():
+            # disable multiprocess to debug
             start_new_bar(
                 **{"func": process, "params_dict": {"conf": target_cfg, "conn": worker_conn}})
         else:

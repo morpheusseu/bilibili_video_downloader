@@ -1,9 +1,9 @@
-from video_download import ACCOUNT, video_converter
+from utility.video_download import ACCOUNT, video_converter
 from bilibili_api import favorite_list, Credential
 import asyncio
 import re
 from rich.progress import Progress, BarColumn, MofNCompleteColumn, SpinnerColumn, TaskProgressColumn, TimeElapsedColumn, TimeRemainingColumn
-from util import transmit_progress_msg
+from utility.util import transmit_progress_msg
 
 UPPER_UID = 398421039
 ITEM_PER_PAGE = 20

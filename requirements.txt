@@ -2,4 +2,7 @@ aiohttp==3.7.4.post0
 bilibili_api==9.1.0
 pathvalidate==2.5.2
 PyQt5==5.15.9
-rich==13.3.3
+PyQt5_sip==12.11.1
+qrcode==7.4.2
+Requests==2.31.0
+rich==13.5.3

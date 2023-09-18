@@ -2,7 +2,7 @@ import asyncio
 import argparse
 from bilibili_api import Credential
 from bilibili_api.user import User
-from favorite_list import get_favorite_lists_from_upper_by_uid
+from utility.favorite_list import get_favorite_lists_from_upper_by_uid
 
 DEFAULT_UID2QUERY = 1778026586
 

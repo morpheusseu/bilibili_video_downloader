@@ -1,11 +1,13 @@
+import sys
 import qrcode
 from time import sleep
 from requests import Session as req_session
+from utility.util import abspath_s
 # thanks for code from bilibili video BV15p4y1X79J
-
+QRCode_Location = abspath_s(sys._MEIPASS, "qrcode.png") if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS') else "qrcode.png"
 
 class Login:
-    def __init__(self, show_qrcode_method, after_method) -> None:
+    def __init__(self, show_qrcode_method, after_method, interrupt_judge) -> None:
         self.oauthKey = ""
         self.qrcodeUrl = ""
         self.session = req_session()
@@ -16,6 +18,7 @@ class Login:
         )
         self.show_method = show_qrcode_method
         self.after_method = after_method
+        self.interrupt_judge = interrupt_judge
 
     def _requests(self, method, url, decode_level=2, retry=10, timeout=15, **kwargs):
         if method in ["get", "post"]:
@@ -46,13 +49,20 @@ class Login:
         qrcode_img = qrcode.QRCode()
         qrcode_img.add_data(url)
         qrcode_img = qrcode_img.make_image()
-        qrcode_img.save("qrcode.png")
-        self.show_method("qrcode.png")
+        qrcode_img.save(QRCode_Location)
+        self.show_method(QRCode_Location)
 
     def login(self):
         if self.getQRCode():
             self.showQRCode(self.qrcodeUrl)
             while True:
+                try:
+                    if self.interrupt_judge():
+                        self.after_method(None)
+                        break
+                except RuntimeError as e:
+                    print(f'Widget Deleted: {e}')
+                    exit(0)
                 sleep(0.5)
                 data = {
                     "oauthKey": self.oauthKey,
@@ -75,15 +85,14 @@ class Login:
                     # wait for confirm after scan
                     pass
                 else:
+                    raw_cookies = req["data"]["url"].split("?")[1].split("&")
+                    cookies = {}
+                    for cookie in raw_cookies:
+                        key, val = cookie.split("=")
+                        if key != "gourl" and key != "Expires":
+                            cookies[key] = val
+                    self.after_method(cookies)
                     break
-            raw_cookies = req["data"]["url"].split("?")[1].split("&")
-            cookies = {}
-            for cookie in raw_cookies:
-                key, val = cookie.split("=")
-                if key != "gourl" and key != "Expires":
-                    cookies[key] = val
-            self.after_method(cookies)
-            return cookies
 
 
 if __name__ == "__main__":

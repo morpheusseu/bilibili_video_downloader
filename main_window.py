@@ -1,7 +1,8 @@
 import os
 import sys
 import json
-from PyQt5.QtWidgets import QApplication, QMainWindow, QVBoxLayout, QHBoxLayout, QDockWidget, QWidget, QComboBox, QPushButton, QLabel, QLineEdit
+from PyQt5.QtWidgets import QApplication, QMainWindow, QVBoxLayout, QHBoxLayout, QDockWidget, QWidget, QComboBox, \
+    QPushButton, QLabel, QLineEdit
 from PyQt5.QtGui import QPalette, QColor, QIcon, QPixmap
 from PyQt5.QtCore import Qt
 from asyncio import new_event_loop
@@ -13,6 +14,10 @@ from bilibili_api.user import get_self_info
 from bilibili_api import Credential
 from utility.util import abspath_s
 from utility.qrcode_login import Login
+if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+    Image_Location = abspath_s(sys._MEIPASS, "image.png")
+else:
+    Image_Location = "image.png"
 
 
 class PresentPage(QDockWidget):
@@ -32,8 +37,7 @@ class PresentPage(QDockWidget):
         self.setWindowTitle("Present Page")
         self.pwd_is_dirty = False
         self.lock = Lock()
-        Thread(target=self.get_user, args=[lambda :self.parent.credential, ]).start()
-
+        Thread(target=self.get_user, args=[lambda: self.parent.credential, ]).start()
 
     def dirty(self):
         with self.lock:
@@ -85,7 +89,8 @@ class PresentPage(QDockWidget):
                     # Windows Deleted might be
                     print(f"Widgets Deleted: {e}")
                     exit(0)
-                ins = Login(show_qrcode_method=self.load_image, after_method=self.process_cookies, interrupt_judge=self.dirty)
+                ins = Login(show_qrcode_method=self.load_image, after_method=self.process_cookies,
+                            interrupt_judge=self.dirty)
                 t = Thread(target=ins.login, args=[])
                 t.start()
                 t.join()
@@ -104,7 +109,7 @@ class PresentPage(QDockWidget):
                 elif key.lower() == 'buvid3':
                     getattr(setting_page, "lineedit_BUVID3").setText(cookies[key])
             setting_page.on_button_click()
-        Thread(target=self.get_user, args=[lambda :self.parent.credential, ]).start()
+        Thread(target=self.get_user, args=[lambda: self.parent.credential, ]).start()
 
     def load_image_from_url(self, url):
         # Save the image data to a file
@@ -113,13 +118,13 @@ class PresentPage(QDockWidget):
         # Load the image into a QPixmap
         pixmap = QPixmap('image.png')
         pixmap = pixmap.scaled(250, 250, Qt.KeepAspectRatio)
-        self.setFixedSize(pixmap.width()+50, pixmap.height()+50)
+        self.setFixedSize(pixmap.width() + 50, pixmap.height() + 50)
         self.image_label.setPixmap(pixmap)
 
     def load_image(self, filepath):
         pixmap = QPixmap()
         pixmap.load(filepath)
-        self.setFixedSize(pixmap.width()+50, pixmap.height()+50)
+        self.setFixedSize(pixmap.width() + 50, pixmap.height() + 50)
         self.image_label.setPixmap(pixmap)
 
 
@@ -287,7 +292,7 @@ class MainWindow(QMainWindow):
 
 def main():
     app = QApplication(sys.argv)
-    win = MainWindow() # this line cause infinitely reopen, the origin is multiprocess, freeze_support needed
+    win = MainWindow()  # this line cause infinitely reopen, the origin is multiprocess, freeze_support needed
     win.show()
     sys.exit(app.exec_())
 

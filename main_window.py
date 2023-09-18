@@ -113,10 +113,10 @@ class PresentPage(QDockWidget):
 
     def load_image_from_url(self, url):
         # Save the image data to a file
-        with open('image.png', 'wb') as f:
+        with open(Image_Location, 'wb') as f:
             f.write(req_get(url).content)
         # Load the image into a QPixmap
-        pixmap = QPixmap('image.png')
+        pixmap = QPixmap(Image_Location)
         pixmap = pixmap.scaled(250, 250, Qt.KeepAspectRatio)
         self.setFixedSize(pixmap.width() + 50, pixmap.height() + 50)
         self.image_label.setPixmap(pixmap)

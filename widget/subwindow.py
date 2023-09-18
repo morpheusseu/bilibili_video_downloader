@@ -6,6 +6,7 @@ from multiprocessing import Process, Pipe
 from threading import Thread, Lock
 from widget.waiting_bar import start_new_bar
 from entry_point import process
+import sys
 
 
 def process_(conf):
@@ -81,6 +82,9 @@ class ParamsWidget(QWidget):
                 self.main_layout.addLayout(tmp_layout)
         self.setLayout(self.main_layout)
         self.append_text.connect(self.slot_append_text)
+        if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+            self.check_dev.hide()
+            self.check_rich.hide()
 
     def append_text4thread(self, text=''):
         self.append_text.emit(text)

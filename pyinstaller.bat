@@ -1,1 +1,0 @@
- pyinstaller main_window.py --add-data="configuration;configuration" --add-data="bilibili_api;bilibili_api" --windowed -F

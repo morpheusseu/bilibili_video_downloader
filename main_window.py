@@ -16,8 +16,10 @@ from utility.util import abspath_s
 from utility.qrcode_login import Login
 if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
     Image_Location = abspath_s(sys._MEIPASS, "image.png")
+    Github_Img = abspath_s(sys._MEIPASS, "github.png")
 else:
     Image_Location = "image.png"
+    Github_Img = "github.png"
 
 
 class PresentPage(QDockWidget):
@@ -218,13 +220,19 @@ class OperatePage(QDockWidget):
 
     def get_switch_box(self):
         tmp_layout = QHBoxLayout()
+        _size = 40
+        github_btn = QLabel()
+        github_btn.setText(f"<a href='https://github.com/morpheusseu/bilibili_video_downloader'><img src='{Github_Img}' width='{_size}' height='{_size}'></a>")
+        github_btn.setOpenExternalLinks(True)
+        github_btn.setToolTip("Click to open the GitHub repository")
+        github_btn.setFixedSize(_size, _size)
         if not hasattr(self, "combobox_switch"):
             self.combobox_switch = QComboBox(self)
             for conf in self.configurations:
                 self.combobox_switch.addItem(conf["name"], conf["func_id"])
             self.combobox_switch.currentIndexChanged.connect(
                 self.create_new_page)
-        for widget in [self.combobox_switch]:
+        for widget in [self.combobox_switch, github_btn]:
             tmp_layout.addWidget(widget)
         return tmp_layout
 

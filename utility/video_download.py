@@ -138,14 +138,12 @@ async def video_converter(convert_type, bv_id, credential, page_idx=0, cid=None,
             return
     video_skip, audio_skip = type_skip_dict[get_skip_type(convert_type)]
     video_ins = video.Video(bvid=bv_id, credential=credential)
-    print(f"in {__file__} get video_ins {video_ins} with credit {credential} and bvid {bv_id}")
     video_info = static_info if static_info else await video_ins.get_info()
     v_num = 1 if "videos" not in video_info else int(video_info["videos"])
     v_title = video_info["title"]
     v_upper = video_info["owner"]["name"]
     v_pic = video_info["pic"]
     v_pages = [] if "pages" not in video_info else video_info["pages"]
-    # print(video_info)
     _destination_location = destination_location
 
     async def download_via_cid(video_ins=video_ins, progress=progress, page_idx=page_idx, cid=cid):
@@ -249,8 +247,11 @@ async def video_converter(convert_type, bv_id, credential, page_idx=0, cid=None,
             progress.remove_task(audio_stream_index) if progress else None
             progress.update(video_convert_index, description='[green][Done] get {}.{} from {}'.format(
                 v_title, convert_type, v_upper), advance=1) if progress else None
-            transmit_progress_msg(task=video_convert_task,
-                                  conn=conn, level=1, extra_msg_after=time_format_sec2hhmmss(video_convert_task.finished_time if video_convert_task.finished_time else 0)) if progress else None
+            transmit_progress_msg(
+                task=video_convert_task, conn=conn, level=1,
+                extra_msg_after=time_format_sec2hhmmss(
+                    video_convert_task.finished_time if video_convert_task.finished_time else 0)
+            ) if progress else None
 
     if all_pages and v_num > 1:
         _destination_location = abspath_s(

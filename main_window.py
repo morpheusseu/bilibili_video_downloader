@@ -5,7 +5,7 @@ from PyQt5.QtWidgets import QApplication, QMainWindow, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QLineEdit
 from PyQt5.QtGui import QPalette, QColor, QIcon, QPixmap
 from PyQt5.QtCore import Qt
-from asyncio import new_event_loop
+from asyncio import new_event_loop, log
 from requests import get as req_get
 from threading import Thread, Lock
 from multiprocessing import freeze_support
@@ -51,32 +51,28 @@ class PresentPage(QDockWidget):
             self.pwd_is_dirty = True
 
     @staticmethod
-    def _get_self_user_info(credential, flag):
+    def _get_self_user_info(credential, loop):
         try:
-            new_event_loop().run_until_complete(get_self_info(credential=credential))
-        except Exception:
-            flag[0] = False
-            return
-        flag[0] = True
+            user_info = loop.run_until_complete(get_self_info(credential=credential))
+        except Exception as e:
+            print(f'{e}')
+            return None
+        return user_info
 
     def get_user(self, credential_getter):
         loop = new_event_loop()
-        flag = [False]
         while True:
             try:
                 try:
                     self.isHidden()
                 except RuntimeError:
                     return
-                t = Thread(target=self._get_self_user_info, kwargs={'credential': credential_getter(), 'flag': flag})
-                t.start()
-                t.join()
-                if flag[0] is False:
+                user_info = self._get_self_user_info(credential=credential_getter(), loop=loop)
+                if user_info is None:
                     raise NotImplementedError
                 if self.online:
                     # heart beats
                     continue
-                user_info = loop.run_until_complete(get_self_info(credential=credential_getter()))
                 self.setWindowTitle(f"welcome! {user_info['name']} (lv.{user_info['level']})")
                 self.load_image_from_url(user_info['face'])
                 self.online = True
@@ -299,4 +295,6 @@ def main():
 
 if __name__ == "__main__":
     freeze_support()
+    from logging import DEBUG
+    log.logger.setLevel(DEBUG)
     main()

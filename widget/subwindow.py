@@ -1,7 +1,6 @@
 from copy import deepcopy
-from PyQt5 import QtWidgets
 from PyQt5.QtCore import pyqtSignal
-from PyQt5.QtWidgets import QVBoxLayout, QHBoxLayout, QWidget, QCheckBox, QPlainTextEdit, QLayout, QLineEdit
+from PyQt5.QtWidgets import QVBoxLayout, QHBoxLayout, QWidget, QCheckBox, QPlainTextEdit, QLayout, QLineEdit, QPushButton, QLabel
 from multiprocessing import Process, Pipe
 from threading import Thread, Lock
 from widget.waiting_bar import start_new_bar
@@ -31,16 +30,19 @@ class ParamsWidget(QWidget):
         self.all_pages = False
         self.widgets = []
         for key in self.cfg["params"]:
-            tmp_label = QtWidgets.QLabel()
+            tmp_label = QLabel()
             tmp_label.setText(key)
-            tmp_lineedit = QtWidgets.QLineEdit()
+            tmp_lineedit = QLineEdit()
             tmp_lineedit.setText(self.cfg["params"][key])
             tmp_lineedit.textChanged.connect(
                 lambda text, key=key: self.cfg["params"].update({key: text}))
             self.widgets.append([tmp_label, tmp_lineedit])
-        self.btn_submit = QtWidgets.QPushButton()
-        self.btn_submit.setText("Submit")
+        self.btn_submit = QPushButton("Submit")
         self.btn_submit.clicked.connect(self.on_button_click)
+        self.btn_stop = QPushButton("Stop")
+        self.btn_stop.clicked.connect(self.on_abort_click)
+        self.btn_stop.hide()
+
 
         self.check_dev = QCheckBox()
         self.check_dev.setText("dev")
@@ -52,7 +54,7 @@ class ParamsWidget(QWidget):
         self.check_all_pages.stateChanged.connect(lambda: self.all_pages_mode())
 
         self.widgets.append(
-            [self.check_dev, self.check_rich, self.check_all_pages, self.btn_submit])
+            [self.check_dev, self.check_rich, self.check_all_pages, self.btn_submit, self.btn_stop])
 
         self.console = QPlainTextEdit()
         self.console1 = QLineEdit()
@@ -97,6 +99,7 @@ class ParamsWidget(QWidget):
     def on_button_click(self):
         # function call that takes the params as arguments
         self.btn_submit.setEnabled(False)
+        self.btn_submit.hide()
         self.parent.dock_operate_page.combobox_switch.setEnabled(False)
         target_cfg = deepcopy(self.cfg)
         target_cfg["params"]["credential"] = self.parent.credential
@@ -117,26 +120,25 @@ class ParamsWidget(QWidget):
             Thread(target=self.waiting_worker, args=[p, v, l,]).start()
             Thread(target=self.updating_worker, args=[
                    v, l, p, main_conn,]).start()
+        self.btn_stop.setEnabled(True)
+        self.btn_stop.show()
+        self.proc2stop = p
 
-    def on_abort_click(self, work_proc):
-        print("try to terminate")
-        work_proc.terminate()
-        self.setEnabled(False)
+    def on_abort_click(self):
+        self.proc2stop.terminate()
+        self.btn_stop.setEnabled(False)
 
     def waiting_worker(self, worker_proc, val, lock):
-        default_text = self.btn_submit.text()
-        self.btn_submit.setText("Executing")
-        # self.btn_submit.clicked.disconnect()
-        # self.btn_submit.clicked.connect(lambda: self.on_abort_click(worker_proc))
-        # self.btn_submit.setEnabled(True)
+        # default_text = self.btn_submit.text()
+        # self.btn_submit.setText("Executing")
 
         worker_proc.join()
         with lock:
             val[1] = False
-        # self.btn_submit.clicked.disconnect()
-        # self.btn_submit.clicked.connect(self.on_button_click)
-        self.btn_submit.setText(default_text)
+        # self.btn_submit.setText(default_text)
         self.btn_submit.setEnabled(True)
+        self.btn_stop.hide()
+        self.btn_submit.show()
         self.parent.dock_operate_page.combobox_switch.setEnabled(True)
 
     def updating_worker(self, val, lock, proc=None, conn=None):
@@ -151,11 +153,17 @@ class ParamsWidget(QWidget):
                         message = conn.recv()
                         if isinstance(message, str):
                             if message.startswith('0@'):
+                                # refreshable statement
                                 self.console1.setText(message.split('@')[1])
                             elif message.startswith('1@'):
+                                # stage statement
                                 self.append_text4thread(message.split('@')[1])
                                 # self.console.appendPlainText(message.split('@')[1])
+                            elif message.startswith('2@'):
+                                # warning statement
+                                self.append_text4thread(message.split('@')[1])
                             elif message.startswith('5@'):
+                                # image url statement
                                 url = [x for x in message.split('@')[1][2:].split('|') if x][0]
                                 self.parent.dock_present_page.load_image_from_url(url)
                 except Exception as e:

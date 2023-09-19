@@ -38,6 +38,7 @@ def transmit_progress_msg_thread(task, conn, level, extra_msg_before='', extra_m
 
 
 def transmit_progress_msg(task, conn, level, extra_msg_before='', extra_msg_after=''):
+    # level : 0->refreshable str;1->stage str;2->warning str;5->image url str
     if task is None:
         msg = '{}@{}:{}|{}|{}'.format(level, '|', extra_msg_before, '|', extra_msg_after)
     else:

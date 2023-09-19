@@ -1,7 +1,6 @@
-import asyncio
-from rich.progress import Progress, BarColumn, MofNCompleteColumn, SpinnerColumn, TaskProgressColumn, TimeElapsedColumn, TimeRemainingColumn
-# necessary sys
 import sys
+from asyncio import new_event_loop
+from rich.progress import Progress, BarColumn, MofNCompleteColumn, SpinnerColumn, TaskProgressColumn, TimeElapsedColumn, TimeRemainingColumn
 
 
 def process(conf, conn):
@@ -16,7 +15,7 @@ def process(conf, conn):
     if hasattr(ep, func_name):
         getattr(ep, func_name)(**params)
     else:
-        raise ValueError("func '{}' not defined")
+        raise ValueError(f"func {func_name} not defined")
     conn.close() if conn else None
 
 
@@ -36,8 +35,7 @@ def download_videos_from_given_upper_favorite_list(credential, uid, convert_type
     ) if progress else None
     progress.start() if progress else None
     # entry
-    loop = asyncio.new_event_loop()
-    loop.run_until_complete(
+    new_event_loop().run_until_complete(
         get_videos_from_favorite_list_by_cfg(credential=credential, config_list=favorite_lists_config, progress=progress))
     progress.stop() if progress else None
 
@@ -50,8 +48,7 @@ def download_videos_from_given_favorite_list_id(credential, fid, convert_type="w
     ) if progress else None
     progress.start() if progress else None
     # entry
-    loop = asyncio.new_event_loop()
-    loop.run_until_complete(
+    new_event_loop().run_until_complete(
         videos_converter_from_given_favorite_list_id(credential=credential, convert_type=convert_type, favorite_list_id=fid, progress=progress, conn=conn))
     progress.stop() if progress else None
 
@@ -65,8 +62,7 @@ def download_video_from_given_bvid(convert_type, bv_id, credential, page_idx=0, 
     ) if progress else None
     progress.start() if progress else None
     # entry
-    loop = asyncio.new_event_loop()
-    loop.run_until_complete(
+    new_event_loop().run_until_complete(
         video_converter(credential=credential, convert_type=convert_type, bv_id=bv_id,
                         page_idx=page_idx, cid=cid, progress=progress, conn=conn, static_info=static_info)
     )
@@ -106,7 +102,6 @@ def hello(a=0, b=1):
 
 
 if __name__ == "__main__":
-    import sys
     a = {'a': 2, 'b': 3}
     if hasattr(sys.modules[__name__], "hello"):
         getattr(sys.modules[__name__], "hello")(**a)

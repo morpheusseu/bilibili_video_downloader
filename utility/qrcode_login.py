@@ -34,8 +34,8 @@ class Login:
                         if decode_level == 1
                         else response
                     )
-                except NotImplementedError:
-                    pass
+                except Exception as e:
+                    print(f'_request: {e}')
             return None
 
     def getQRCode(self):

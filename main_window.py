@@ -2,9 +2,9 @@ import os
 import sys
 import json
 from PyQt5.QtWidgets import QApplication, QMainWindow, QVBoxLayout, QHBoxLayout, QDockWidget, QWidget, QComboBox, \
-    QPushButton, QLabel, QLineEdit
+    QPushButton, QLabel, QLineEdit, QMessageBox
 from PyQt5.QtGui import QPalette, QColor, QIcon, QPixmap
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, pyqtSignal
 from asyncio import new_event_loop, log
 from requests import get as req_get
 from threading import Thread, Lock
@@ -61,7 +61,7 @@ class PresentPage(QDockWidget):
         try:
             user_info = loop.run_until_complete(get_self_info(credential=credential))
         except Exception as e:
-            print(f'{e}')
+            print(f'_get_self_user_info: {e}')
             return None
         return user_info
 
@@ -92,12 +92,12 @@ class PresentPage(QDockWidget):
                     continue
                 try:
                     self.setWindowTitle("please login via qrcode")
-                except NotImplementedError as e:
+                except NotImplementedError as ni_e:
                     # Windows Deleted might be
-                    print(f"Widgets Deleted: {e}")
+                    print(f"Widgets Deleted: {ni_e}")
                     exit(0)
                 ins = Login(show_qrcode_method=self.load_image, after_method=self.process_cookies,
-                            interrupt_judge=self.dirty)
+                            interrupt_judge=self.dirty, stderr_method=self.parent.error_propagate4thread)
                 t = Thread(target=ins.login, args=[])
                 t.start()
                 t.join()
@@ -121,7 +121,7 @@ class PresentPage(QDockWidget):
     def load_image_from_url(self, url):
         # Save the image data to a file
         with open(Image_Location, 'wb') as f:
-            f.write(req_get(url).content)
+            f.write(req_get(url, timeout=10).content)
         # Load the image into a QPixmap
         pixmap = QPixmap(Image_Location)
         pixmap = pixmap.scaled(250, 250, Qt.KeepAspectRatio)
@@ -265,6 +265,8 @@ class OperatePage(QDockWidget):
 
 
 class MainWindow(QMainWindow):
+    error_propagate = pyqtSignal(str)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setGeometry(200, 200, 800, 400)
@@ -280,6 +282,10 @@ class MainWindow(QMainWindow):
         self.addDockWidget(2, self.dock_present_page)
         self.addDockWidget(2, self.dock_setting_page)
         self.dock_setting_page.on_button_click()
+        self.err_msgbox = QMessageBox(parent=self)
+        self.err_msgbox.setWindowTitle('Error occurred!')
+        self.err_msgbox.hide()
+        self.error_propagate.connect(self.slot_error_propagate)
 
     @property
     def credential(self):
@@ -301,6 +307,15 @@ class MainWindow(QMainWindow):
         palette_a.setColor(QPalette.Highlight, QColor(42, 130, 218))
         palette_a.setColor(QPalette.HighlightedText, QColor(35, 35, 35))
         widget.setPalette(palette_a)
+
+    def error_propagate4thread(self, msg):
+        self.error_propagate.emit(msg)
+    
+    def slot_error_propagate(self, msg):
+        self.err_msgbox.setText(msg)
+        self.err_msgbox.exec()
+        exit(-1)
+        
 
 
 def main():

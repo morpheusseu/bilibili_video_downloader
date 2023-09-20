@@ -12,8 +12,9 @@ from multiprocessing import freeze_support
 from time import sleep
 from bilibili_api.user import get_self_info
 from bilibili_api import Credential
-from utility.util import abspath_s
+from utility.util import abspath_s, make_dirctory_recursive
 from utility.qrcode_login import Login
+from utility.video_download import save_user_cfg, save_passport
 if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
     Bin_Dir = abspath_s(sys._MEIPASS, "bin")
     Image_Location = abspath_s(sys._MEIPASS, "image.png")
@@ -45,7 +46,7 @@ class PresentPage(QDockWidget):
         self.lock = Lock()
         Thread(target=self.get_user, args=[lambda: self.parent.credential, ]).start()
 
-    def dirty(self):
+    def is_dirty(self):
         with self.lock:
             val = self.pwd_is_dirty
             self.pwd_is_dirty = False
@@ -54,6 +55,7 @@ class PresentPage(QDockWidget):
     def set_dirty(self):
         # once passport updated
         with self.lock:
+            self.online = False
             self.pwd_is_dirty = True
 
     @staticmethod
@@ -97,7 +99,7 @@ class PresentPage(QDockWidget):
                     print(f"Widgets Deleted: {ni_e}")
                     exit(0)
                 ins = Login(show_qrcode_method=self.load_image, after_method=self.process_cookies,
-                            interrupt_judge=self.dirty, stderr_method=self.parent.error_propagate4thread)
+                            interrupt_judge=self.is_dirty, stderr_method=self.parent.error_propagate4thread)
                 t = Thread(target=ins.login, args=[])
                 t.start()
                 t.join()
@@ -199,7 +201,11 @@ class SettingPage(QDockWidget):
             bili_jct=getattr(self, "lineedit_BILI_JCT").text(),
             buvid3=getattr(self, "lineedit_BUVID3").text()
         )
-        from utility.video_download import save_user_cfg, save_passport
+        location = getattr(self, "lineedit_save_location", None).text()
+        if os.path.isdir(location):
+            pass
+        elif make_dirctory_recursive(location) is False:
+            self.parent.warning_propagate4thread(f'location {location} cant be create\ncheck carefully')
         save_user_cfg(self.user_cfg_content)
         save_passport(self.passport_content)
         self.parent.dock_present_page.set_dirty()
@@ -266,6 +272,7 @@ class OperatePage(QDockWidget):
 
 class MainWindow(QMainWindow):
     error_propagate = pyqtSignal(str)
+    warning_propagate = pyqtSignal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -286,6 +293,10 @@ class MainWindow(QMainWindow):
         self.err_msgbox.setWindowTitle('Error occurred!')
         self.err_msgbox.hide()
         self.error_propagate.connect(self.slot_error_propagate)
+        self.warn_msgbox = QMessageBox(parent=self)
+        self.warn_msgbox.setWindowTitle('Warning occurred!')
+        self.warn_msgbox.hide()
+        self.warning_propagate.connect(self.slot_warning_propagate)
 
     @property
     def credential(self):
@@ -315,6 +326,13 @@ class MainWindow(QMainWindow):
         self.err_msgbox.setText(msg)
         self.err_msgbox.exec()
         exit(-1)
+
+    def warning_propagate4thread(self, msg):
+        self.warning_propagate.emit(msg)
+
+    def slot_warning_propagate(self, msg):
+        self.warn_msgbox.setText(msg)
+        self.warn_msgbox.exec()
         
 
 

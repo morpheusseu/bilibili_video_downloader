@@ -5,6 +5,21 @@ import time
 def abspath_s(*arg):
     return os.path.abspath(os.path.join(*arg))
 
+def make_dirctory_recursive(filepath):
+    if not os.path.isdir(filepath):
+        parent = os.path.dirname(filepath)
+        if parent == filepath:
+            return True
+        if make_dirctory_recursive(parent) is False:
+            return False
+        try:
+            os.makedirs(filepath)
+            return True
+        except OSError as ose:
+            print(f'{ose}')
+            return False
+
+
 
 def retry_task(func, max_retry_time=3, msg="dealing", progress=None):
     async def wrapper(*args, **kwargs):

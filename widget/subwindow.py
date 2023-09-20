@@ -131,13 +131,10 @@ class ParamsWidget(QWidget):
         self.btn_stop.setEnabled(False)
 
     def waiting_worker(self, worker_proc, val, lock):
-        # default_text = self.btn_submit.text()
-        # self.btn_submit.setText("Executing")
-
         worker_proc.join()
         with lock:
             val[1] = False
-        # self.btn_submit.setText(default_text)
+        self.parent.dock_present_page.set_dirty()
         self.btn_submit.setEnabled(True)
         self.btn_stop.hide()
         self.btn_submit.show()

@@ -120,12 +120,13 @@ class ParamsWidget(QWidget):
             Thread(target=self.waiting_worker, args=[p, v, l,]).start()
             Thread(target=self.updating_worker, args=[
                    v, l, p, main_conn,]).start()
+            self.proc2stop = p
         self.btn_stop.setEnabled(True)
         self.btn_stop.show()
-        self.proc2stop = p
 
     def on_abort_click(self):
-        self.proc2stop.terminate()
+        if getattr(self, 'proc2stop', None):
+            self.proc2stop.terminate()
         self.append_text4thread(f'>>>> task terminated manually >>>>')
         self.btn_stop.setEnabled(False)
 

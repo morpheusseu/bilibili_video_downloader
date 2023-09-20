@@ -7,6 +7,7 @@ from bilibili_api import video, Credential
 from rich.console import Console
 from rich.progress import Progress, BarColumn, MofNCompleteColumn, SpinnerColumn, TaskProgressColumn, TimeElapsedColumn, TimeRemainingColumn
 from pathvalidate import sanitize_filename
+from subprocess import DEVNULL, run as subprocess_run
 
 from utility.util import abspath_s, retry_task, transmit_progress_msg_thread, transmit_progress_msg, time_format_sec2hhmmss
 from threading import Thread
@@ -92,9 +93,8 @@ def convert_via_ffmpeg(output_type, input_files, output_file=None, default_file=
         "mp4": '{} -hide_banner -loglevel error -i {} -vcodec copy -acodec copy "{}"'
     }
     abs_output_filepath = abspath_s(destination_location, output_file)
-    cmd = cmd_format_dict[output_type].format(FFMPEG_PATH, " -i ".join(
-        input_files) if isinstance(input_files, list) else " -i ".join(input_files), abs_output_filepath)
-    os.system(cmd)
+    cmd = cmd_format_dict[output_type].format(FFMPEG_PATH, " -i ".join(input_files) if isinstance(input_files, list) else input_files, abs_output_filepath)
+    subprocess_run(cmd, env=dict(os.environ), stdout=DEVNULL, shell=True)
     if progress is None:
         print(abs_output_filepath)
 

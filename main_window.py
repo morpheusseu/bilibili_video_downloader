@@ -15,11 +15,15 @@ from bilibili_api import Credential
 from utility.util import abspath_s
 from utility.qrcode_login import Login
 if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+    Bin_Dir = abspath_s(sys._MEIPASS, "bin")
     Image_Location = abspath_s(sys._MEIPASS, "image.png")
     Github_Img = abspath_s(sys._MEIPASS, "github.png")
 else:
+    Bin_Dir = abspath_s(__file__, "..", "bin")
     Image_Location = "image.png"
     Github_Img = "github.png"
+if os.path.isdir(Bin_Dir):
+    os.environ['PATH'] = f"{Bin_Dir};{os.environ.get('PATH', '')}"
 
 
 class PresentPage(QDockWidget):
@@ -61,8 +65,9 @@ class PresentPage(QDockWidget):
             return None
         return user_info
 
-    def get_user(self, credential_getter):
+    def get_user(self, credential_getter, retry_time=3):
         loop = new_event_loop()
+        retry = 0
         while True:
             try:
                 try:
@@ -74,6 +79,7 @@ class PresentPage(QDockWidget):
                     raise NotImplementedError
                 if self.online:
                     # heart beats
+                    retry = retry_time
                     continue
                 self.setWindowTitle(f"welcome! {user_info['name']} (lv.{user_info['level']})")
                 self.load_image_from_url(user_info['face'])
@@ -81,6 +87,9 @@ class PresentPage(QDockWidget):
                 sleep(1)
             except NotImplementedError:
                 self.online = False
+                if retry > 0:
+                    retry -= 1
+                    continue
                 try:
                     self.setWindowTitle("please login via qrcode")
                 except NotImplementedError as e:

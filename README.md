@@ -1,5 +1,7 @@
 # bilibili_video_downloader
 
+# !!! 新功能请参照视频：https://www.bilibili.com/video/BV178411i7AD (下述描述懒得改了)
+
 # Introduction
 
 This repository contains a video/audio downloader for Bilibili that uses your unique credentials. It has several modes:

@@ -2,14 +2,27 @@ import sys
 import qrcode
 from time import sleep
 from requests import Session as req_session, RequestException
-from utility.util import abspath_s
+
+try:
+    from utility.util import abspath_s
+except ImportError:
+    from util import abspath_s
+
 # thanks for code from bilibili video BV15p4y1X79J
-QRCode_Location = abspath_s(sys._MEIPASS, "qrcode.png") if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS') else "qrcode.png"
+QRCode_Location = (
+    abspath_s(sys._MEIPASS, "qrcode.png")
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS")
+    else "qrcode.png"
+)
+
 
 class Login:
-    def __init__(self, show_qrcode_method, after_method, interrupt_judge, stderr_method) -> None:
+    def __init__(
+        self, show_qrcode_method, after_method, interrupt_judge, stderr_method
+    ) -> None:
         self.oauthKey = ""
         self.qrcodeUrl = ""
+        self.qrcodeKey = ""
         self.session = req_session()
         self.session.headers.update(
             {
@@ -36,15 +49,21 @@ class Login:
                         else response
                     )
                 except RequestException as r_e:
-                    print(f'_request: {r_e}')
-            self.stderr_method(f'*>>>>> _request: Network Error, unable to access {url}, try to turn off proxy and restart app <<<<<*')
+                    print(f"_request: {r_e}")
+            self.stderr_method(
+                f"*>>>>> _request: Network Error, unable to access {url}, try to turn off proxy and restart app <<<<<*"
+            )
             # raise RequestException(f'_request: Network Error, unable to access {url}')
 
     def getQRCode(self):
-        req = self._requests("get", "https://passport.bilibili.com/qrcode/getLoginUrl")
+        req = self._requests(
+            "get",
+            "https://passport.bilibili.com/x/passport-login/web/qrcode/generate?source=main-fe-header",
+        )
         if req and req.get("code") == 0:
-            self.oauthKey = req["data"]["oauthKey"]
             self.qrcodeUrl = req["data"]["url"]
+            self.qrcodeKey = req["data"]["qrcode_key"]
+            # self.showQRCode(url)
             return True
         # raise RequestException('getQRCode: Fail to access QRCode (login url) due to network error')
 
@@ -64,40 +83,46 @@ class Login:
                         self.after_method(None)
                         break
                 except RuntimeError as rt_e:
-                    print(f'Widget Deleted: {rt_e}')
+                    print(f"Widget Deleted: {rt_e}")
                     exit(0)
                 sleep(0.5)
-                data = {
-                    "oauthKey": self.oauthKey,
-                    "gourl": "https://passport.bilibili.com/account/security",
-                }
                 req = self._requests(
-                    "post",
-                    "https://passport.bilibili.com/qrcode/getLoginInfo",
-                    data=data,
+                    "get",
+                    f"https://passport.bilibili.com/x/passport-login/web/qrcode/poll?qrcode_key={self.qrcodeKey}&source=main-fe-header",
                 )
-                code = req["data"]
-                if code == -4:
+                req_data = req["data"]
+                code = req_data["code"]
+                if code == 86101:
                     # wait for scan
                     pass
-                elif req["data"] == -2:
+                elif code == 86038:
+                    # qrcode invalid
                     # regenerate qrcode for timeout
+                    print(f"qrcode-{self.qrcodeKey} invalid and regenerate")
                     self.getQRCode()
                     self.showQRCode(self.qrcodeUrl)
-                elif code == -5:
+                elif code == 86090:
                     # wait for confirm after scan
                     pass
                 else:
-                    raw_cookies = req["data"]["url"].split("?")[1].split("&")
+                    # code == 0, successfully access
+                    raw_cookies = req_data["url"].split("?")[1].split("&")
                     cookies = {}
                     for cookie in raw_cookies:
                         key, val = cookie.split("=")
                         if key != "gourl" and key != "Expires":
                             cookies[key] = val
+                    _key = "SESSDATA"
+                    if _key in cookies:
+                        cookies[_key] = (
+                            cookies[_key].replace(",", "%2C").replace("*", "%2A")
+                        )
+                    print(cookies)
                     self.after_method(cookies)
                     break
 
 
 if __name__ == "__main__":
-    ins = Login()
-    ins.login()
+    ins = Login(None, None, None, None)
+    # ins.login()
+    ins.getQRCode()

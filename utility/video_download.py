@@ -3,7 +3,7 @@ import time
 import json
 import asyncio
 import aiohttp
-from bilibili_api import video, Credential
+from bilibili_api import video, bangumi, Credential
 from rich.console import Console
 from rich.progress import (
     Progress,
@@ -17,14 +17,24 @@ from rich.progress import (
 from pathvalidate import sanitize_filename
 from subprocess import DEVNULL, run as subprocess_run
 
-from utility.util import (
-    abspath_s,
-    retry_task,
-    transmit_progress_msg_thread,
-    transmit_progress_msg,
-    time_format_sec2hhmmss,
-    http_range_partition,
-)
+try:
+    from utility.util import (
+        abspath_s,
+        retry_task,
+        transmit_progress_msg_thread,
+        transmit_progress_msg,
+        time_format_sec2hhmmss,
+        http_range_partition,
+    )
+except ImportError:
+    from util import (
+        abspath_s,
+        retry_task,
+        transmit_progress_msg_thread,
+        transmit_progress_msg,
+        time_format_sec2hhmmss,
+        http_range_partition,
+    )
 from threading import Thread
 import sys
 
@@ -92,6 +102,7 @@ def save_user_cfg(cfg):
     load_user_cfg()
 
 
+load_passport()
 load_user_cfg()
 
 
@@ -244,6 +255,8 @@ async def video_converter(
                 )
             else:
                 video_url = url["dash"]["video"][0]["baseUrl"]
+                print(video_url)
+                print(url["dash"]["audio"][0]["baseUrl"])
                 video_stream_index = None
                 with open(video_temp_file, "wb"):
                     # create an empty temp file

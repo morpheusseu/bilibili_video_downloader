@@ -1,83 +1,137 @@
-# bilibili_video_downloader
+# Bilibili 视频 / 音频下载器
 
-# !!! 新功能请参照视频：https://www.bilibili.com/video/BV178411i7AD (下述描述懒得改了)
+基于 **bpi-py 0.3.1** 的独立 PyQt5 桌面应用；也提供共享同一下载引擎的 CLI。不依赖 Boxy。
 
-## new （23.12.2）:
+## 功能
 
-1. 更新到最新的 B 站扫码登录方案
-2. 更新分片下载方式，可支持下载大容量视频
-3. 更新对番剧剧集的支持，可解析观看剧集的 url 进行下载
+| 输入 | 能力 |
+| --- | --- |
+| BV / AV ID、视频链接 | 指定分 P、链接 `?p=2`，或下载全部分 P |
+| 收藏夹 ID、包含 `fid=` 的链接 | 按服务器 `has_more` 分页，去重后批量下载 |
+| UID + 收藏夹名称正则 | 匹配一个或多个收藏夹；空正则匹配全部；跨收藏夹去重 |
+| `ep123`、番剧单集链接 | 使用 bpi-py 的番剧元数据和播放接口，不抓网页字符串 |
+| 输出 | MP4 音视频合并；只下载音频并转 MP3 / WAV；支持 DASH 和分段合并 |
+| 登录 | 真实 Chrome 中的官方登录页面；手动扫码、密码或平台要求的验证 |
 
----
+界面支持不下载媒体的来源预览、输出目录选择、实时字节进度、取消、打开输出目录。
+下载/转换在独立线程的 asyncio 循环里运行，不阻塞界面。主要操作按钮固定显示。
+公开内容无需登录。仅下载当前权限允许的内容；不绕过 VIP、地区限制、DRM 或风控。
 
-# Introduction
+## 安装和运行
 
-This repository contains a video/audio downloader for Bilibili that uses your unique credentials. It has several modes:
+需要 Python 3.11+、[uv](https://docs.astral.sh/uv/)。账号登录额外需要已安装的 **Google Chrome**。
 
-1. Use bv id of the video to download
-2. Use favorite list id to download all videos from the list
-3. Use upper's uid and its owned favorite list's name to match desired favorite list and download all videos from it
+```sh
+uv sync --frozen
+uv run --frozen bili-downloader
+# 等价的源码入口：
+uv run --frozen python main_window.py
+```
 
-All downloads can choose type from (`".mp4", ".wav", ".mp3"`). A PyQt5 GUI is established for usability for users, but it has a shortcoming that you can not interact when task is running and output is on the console instead of on the PyQt5 GUI.
+FFmpeg 优先使用用户指定路径，其次系统 PATH，否则使用 `imageio-ffmpeg` wheel 自带的二进制。
+无需为了首次运行单独配置 FFmpeg。可在界面的高级设置里覆盖路径。
 
-The work is based on the achievement of [bilibili_api](https://github.com/MoyuScript/bilibili-api).
+也可在仓库根目录执行 `pip install -r requirements.txt`；依赖定义只维护在 `pyproject.toml`，
+完整可重复环境以 `uv.lock` 为准。
 
-## Usage
+## 登录与隐私
 
-To use this downloader, you can follow these steps:
+1. 点击 **在 Chrome 中登录**。应用只启动自己拥有的临时浏览器会话，不读取已有 Chrome profile。
+2. 在 Bilibili 官方页面完成登录。程序不填写密码、不处理验证码或 CAPTCHA。
+3. 读取该临时会话的 Bilibili 登录/设备 Cookie 和真实浏览器 User-Agent，由 bpi-py 验证账号身份。
+4. 登录完成后关闭临时 Chrome、清理其临时 profile，并回到下载器。后续 API 使用同一浏览器 UA。
 
-1. Clone this repository to your local machine.
-2. Install Python 3.10 if you haven't already.
-3. Install the required packages by running `pip install -r requirements.txt` in your terminal.
-4. Install [ffmpeg](https://ffmpeg.org/download.html) and update it into environment path(it use ffmpeg to mix streams).
-5. Run `python main_window.py` in your terminal to start the GUI.
+这是实际 Chrome 登录，保留浏览器真实产生的设备 Cookie，不制造设备指纹，不模拟 Android 设备。
+**Bilibili 最终显示的设备名称由平台决定，本应用不能保证它一定显示为 Chrome。**
+浏览器自身加载官方网页的资源请求由该网页管理，不受下面的数据 API 请求节奏控制。
 
-## Modes
+默认只保留当前进程中的登录。只有用户勾选 **记住登录**，才保存到系统加密凭据存储：
+macOS Keychain / Windows Credential Manager / Linux Secret Service。
+没有可用的原生后端时明确报错，**不降级到明文文件**。
+使用保存的登录需要用户点击相应按钮；启动时不自动读取钥匙串或发账号请求。
+“退出并忘记登录”清除本应用的内存和保存凭证，不注销其他浏览器/手机客户端。
 
-This downloader has three modes that allow you to download videos and audio from Bilibili in different ways:
+高级 Cookie 输入仍然可用：只在内存中传给 bpi-py，不进入设置、终端参数、日志或下载 URL。
+本版本不读取旧 `configuration/passport.json`，也不自动导入旧明文凭证。
+旧仓库历史中的凭证文件没有被改写历史；若其中曾保存仍有效的真实凭证，应在官方客户端撤销。
 
-In mode 1, you can download a single video by entering its bv id.
+## 请求节奏和失败处理
 
-In mode 2, you can download all videos from a favorite list by entering its id.
+- 同一个应用实例的 API 和媒体请求共用一把串行锁；从上一请求**完整结束**到下一请求开始，
+  随机等待 **0.5～1.5 秒**，启动后的第一个请求也等待。
+- 借鉴 WhatsApp runtime 的 jitter / 防重试风暴原则，但不把其重连指数退避直接套在正常下载上。
+- 不建立后台账号心跳，不轮询收藏/动态，不并行抓取，不在每个输入变动时自动请求。
+- HTTP 403/412/429、API `-352/-412` 会停止本实例后续请求；请到官方客户端检查账号，
+  遵守平台要求后再重启。没有自动重试、换代理、换账号或伪造设备的逻辑。
+- CDN 的正常 HTTPS 重定向逐跳验证域名，至多四次请求，也受随机间隔约束。
+  不跟随任意网站、登录页或 HTTP 降级；媒体客户端不携带 Bilibili 登录 Cookie。
+- 节奏控制**不能保证账号不被限制**。不要同时运行多个实例，也不要把批量下载当作不限量授权。
 
-In mode 3, you can download all videos from a favorite list owned by a specific user by entering their uid and the name of the list.
+收藏夹扫描以实际分页结果而非数量统计决定是否继续。空页/重复页却仍宣称 `has_more`
+会报错停止，不把不完整列表当作成功。没有 BVID 或非视频的收藏条目不会交给视频下载器。
 
----
+媒体按固定大小流式写入独立临时目录，不把大视频载入内存；不需要先整段下载一遍探测长度。
+完成转换后才原子发布最终文件。文件名包含 BV/CID，避免同名视频和不同分 P 冲突。
+已有非空文件跳过，空文件、目录、链接会提示处理，**不覆盖用户已有文件**。
+取消或失败会清理该任务的临时文件；已完成文件保留，重新运行会跳过它们。
+FFmpeg 通过参数数组运行，不使用 `shell=True`。
 
-# 介绍
+## CLI
 
-这个仓库包含一个 Bilibili 的视频/音频下载器，可以使用您的唯一凭据。它有几种模式：
+```sh
+# 只检查元数据；不会下载媒体，默认预览最多 20 个分 P
+uv run --frozen bili-download inspect BV178411i7AD
+uv run --frozen bili-download inspect 'https://www.bilibili.com/video/BV178411i7AD?p=1'
 
-1. 使用视频的 bv id 下载
-2. 使用收藏夹 id 下载列表中的所有视频
-3. 使用上级 uid 及其拥有的收藏夹名称来匹配所需的收藏夹，并从中下载所有视频
+# 输出到指定目录
+uv run --frozen bili-download download BV178411i7AD --format mp4 --quality 16 --output ./downloads
+uv run --frozen bili-download download BV178411i7AD --format mp3 --all-parts --output ./downloads
+uv run --frozen bili-download download 123456 --mode favorite --format wav
+uv run --frozen bili-download download 398421039 --mode user --pattern 'piano.*' --format mp3
+uv run --frozen bili-download inspect ep746940
 
-所有下载都可以选择类型（`“.mp4”，“.wav”，“.mp3”`）。为了方便用户，建立了一个 PyQt5 GUI，但它有一个缺点，即在任务运行时无法交互，并且输出在控制台上而不是在 PyQt5 GUI 上。
+# 只有显式要求时才保存/读取系统登录
+uv run --frozen bili-download login --remember
+uv run --frozen bili-download download BV178411i7AD --use-saved-login
+```
 
-这项工作基于[bilibili_api](https://github.com/MoyuScript/bilibili-api)的成果。
+分 P 从 **1** 开始；`--all-parts` 优先于单个分 P。画质受账号和实际返回流约束，不保证请求到 1080P
+就获得 1080P；视频流选择不会高于所选画质。输入必须是明确支持的 ID / bilibili.com 完整链接，
+不自动展开 `b23.tv` 短链接或从任意粘贴文字中猜测目标。
 
----
+## 验证与打包
 
-# 用法
+```sh
+uv run --frozen pytest -q
+uv run --frozen ruff check .
+uv run --frozen ruff format --check .
+```
 
-要使用此下载器，您可以按照以下步骤操作：
+自动测试只用合成数据和 MockTransport，不读取账号、钥匙串或访问 Bilibili。
+覆盖真实 bpi-py 解析、分页去重/不前进、分 P、原生凭证存储边界、Chrome 登录交接/取消、
+真实 FFmpeg 的三种输出、分段合并、下载取消/不完整文件、CDN 跳转、风控锁停及 Qt 线程/界面恢复。
 
-1. 将此存储库克隆到本地计算机。
-2. 如果尚未安装，请安装 Python 3.10。
-3. 运行 `pip install -r requirements.txt` 以在终端中安装所需的软件包。
-4. 安装[ffmpeg](https://ffmpeg.org/download.html)并将它的路径更新到环境变量（ffmpeg 用于混流）。
-5. 在终端中运行 `python main_window.py` 以启动 GUI。
+手动真实验收记录（2026-10-21）：
 
----
+- 旧项目演示视频 `BV178411i7AD`：公开元数据、360P MP4 下载/合并、MP3 和 WAV 下载/转换成功。
+- MP3 / WAV 均经过 FFmpeg 完整解码；同一会话的 7 次请求最小间隔实测约 0.620 秒。
+- 公开收藏夹额外做了匿名真实验证：一个 91 条内容的收藏夹，以每页 1 条读取两页，均非空且无重复。
+  共 3 次请求，最小间隔约 0.753 秒；没有登录其所有者账号或扫描/下载整个收藏夹。
+- macOS `.app` 已实际启动，来源预览、独立 Chrome 官方登录页启动/取消、GUI 下载与合并均通过。
+- 本应用只实现原下载器的功能，不自动同步动态、历史或私信。此前独立 bpi-py 只读实验
+  已确认关注动态和普通私信可用；本应用的多 P 真实批量下载仍待样本验收。
+- `ep746940` 的真实番剧元数据可解析，但其下载权限标记为禁止，程序正确拒绝；
+  允许下载的番剧、带权限账号下载、真实 Chrome 登录后的设备标签、原生钥匙串弹窗仍需人工验收。
+- Windows/Linux 上的界面、钥匙串和最终分发包未在本机验证。
 
-# 模式
+Windows 打包：`./pyinstaller.ps1`，需要调试控制台时 `./pyinstaller.ps1 -Console`。
+其他平台使用同一条命令：
 
-此下载器有三种模式，可让您以不同的方式从 Bilibili 下载视频和音频：
+```sh
+uv run --frozen --group build pyinstaller --noconfirm --clean --onedir --windowed \
+  --name BilibiliDownloader --collect-data imageio_ffmpeg --collect-data bili_downloader \
+  --collect-all playwright main_window.py
+```
 
-在模式 1 中，您可以通过输入其 bv id 来下载单个视频。
-
-在模式 2 中，您可以通过输入其 id 来从收藏夹中下载所有视频。
-
-在模式 3 中，您可以通过输入其 uid 和列表名称来下载特定用户拥有的收藏夹中的所有视频。
-
----
+分发包不包含 Chrome，也不下载或替换用户的系统浏览器。PyQt5、FFmpeg 和其他依赖各有许可要求，
+分发时应保留并检查其许可；bpi-py 的 MIT 许可不等于 Bilibili 对接口使用或媒体下载的授权。

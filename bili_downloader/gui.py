@@ -6,8 +6,27 @@ import threading
 from collections.abc import Callable
 from pathlib import Path
 
-from PyQt5.QtCore import QSettings, Qt, QThread, QUrl, pyqtSignal
-from PyQt5.QtGui import QDesktopServices, QFontDatabase, QIcon
+from PyQt5.QtCore import (
+    QBuffer,
+    QByteArray,
+    QIODevice,
+    QSettings,
+    QSize,
+    Qt,
+    QThread,
+    QTimer,
+    QUrl,
+    pyqtSignal,
+)
+from PyQt5.QtGui import (
+    QDesktopServices,
+    QFontDatabase,
+    QIcon,
+    QImageReader,
+    QPainter,
+    QPainterPath,
+    QPixmap,
+)
 from PyQt5.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -16,6 +35,7 @@ from PyQt5.QtWidgets import (
     QFormLayout,
     QFrame,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QLineEdit,
     QMainWindow,
@@ -35,6 +55,7 @@ from .api import Bilibili, safe_error
 from .auth import Session, forget_session, load_session, save_session
 from .browser_login import chrome_login
 from .download import Progress, download_source
+from .library import FavoriteView
 from .sources import DownloadError, parse_source
 from .theme import STYLE
 
@@ -134,6 +155,10 @@ class MainWindow(QMainWindow):
         self.engine.idle.connect(self.on_idle)
         self.engine.start()
         self.busy = False
+        self._session_mid = None
+        self._pending_library = False
+        self._library_job = False
+        self._library_view = FavoriteView()
         root = QWidget()
         layout = QVBoxLayout(root)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -144,10 +169,30 @@ class MainWindow(QMainWindow):
         header_layout.setContentsMargins(32, 16, 32, 16)
         header_layout.addWidget(self.label("Bilibili 下载器", "brand"))
         header_layout.addStretch()
-        self.identity = self.label("未登录 · 公开内容无需登录", "hint")
+        self.library_toggle = QPushButton()
+        self.library_toggle.setObjectName("favoritesStar")
+        star_path = str(Path(__file__).with_name("star.svg"))
+        star = QIcon(star_path)
+        star.addFile(star_path, QSize(26, 26), QIcon.Disabled)
+        self.library_toggle.setIcon(star)
+        self.library_toggle.setIconSize(QSize(26, 26))
+        self.library_toggle.setFixedSize(44, 44)
+        self.library_toggle.setAccessibleName("我的收藏")
+        self.library_toggle.setToolTip("我的收藏（登录后可用）")
+        self.library_toggle.setCheckable(True)
+        self.library_toggle.setEnabled(False)
+        header_layout.addWidget(self.library_toggle)
+        self.identity = self.label("", "identity")
         self.identity.setWordWrap(False)
+        self.identity.setMaximumWidth(220)
+        self.identity.hide()
         header_layout.addWidget(self.identity)
-        self.account_toggle = QPushButton("账号与登录")
+        self.account_toggle = QPushButton("登录")
+        self.account_toggle.setObjectName("accountAvatar")
+        self.account_toggle.setFixedSize(44, 44)
+        self.account_toggle.setIconSize(QSize(36, 36))
+        self.account_toggle.setAccessibleName("登录：账号与登录")
+        self.account_toggle.setToolTip("登录 · 账号与登录")
         self.account_toggle.setCheckable(True)
         header_layout.addWidget(self.account_toggle)
         layout.addWidget(header)
@@ -204,6 +249,43 @@ class MainWindow(QMainWindow):
         self.account_panel.hide()
         self.account_toggle.toggled.connect(self.toggle_account)
         body_layout.addWidget(self.account_panel)
+
+        self.library_panel, library_layout = self.section("我的收藏", "仅当前账号")
+        folders_row = QHBoxLayout()
+        self.folders = QComboBox()
+        self.folders.setAccessibleName("我的收藏夹")
+        self.refresh_library = QPushButton("强制刷新")
+        folders_row.addWidget(self.folders, 1)
+        folders_row.addWidget(self.refresh_library)
+        library_layout.addLayout(folders_row)
+        self.library_hint = self.label(
+            "登录后读取收藏夹；按需加载内容，不会一次扫描全部收藏。", "hint"
+        )
+        library_layout.addWidget(self.library_hint)
+        self.favorite_items = QTreeWidget()
+        self.favorite_items.setHeaderLabels(["内容", "UP 主", "时长", "状态"])
+        self.favorite_items.setRootIsDecorated(False)
+        self.favorite_items.setMinimumHeight(150)
+        self.favorite_items.setMaximumHeight(220)
+        self.favorite_items.setAccessibleName("收藏夹内容")
+        self.favorite_items.header().setSectionResizeMode(0, QHeaderView.Stretch)
+        for column in (1, 2, 3):
+            self.favorite_items.header().setSectionResizeMode(column, QHeaderView.ResizeToContents)
+        library_layout.addWidget(self.favorite_items)
+        library_actions = QHBoxLayout()
+        self.more_favorites = QPushButton("加载更多")
+        self.use_favorite = QPushButton("填入所选视频")
+        self.use_folder = QPushButton("填入此收藏夹")
+        for button in (self.more_favorites, self.use_favorite, self.use_folder):
+            button.setEnabled(False)
+            library_actions.addWidget(button)
+        library_actions.addStretch()
+        library_layout.addLayout(library_actions)
+        self.auto_library = QCheckBox("每 60 秒检查当前收藏夹变化（仅应用前台、空闲时）")
+        self.auto_library.setChecked(True)
+        library_layout.addWidget(self.auto_library)
+        self.library_panel.hide()
+        body_layout.addWidget(self.library_panel)
 
         source_box, source_layout = self.section("内容来源", "01")
         form = QFormLayout()
@@ -334,7 +416,7 @@ class MainWindow(QMainWindow):
         task_layout.addWidget(self.bar)
         actions = QHBoxLayout()
         actions.setSpacing(12)
-        pacing = self.label("请求间隔 0.5–1.5 秒 · 无后台请求", "finePrint")
+        pacing = self.label("串行请求 · 间隔 0.5–1.5 秒", "finePrint")
         pacing.setWordWrap(False)
         actions.addWidget(pacing)
         actions.addStretch()
@@ -374,6 +456,18 @@ class MainWindow(QMainWindow):
         self.forget.clicked.connect(self.logout)
         self.preview.clicked.connect(self.preview_source)
         self.open_output.clicked.connect(self.open_directory)
+        self.library_toggle.toggled.connect(self.toggle_library)
+        self.refresh_library.clicked.connect(lambda: self.load_library(force=True))
+        self.folders.currentIndexChanged.connect(self.folder_changed)
+        self.more_favorites.clicked.connect(self.load_more_favorites)
+        self.use_favorite.clicked.connect(self.choose_favorite)
+        self.use_folder.clicked.connect(self.choose_folder)
+        self.favorite_items.itemSelectionChanged.connect(self.library_controls)
+        self.favorite_items.itemDoubleClicked.connect(lambda *args: self.choose_favorite())
+        self.library_timer = QTimer(self)
+        self.library_timer.setInterval(60000)
+        self.library_timer.timeout.connect(self.check_library)
+        self.library_timer.start()
         self.mode_changed()
 
     @staticmethod
@@ -406,6 +500,133 @@ class MainWindow(QMainWindow):
         self.account_panel.setVisible(visible)
         if visible:
             self.scroll.verticalScrollBar().setValue(0)
+
+    def toggle_library(self, visible):
+        self.library_panel.setVisible(visible)
+        if visible:
+            self.scroll.verticalScrollBar().setValue(0)
+            if self._session_mid and not self._library_view.folders:
+                self.load_library()
+
+    def check_library(self):
+        if (
+            self.auto_library.isChecked()
+            and self.library_panel.isVisible()
+            and not self.isMinimized()
+            and QApplication.applicationState() == Qt.ApplicationActive
+        ):
+            self.load_library()
+
+    def load_library(self, *, force=False):
+        if self.busy or self._session_mid is None:
+            return
+
+        async def operation(api):
+            if api.session is None:
+                raise DownloadError("请先登录当前账号")
+            return await api.favorites.refresh(api.session.mid, force=force)
+
+        self.launch(
+            operation, "正在检查收藏夹", "检查资源标识，仅在内容变化时重新读取条目。", library=True
+        )
+
+    def folder_changed(self):
+        folder_id = self.folders.currentData()
+        if self.busy or folder_id is None:
+            return
+        self.launch(lambda api: api.favorites.open(folder_id), "正在读取收藏夹", library=True)
+
+    def load_more_favorites(self):
+        if not self.busy and self._library_view.has_more:
+            self.launch(lambda api: api.favorites.more(), "正在加载下一页", library=True)
+
+    def library_controls(self):
+        ready = not self.busy and self._session_mid is not None
+        selected = self.favorite_items.currentItem()
+        self.folders.setEnabled(ready)
+        self.refresh_library.setEnabled(ready)
+        self.more_favorites.setEnabled(ready and self._library_view.has_more)
+        self.use_folder.setEnabled(ready and self._library_view.folder_id is not None)
+        self.use_favorite.setEnabled(
+            ready and selected is not None and bool(selected.data(0, Qt.UserRole))
+        )
+
+    def choose_favorite(self):
+        selected = self.favorite_items.currentItem()
+        if selected and selected.data(0, Qt.UserRole):
+            self.mode.setCurrentIndex(self.mode.findData("auto"))
+            self.source.setText(selected.data(0, Qt.UserRole))
+            self.library_toggle.setChecked(False)
+            self.scroll.ensureWidgetVisible(self.source)
+
+    def choose_folder(self):
+        if self._library_view.folder_id is not None:
+            self.mode.setCurrentIndex(self.mode.findData("favorite"))
+            self.source.setText(str(self._library_view.folder_id))
+            self.library_toggle.setChecked(False)
+            self.scroll.ensureWidgetVisible(self.source)
+
+    def show_library(self, view):
+        previous = self._library_view
+        self._library_view = view
+        self.folders.blockSignals(True)
+        self.folders.clear()
+        for folder in view.folders:
+            self.folders.addItem(folder.title, folder.id)
+            self.folders.setItemData(
+                self.folders.count() - 1,
+                f"ID {folder.id} · 服务端计数 {folder.media_count} 项（可能延迟更新）",
+                Qt.ToolTipRole,
+            )
+        self.folders.setCurrentIndex(self.folders.findData(view.folder_id))
+        self.folders.blockSignals(False)
+        if previous.folder_id != view.folder_id or previous.items is not view.items:
+            self.render_favorites(view.items, preserve=previous.folder_id == view.folder_id)
+        if not view.folders:
+            text = "当前账号没有创建的收藏夹。"
+        else:
+            change = "已更新条目" if view.refreshed else "标识未变化，复用缓存"
+            text = f"{change} · 当前显示 {len(view.items)} 项" + (
+                "，可加载下一页" if view.has_more else "，已到列表末尾"
+            )
+            if not view.digest:
+                text += "；标识与条目暂不一致，下次检查不会跳过读取"
+        self.library_hint.setText(text)
+        self.library_hint.setToolTip(
+            f"资源标识的本地 SHA-256：{view.digest}" if view.digest else ""
+        )
+        self.status.setText(text)
+        self.library_controls()
+
+    def render_favorites(self, items, *, preserve=False):
+        current = self.favorite_items.currentItem()
+        selected = current.data(0, Qt.UserRole) if current and preserve else None
+        position = self.favorite_items.verticalScrollBar().value() if preserve else 0
+        self.favorite_items.clear()
+        for media in items:
+            available = (
+                media.type_name == 2
+                and bool(media.bvid or media.bv_id)
+                and media.attr not in {1, 9}
+            )
+            state = (
+                "可读取" if available else ("已失效" if media.attr in {1, 9} else "暂不支持下载")
+            )
+            item = QTreeWidgetItem(
+                [
+                    media.title,
+                    media.upper.name,
+                    f"{media.duration // 60}:{media.duration % 60:02}",
+                    state,
+                ]
+            )
+            item.setData(0, Qt.UserRole, (media.bvid or media.bv_id) if available else "")
+            for column in range(4):
+                item.setToolTip(column, item.text(column))
+            self.favorite_items.addTopLevelItem(item)
+            if selected and item.data(0, Qt.UserRole) == selected:
+                self.favorite_items.setCurrentItem(item)
+        self.favorite_items.verticalScrollBar().setValue(position)
 
     def mode_changed(self):
         self.clear_preview()
@@ -460,11 +681,15 @@ class MainWindow(QMainWindow):
         self.pattern.setEnabled(not busy and self.mode.currentData() == "user")
         self.options_changed()
         self.cancel.setEnabled(busy)
+        self.library_controls()
 
-    def launch(self, operation, title="正在处理", note="请求串行执行，可随时取消。"):
+    def launch(
+        self, operation, title="正在处理", note="请求串行执行，可随时取消。", *, library=False
+    ):
         if self.busy:
             return
         self.set_busy(True)
+        self._library_job = library
         self.task_title.setText(title)
         self.status.setText(note)
         self.bar.setRange(0, 0)
@@ -475,12 +700,19 @@ class MainWindow(QMainWindow):
             self.on_idle()
 
     def on_idle(self):
+        self._library_job = False
         self.set_busy(False)
         if self.bar.maximum() == 0:
             self.bar.setRange(0, 100)
             self.bar.setValue(0)
+        if self._pending_library:
+            self._pending_library = False
+            QTimer.singleShot(0, self.load_library)
 
     def show_error(self, text):
+        if self._library_job:
+            self.auto_library.setChecked(False)
+            self.library_hint.setText(f"{text}；自动检查已暂停，原有缓存保留。")
         self.task_title.setText("未能完成")
         self.status.setText(text)
         self.bar.setRange(0, 100)
@@ -488,6 +720,8 @@ class MainWindow(QMainWindow):
         self.log.appendPlainText(text)
 
     def show_cancelled(self):
+        if self._library_job:
+            self.auto_library.setChecked(False)
         self.task_title.setText("已取消")
         self.status.setText("任务已取消；没有发布不完整文件，已完成文件会保留。")
         self.bar.setRange(0, 100)
@@ -503,7 +737,7 @@ class MainWindow(QMainWindow):
         if event.phase == "bytes":
             megabytes = event.completed / 1024 / 1024
             self.status.setText(
-                f"下载中 · {megabytes:.1f} MiB"
+                f"{event.message} · {megabytes:.1f} MiB"
                 + (f" / {event.total / 1024 / 1024:.1f} MiB" if event.total else "")
             )
             self.bar.setRange(0, 100 if event.total else 0)
@@ -514,12 +748,69 @@ class MainWindow(QMainWindow):
             self.log.appendPlainText(event.message)
 
     def show_session(self, session):
-        self.identity.setText("已登录" if session else "未登录 · 公开内容无需登录")
+        mid = session.mid if session else None
+        if mid != self._session_mid:
+            self._library_view = FavoriteView()
+            self.folders.blockSignals(True)
+            self.folders.clear()
+            self.folders.blockSignals(False)
+            self.favorite_items.clear()
+        self._session_mid = mid
+        self.library_toggle.setEnabled(session is not None)
+        self.identity.setText(
+            self.identity.fontMetrics().elidedText(session.name, Qt.ElideRight, 200)
+            if session
+            else ""
+        )
+        self.identity.setVisible(session is not None)
+        self.identity.setToolTip(f"{session.name} · UID {session.mid}" if session else "")
+        self.show_avatar(session)
+        if session is None:
+            self.library_toggle.setChecked(False)
+        self.library_controls()
         self.account_identity.setText(
             f"{session.name} · UID {session.mid}"
             if session
             else "需要账号权限时，再在 Chrome 中登录。"
         )
+
+    def show_avatar(self, session):
+        self.account_toggle.setIcon(QIcon())
+        if session is None:
+            self.account_toggle.setText("登录")
+            self.account_toggle.setAccessibleName("登录：账号与登录")
+            self.account_toggle.setToolTip("登录 · 账号与登录")
+            return
+        self.account_toggle.setText("")
+        self.account_toggle.setAccessibleName(f"{session.name}的头像：账号与登录")
+        self.account_toggle.setToolTip(f"{session.name} · UID {session.mid}\n账号与登录")
+        if session.avatar:
+            buffer = QBuffer()
+            buffer.setData(QByteArray(session.avatar))
+            buffer.open(QIODevice.ReadOnly)
+            reader = QImageReader(buffer)
+            size = reader.size()
+            if size.isValid() and max(size.width(), size.height()) <= 4096:
+                reader.setScaledSize(size.scaled(QSize(72, 72), Qt.KeepAspectRatioByExpanding))
+                image = reader.read()
+                if not image.isNull():
+                    source = QPixmap.fromImage(image).scaled(
+                        36, 36, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation
+                    )
+                    pixmap = QPixmap(36, 36)
+                    pixmap.fill(Qt.transparent)
+                    painter = QPainter(pixmap)
+                    painter.setRenderHint(QPainter.Antialiasing)
+                    clip = QPainterPath()
+                    clip.addEllipse(0, 0, 36, 36)
+                    painter.setClipPath(clip)
+                    painter.drawPixmap(
+                        (36 - source.width()) // 2, (36 - source.height()) // 2, source
+                    )
+                    painter.end()
+                    self.account_toggle.setIcon(QIcon(pixmap))
+                    return
+        self.account_toggle.setText(session.name[:1] or "B")
 
     def show_result(self, result):
         self.task_title.setText("已完成")
@@ -531,8 +822,15 @@ class MainWindow(QMainWindow):
             self.show()
             self.raise_()
             self.activateWindow()
+            self.account_toggle.setChecked(False)
+            self._pending_library = True
+            self.auto_library.setChecked(True)
+            self.library_toggle.setChecked(True)
         elif result == "logout":
             self.status.setText("已退出并忘记本应用保存的登录；未操作其他客户端。")
+        elif isinstance(result, FavoriteView):
+            self.task_title.setText("收藏夹已检查")
+            self.show_library(result)
         elif isinstance(result, list):
             self.status.setText(
                 f"任务完成：{sum(not r.skipped for r in result)} 个文件已生成，"

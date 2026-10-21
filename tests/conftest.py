@@ -1,5 +1,6 @@
 """Synthetic provider responses; tests never load credentials or call Bilibili."""
 
+import base64
 import os
 import subprocess
 from pathlib import Path
@@ -12,6 +13,10 @@ from bili_downloader.download import ffmpeg_executable
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 BV = "BV178411i7AD"
+PNG = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAACXBIWXMAAA9hAAAPYQGoP6dp"
+    "AAAAFElEQVQImWNkSDvzn4GBgYGJAQoAIHwCNeos0L0AAAAASUVORK5CYII="
+)
 
 
 def video(bvid=BV, pages=1):
@@ -183,3 +188,55 @@ def media(tmp_path_factory):
     )
     paths["combined"] = combined
     return {key: Path(path).read_bytes() for key, path in paths.items()}
+
+
+def library_provider(count=21):
+    state = {
+        "items": [favorite_item(f"BV{i:010}", i) for i in range(1, count + 1)],
+        "mtime": 1,
+        "repeat": False,
+        "deny": False,
+    }
+
+    def handler(request):
+        if state["deny"]:
+            return httpx.Response(429)
+        path = request.url.path
+        if path.endswith("list-all"):
+            return response(
+                {
+                    "count": 1,
+                    "list": [
+                        {
+                            "id": 10,
+                            "fid": 10,
+                            "mid": 42,
+                            "attr": 0,
+                            "title": "我的收藏",
+                            "fav_state": 0,
+                            "media_count": 0,  # Count is a hint, not a pagination frontier.
+                        }
+                    ],
+                }
+            )
+        if path.endswith("resource/ids"):
+            items = state.get("ids_override", state["items"])
+            return response([{"id": item["id"], "type": item["type"]} for item in items])
+        if path.endswith("resource/list"):
+            page = int(request.url.params["pn"])
+            start = (page - 1) * 20
+            if state["repeat"] and page > 1:
+                start = 0
+            info = folder_info(len(state["items"]))
+            info["mtime"] = state["mtime"]
+            return response(
+                {
+                    "info": info,
+                    "medias": state["items"][start : start + 20],
+                    "has_more": state["repeat"] or start + 20 < len(state["items"]),
+                    "ttl": 0,
+                }
+            )
+        raise AssertionError(path)
+
+    return Provider(handler), state

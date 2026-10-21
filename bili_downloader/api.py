@@ -6,6 +6,7 @@ import re
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from urllib.parse import urlparse
 
 import httpx
 from bpi import AsyncBpiClient
@@ -13,6 +14,7 @@ from bpi.errors import ApiError, AuthenticationError, HttpStatusError, ResponseD
 from bpi.session import parse_cookie
 
 from .auth import Session, normalized_cookie
+from .library import FavoriteLibrary
 from .sources import DownloadError, Source, VideoPart
 
 
@@ -105,11 +107,13 @@ def safe_error(error: Exception) -> str:
 
 
 class Bilibili:
-    def __init__(self, *, gate: RequestGate | None = None, transport=None):
+    def __init__(self, *, gate: RequestGate | None = None, transport=None, image_transport=None):
         self.gate = gate or RequestGate()
         self.http = ApiHttpClient(self.gate, transport=transport)
         self.sdk = AsyncBpiClient(http_client=self.http)
         self.session: Session | None = None
+        self.image_transport = image_transport
+        self.favorites = FavoriteLibrary(self.sdk.fav)
 
     async def __aenter__(self):
         return self
@@ -123,6 +127,7 @@ class Bilibili:
         self.http.cookies.clear()
         self.http.user_agent = ""
         self.session = None
+        self.favorites.clear()
 
     async def use_cookie(self, cookie: str, *, user_agent: str = "") -> Session:
         self.clear_session()
@@ -135,13 +140,61 @@ class Bilibili:
             nav = await self.sdk.login.nav()
             if not nav.is_login or not nav.mid:
                 raise DownloadError("登录身份验证失败")
+            avatar = b""
+            if nav.face:
+                try:
+                    avatar = await self.avatar_image(nav.face)
+                except (DownloadError, httpx.HTTPError):
+                    pass  # A missing avatar must not turn valid authentication into failure.
             self.session = Session(
-                nav.mid, nav.uname or str(nav.mid), normalized_cookie(cookie), user_agent
+                nav.mid, nav.uname or str(nav.mid), normalized_cookie(cookie), user_agent, avatar
             )
             return self.session
         except BaseException:
             self.clear_session()
             raise
+
+    async def avatar_image(self, value: str) -> bytes:
+        url = urlparse(value)
+        host = url.hostname or ""
+        if (
+            url.scheme not in {"http", "https"}
+            or url.username
+            or url.password
+            or url.netloc != host
+            or not (host == "hdslb.com" or host.endswith(".hdslb.com"))
+        ):
+            return b""
+        value = url._replace(scheme="https").geturl()
+        # No login cookies, redirects or arbitrary hosts. Same request gate as the API.
+        async with httpx.AsyncClient(
+            transport=self.image_transport, timeout=10, trust_env=False
+        ) as images:
+            async with self.gate.request():
+                async with images.stream(
+                    "GET",
+                    value,
+                    follow_redirects=False,
+                    headers={
+                        "User-Agent": self.http.user_agent or "Mozilla/5.0",
+                        "Referer": "https://www.bilibili.com/",
+                    },
+                ) as response:
+                    self.gate.check(response.status_code)
+                    if response.status_code != 200:
+                        return b""
+                    if response.headers.get("content-type", "").split(";")[0] not in {
+                        "image/jpeg",
+                        "image/png",
+                        "image/webp",
+                    }:
+                        return b""
+                    body = bytearray()
+                    async for chunk in response.aiter_bytes(chunk_size=64 * 1024):
+                        if len(body) + len(chunk) > 1024 * 1024:
+                            return b""
+                        body.extend(chunk)
+                    return bytes(body)
 
     async def parts(self, source: Source, *, all_parts=False, page=1) -> AsyncIterator[VideoPart]:
         if page < 1:

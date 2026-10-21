@@ -30,6 +30,8 @@ class Session:
     name: str
     cookie: str = field(repr=False)
     user_agent: str = ""
+    # Presentation-only, fetched once for each verified login; never stored in Keychain.
+    avatar: bytes = field(default=b"", repr=False, compare=False)
 
 
 def normalized_cookie(value: str) -> str:

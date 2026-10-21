@@ -72,6 +72,7 @@ async def transfer(
     report: Callable[[Progress], None],
     *,
     user_agent="Mozilla/5.0",
+    label="媒体流",
 ):
     # A separate cookie-free client prevents account credentials reaching a media CDN.
     for hop in range(4):
@@ -92,7 +93,7 @@ async def transfer(
                     if not location:
                         raise DownloadError("CDN 重定向缺少目标地址")
                     url = media_url(urljoin(url, location), [])
-                    report(Progress("redirect", f"CDN 安全转发 {hop + 1}/4"))
+                    report(Progress("redirect", f"{label} · CDN 安全转发 {hop + 1}/4"))
                     continue
                 if response.status_code != 200:
                     raise DownloadError(f"媒体下载返回 HTTP {response.status_code}，未自动重试")
@@ -103,7 +104,7 @@ async def transfer(
                     async for chunk in response.aiter_bytes(chunk_size=256 * 1024):
                         output.write(chunk)
                         completed += len(chunk)
-                        report(Progress("bytes", "下载媒体流", completed, total))
+                        report(Progress("bytes", f"下载{label}", completed, total))
                 if completed == 0 or (total is not None and completed != total):
                     raise DownloadError("下载长度不完整，没有生成最终文件；可以手动重新运行")
                 return
@@ -176,7 +177,7 @@ async def download_part(
     report(Progress("metadata", f"获取播放信息：{part.title} / P{part.number}"))
     data = await api.streams(part, quality)
     combined = data.dash is None
-    urls = []
+    transfers = []
     if data.dash:
         if format == "mp4":
             streams = [v for v in data.dash.video if v.id <= quality]
@@ -184,14 +185,18 @@ async def download_part(
             stream = max(compatible or streams, key=lambda x: (x.id, x.bandwidth), default=None)
             if stream is None:
                 raise DownloadError("此内容没有不高于所选画质的可用视频流")
-            urls.append(media_url(stream.base_url, stream.backup_url))
+            transfers.append(("视频流（画面）", media_url(stream.base_url, stream.backup_url)))
         audio = max(data.dash.audio, key=lambda x: x.bandwidth, default=None)
         if audio:
-            urls.append(media_url(audio.base_url, audio.backup_url))
+            transfers.append(("音频流（声音）", media_url(audio.base_url, audio.backup_url)))
         elif format != "mp4":
             raise DownloadError("此内容没有可用音频流")
     elif data.durl:
-        urls = [media_url(d.url, d.backup_url) for d in sorted(data.durl, key=lambda d: d.order)]
+        segments = sorted(data.durl, key=lambda d: d.order)
+        transfers = [
+            (f"音视频片段 {index + 1}/{len(segments)}（同一视频）", media_url(d.url, d.backup_url))
+            for index, d in enumerate(segments)
+        ]
     else:
         raise DownloadError("播放接口没有返回支持的 DASH 或分段流")
     output.mkdir(parents=True, exist_ok=True)
@@ -201,9 +206,9 @@ async def download_part(
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(60, connect=20), trust_env=False, transport=media_transport
         ) as http:
-            for index, url in enumerate(urls):
+            for index, (label, url) in enumerate(transfers):
                 path = work / f"{index}.m4s"
-                report(Progress("download", f"下载媒体流 {index + 1}/{len(urls)}：{part.title}"))
+                report(Progress("download", f"下载{label}：{part.title} / P{part.number}"))
                 await transfer(
                     http,
                     api.gate,
@@ -211,10 +216,16 @@ async def download_part(
                     path,
                     report,
                     user_agent=api.http.user_agent or "Mozilla/5.0",
+                    label=label,
                 )
                 inputs.append(path)
         staged = work / f"result.{format}"
-        report(Progress("convert", f"转换为 {format.upper()}：{part.title}"))
+        action = (
+            "合并视频流与音频流，生成 1 个 MP4"
+            if not combined and format == "mp4" and len(transfers) == 2
+            else f"转换并生成 1 个 {format.upper()} 文件"
+        )
+        report(Progress("convert", f"{action}：{part.title}"))
         await convert(executable, inputs, staged, combined=combined)
         try:
             # Atomic publication without overwriting a file created by another job.

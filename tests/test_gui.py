@@ -2,7 +2,8 @@ import asyncio
 import time
 
 import pytest
-from conftest import BV, Provider
+from conftest import BV, PNG, Provider, library_provider
+from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import QApplication
 
 from bili_downloader import gui
@@ -25,7 +26,7 @@ def wait_for(app, condition):
 
 
 @pytest.fixture
-def window(app, monkeypatch):
+def window(app, monkeypatch, request):
     class Settings:
         def value(self, key, default):
             return default
@@ -34,7 +35,8 @@ def window(app, monkeypatch):
             pass
 
     monkeypatch.setattr(gui, "QSettings", lambda *args: Settings())
-    provider = Provider(pages=2)
+    factory = getattr(request, "param", lambda: Provider(pages=2))
+    provider = factory()
     window = gui.MainWindow(api_factory=provider.api)
     window.show()
     app.processEvents()
@@ -65,6 +67,91 @@ def test_preview_uses_real_worker_without_idle_network_calls(app, window):
     assert widget.preview_items.topLevelItemCount() == 0
     assert widget.preview_items.isHidden()
     assert len(provider.requests) == 1
+
+
+def test_profile_renders_from_login_memory_without_fetching_again(app, window):
+    widget, provider = window
+    assert widget.account_toggle.text() == "登录"
+    assert widget.identity.isHidden()
+    session = Session(42, "头像测试", "synthetic-cookie", avatar=PNG)
+    widget.show_session(session)
+    assert widget.identity.text() == "头像测试"
+    assert not widget.account_toggle.icon().isNull()
+    assert widget.account_toggle.text() == "" and widget.identity.isVisible()
+    assert widget.account_toggle.width() == widget.account_toggle.height() == 44
+    assert widget.library_toggle.text() == "" and not widget.library_toggle.icon().isNull()
+    assert widget.library_toggle.accessibleName() == "我的收藏"
+    widget.resize(760, 650)
+    app.processEvents()
+    assert widget.rect().contains(
+        widget.account_toggle.mapTo(widget, widget.account_toggle.rect().bottomRight())
+    )
+    widget.show_session(session)
+    assert not provider.requests
+    widget.show_session(None)
+    assert widget.identity.isHidden() and not widget.library_toggle.isEnabled()
+    assert widget.account_toggle.text() == "登录" and widget.account_toggle.icon().isNull()
+    widget.account_toggle.click()
+    assert widget.account_panel.isVisible() and not provider.requests
+
+
+def test_byte_progress_preserves_video_and_audio_stream_labels(app, window):
+    widget, provider = window
+    for label in ("视频流（画面）", "音频流（声音）", "音视频片段 1/2（同一视频）"):
+        widget.show_progress(Progress("bytes", f"下载{label}", 1024 * 1024, 2 * 1024 * 1024))
+        assert label in widget.status.text()
+        assert "1.0 MiB / 2.0 MiB" in widget.status.text()
+        assert widget.bar.value() == 50
+    assert not provider.requests
+
+
+@pytest.mark.parametrize("window", [lambda: library_provider()[0]], indirect=True)
+def test_login_favorites_browse_cache_and_fill_download_source(app, window, monkeypatch):
+    widget, provider = window
+    widget.launch(lambda api: api.use_cookie("SESSDATA=synthetic; DedeUserID=42"))
+    wait_for(app, lambda: not widget.busy and widget.favorite_items.topLevelItemCount() == 20)
+    assert widget.identity.text() == "Synthetic" and widget.library_panel.isVisible()
+    assert widget.folders.currentData() == 10
+    first_item = widget.favorite_items.topLevelItem(0)
+    widget.favorite_items.setCurrentItem(first_item)
+    body_count = sum(r.url.path.endswith("resource/list") for r in provider.requests)
+    monkeypatch.setattr(gui.QApplication, "applicationState", lambda: Qt.ApplicationActive)
+    widget.check_library()
+    wait_for(app, lambda: not widget.busy)
+    assert widget.favorite_items.currentItem() is first_item
+    assert sum(r.url.path.endswith("resource/list") for r in provider.requests) == body_count
+    count = len(provider.requests)
+    widget.set_busy(True)
+    widget.check_library()
+    widget.set_busy(False)
+    with monkeypatch.context() as context:
+        context.setattr(widget, "isMinimized", lambda: True)
+        widget.check_library()
+    assert len(provider.requests) == count
+    widget.more_favorites.click()
+    wait_for(app, lambda: not widget.busy and widget.favorite_items.topLevelItemCount() == 21)
+    count = len(provider.requests)
+    widget.use_favorite.click()
+    assert widget.source.text() == "BV0000000001" and widget.mode.currentData() == "auto"
+    assert not widget.library_panel.isVisible() and len(provider.requests) == count
+    widget.check_library()
+    assert len(provider.requests) == count  # Collapsed panel never polls.
+    widget.library_toggle.click()
+    monkeypatch.setattr(gui.QApplication, "applicationState", lambda: Qt.ApplicationInactive)
+    widget.check_library()
+    assert len(provider.requests) == count
+    widget.use_folder.click()
+    assert widget.source.text() == "10" and widget.mode.currentData() == "favorite"
+    assert len(provider.requests) == count  # Filling a source never starts a download.
+
+    async def denied(api):
+        raise DownloadError("合成刷新失败")
+
+    widget.launch(denied, library=True)
+    wait_for(app, lambda: not widget.busy)
+    assert not widget.auto_library.isChecked()
+    assert widget.favorite_items.topLevelItemCount() == 21
+    assert "自动检查已暂停" in widget.library_hint.text()
 
 
 def test_cancel_and_error_leave_ui_usable(app, window):
@@ -216,6 +303,6 @@ def test_keychain_save_failure_stays_visible_without_losing_memory_login(app, wi
     wait_for(app, lambda: not widget.busy)
     assert widget.task_title.text() == "未能完成"
     assert "当前登录可用，但未能保存" in widget.status.text()
-    assert widget.identity.text() == "已登录"
+    assert widget.identity.text() == "Synthetic user"
     assert widget.account_identity.text() == "Synthetic user · UID 42"
     assert not provider.requests

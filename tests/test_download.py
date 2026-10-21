@@ -20,15 +20,31 @@ async def test_sdk_to_streams_to_real_ffmpeg_and_existing_output(tmp_path, media
         return httpx.Response(200, content=media[request.url.path.lstrip("/")])
 
     transport = httpx.MockTransport(cdn)
+    progress = []
     async with provider.api() as api:
         await api.use_cookie("SESSDATA=synthetic; DedeUserID=42")
         result = await download_source(
-            api, Source("video", BV), tmp_path, format=format, media_transport=transport
+            api,
+            Source("video", BV),
+            tmp_path,
+            format=format,
+            media_transport=transport,
+            report=progress.append,
         )
         assert len(result) == 1 and result[0].path.stat().st_size > 100
         assert result[0].path.parent == tmp_path
         assert result[0].path.suffix == "." + format
         assert len(media_requests) == (2 if format == "mp4" else 1)
+        starts = [e.message for e in progress if e.phase == "download"]
+        assert len(starts) == len(media_requests)
+        if format == "mp4":
+            assert "视频流（画面）" in starts[0] and "音频流（声音）" in starts[1]
+            assert any("合并视频流与音频流，生成 1 个 MP4" in e.message for e in progress)
+        else:
+            assert "音频流（声音）" in starts[0]
+        assert all(
+            "视频流" in e.message or "音频流" in e.message for e in progress if e.phase == "bytes"
+        )
         contents = result[0].path.read_bytes()
         again = await download_source(
             api, Source("video", BV), tmp_path, format=format, media_transport=transport
@@ -158,7 +174,7 @@ async def test_progressive_segments_are_concatenated_in_server_order(tmp_path, m
                 return response(data)
             return super().__call__(request)
 
-    calls = []
+    calls, progress = [], []
 
     def cdn(request):
         calls.append(request.url.path)
@@ -171,6 +187,11 @@ async def test_progressive_segments_are_concatenated_in_server_order(tmp_path, m
             tmp_path,
             format=format,
             media_transport=httpx.MockTransport(cdn),
+            report=progress.append,
         )
     assert calls == ["/segment1", "/segment2"]
     assert result[0].path.stat().st_size > 100
+    starts = [e.message for e in progress if e.phase == "download"]
+    assert len(starts) == 2
+    assert "音视频片段 1/2（同一视频）" in starts[0]
+    assert "音视频片段 2/2（同一视频）" in starts[1]

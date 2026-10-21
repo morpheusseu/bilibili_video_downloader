@@ -14,6 +14,7 @@ COLORS = {
     "hairline": "#e0e0e0",
     "soft": "#f0f0f0",
     "disabled": "#7a7a7a",
+    "pink": "#cf2f73",
     "down": Path(__file__).with_name("chevron-down.svg").as_posix(),
     "up": Path(__file__).with_name("chevron-up.svg").as_posix(),
 }
@@ -31,6 +32,7 @@ STYLE = Template("""
     QLabel#taskTitle { font-size: 17px; font-weight: 600; }
     QLabel#hint { color: $muted; font-size: 12px; }
     QLabel#finePrint { color: $muted; font-size: 11px; }
+    QLabel#identity { color: $ink; font-size: 14px; }
     QWidget#header { background: $white; border-bottom: 1px solid $hairline; }
     QFrame#card { background: $white; border: 1px solid $hairline; border-radius: 18px; }
     QFrame#taskPanel { background: $white; border-top: 1px solid $hairline; }
@@ -72,6 +74,16 @@ STYLE = Template("""
     QPushButton:disabled, QPushButton#primary:disabled, QPushButton#secondary:disabled {
         color: $disabled; background: $parchment; border: 1px solid $hairline;
     }
+    QPushButton#accountAvatar { background: $white; color: $pink; border: 1px solid $hairline;
+        border-radius: 22px; padding: 0; font-size: 12px; font-weight: 600;
+        min-width: 42px; max-width: 42px; min-height: 42px; max-height: 42px; }
+    QPushButton#accountAvatar:checked { background: $parchment; }
+    QPushButton#accountAvatar:focus { border: 1px solid $focus; }
+    QPushButton#favoritesStar { background: transparent; border: 1px solid transparent;
+        border-radius: 22px; padding: 0;
+        min-width: 42px; max-width: 42px; min-height: 42px; max-height: 42px; }
+    QPushButton#favoritesStar:checked { background: $parchment; border: 1px solid $hairline; }
+    QPushButton#favoritesStar:focus { border: 1px solid $focus; }
     QCheckBox { spacing: 8px; min-height: 26px; }
     QCheckBox::indicator { width: 16px; height: 16px; }
     QCheckBox:disabled, QLabel:disabled { color: $disabled; }

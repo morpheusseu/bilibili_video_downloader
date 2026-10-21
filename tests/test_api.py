@@ -4,6 +4,8 @@ from types import SimpleNamespace
 import httpx
 import pytest
 from conftest import BV, Provider, favorite_item, folder_info, response
+from playwright.async_api import Error as BrowserError
+from playwright.async_api import TimeoutError as BrowserTimeout
 
 from bili_downloader import auth, browser_login
 from bili_downloader.api import Bilibili, RequestGate, safe_error
@@ -158,6 +160,9 @@ class Browser:
         self.closed = False
         self.cookies_started = asyncio.Event()
         self.wait_cookies = False
+        self.pages = [self]
+        self.navigated = False
+        self.mid = "42"
 
     async def launch(self, **kwargs):
         assert kwargs == {"channel": "chrome", "headless": False}
@@ -172,6 +177,7 @@ class Browser:
 
     async def goto(self, url, **kwargs):
         assert url == "https://passport.bilibili.com/login"
+        self.navigated = True
 
     async def cookies(self, urls):
         self.cookies_started.set()
@@ -179,13 +185,17 @@ class Browser:
             await asyncio.Event().wait()
         return [
             {"name": "SESSDATA", "value": "synthetic"},
-            {"name": "DedeUserID", "value": "42"},
+            {"name": "DedeUserID", "value": self.mid},
             {"name": "buvid4", "value": "synthetic-browser-device"},
             {"name": "ignored", "value": "not-exported"},
         ]
 
     async def evaluate(self, expression):
         assert expression == "navigator.userAgent"
+        if self.navigated:
+            raise BrowserError(
+                "Execution context was destroyed, most likely because of a navigation"
+            )
         return "Synthetic Chrome"
 
     def is_connected(self):
@@ -209,8 +219,9 @@ async def test_chrome_handoff_and_cancel_close_only_owned_browser(monkeypatch, c
     browser = Browser()
     browser.wait_cookies = cancel
     monkeypatch.setattr(browser_login, "async_playwright", lambda: browser)
-    async with Provider().api() as api:
-        task = asyncio.create_task(browser_login.chrome_login(api, lambda message: None))
+    provider, messages = Provider(), []
+    async with provider.api() as api:
+        task = asyncio.create_task(browser_login.chrome_login(api, messages.append))
         await browser.cookies_started.wait()
         if cancel:
             task.cancel()
@@ -222,7 +233,102 @@ async def test_chrome_handoff_and_cancel_close_only_owned_browser(monkeypatch, c
             assert session.mid == 42 and session.user_agent == "Synthetic Chrome"
             assert "ignored" not in session.cookie
             assert "buvid4=synthetic-browser-device" in session.cookie
+            assert len(provider.requests) == 1
+            assert [message[:3] for message in messages] == ["1/4", "2/4", "3/4", "4/4"]
+        assert len(provider.requests) == (0 if cancel else 1)
     assert browser.closed
+
+
+@pytest.mark.parametrize(
+    ("method", "stage", "error"),
+    [
+        ("launch", "启动 Chrome", BrowserError("missing chrome; SESSDATA=do-not-log")),
+        ("new_context", "准备独立会话", BrowserError("SESSDATA=do-not-log")),
+        ("evaluate", "读取浏览器信息", BrowserError("Execution context was destroyed; do-not-log")),
+        ("goto", "打开官方登录页", BrowserTimeout("https://private.invalid/?SESSDATA=do-not-log")),
+        ("cookies", "读取登录状态", BrowserError("Target context has been closed; do-not-log")),
+    ],
+)
+async def test_chrome_errors_identify_stage_without_disclosing_browser_details(
+    monkeypatch, method, stage, error
+):
+    browser, provider = Browser(), Provider()
+
+    async def fail(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(browser, method, fail)
+    monkeypatch.setattr(browser_login, "async_playwright", lambda: browser)
+    async with provider.api() as api:
+        with pytest.raises(DownloadError) as raised:
+            await browser_login.chrome_login(api, lambda message: None)
+        assert f"［{stage}］" in str(raised.value)
+        assert "do-not-log" not in str(raised.value)
+        assert "SESSDATA" not in str(raised.value)
+        assert "private.invalid" not in str(raised.value)
+        assert api.session is None
+    assert not provider.requests
+    if method != "launch":
+        assert browser.closed
+
+
+async def test_chrome_handoff_does_not_depend_on_original_page_staying_open(monkeypatch):
+    browser = Browser()
+    browser.pages = [object()]  # Provider replaced the original login tab.
+    monkeypatch.setattr(browser, "is_closed", lambda: True)
+    monkeypatch.setattr(browser_login, "async_playwright", lambda: browser)
+    provider = Provider()
+    async with provider.api() as api:
+        assert (await browser_login.chrome_login(api, lambda message: None)).mid == 42
+        assert len(provider.requests) == 1
+    assert browser.closed
+
+
+@pytest.mark.parametrize("verification", ["identity_mismatch", "risk_rejected"])
+async def test_chrome_failed_identity_verification_clears_session_without_retry(
+    monkeypatch, verification
+):
+    browser = Browser()
+    monkeypatch.setattr(browser_login, "async_playwright", lambda: browser)
+    requests = []
+
+    def nav(request):
+        requests.append(request)
+        if verification == "risk_rejected":
+            return response(None, code=-352)
+        return response({"isLogin": True, "mid": 43, "uname": "Another synthetic account"})
+
+    async with Bilibili(gate=RequestGate(0, 0), transport=httpx.MockTransport(nav)) as api:
+        with pytest.raises(DownloadError, match="验证账号身份"):
+            await browser_login.chrome_login(api, lambda message: None)
+        assert api.session is None and not list(api.http.cookies)
+        assert api.gate.stopped == (verification == "risk_rejected")
+    assert browser.closed and len(requests) == 1
+
+
+@pytest.mark.parametrize("mismatch", [False, True])
+async def test_chrome_cleanup_failure_does_not_mask_verified_session_or_primary_error(
+    monkeypatch, mismatch
+):
+    browser, provider, messages = Browser(), Provider(), []
+    browser.mid = "43" if mismatch else "42"
+
+    async def cannot_close():
+        raise BrowserError("SESSDATA=do-not-log")
+
+    monkeypatch.setattr(browser, "close", cannot_close)
+    monkeypatch.setattr(browser_login, "async_playwright", lambda: browser)
+    async with provider.api() as api:
+        if mismatch:
+            with pytest.raises(DownloadError, match="验证账号身份.*账号不一致"):
+                await browser_login.chrome_login(api, messages.append)
+            assert api.session is None
+        else:
+            session = await browser_login.chrome_login(api, messages.append)
+            assert session is api.session and session.mid == 42
+        assert "清理提示［关闭登录窗口］" in messages[-1]
+        assert "do-not-log" not in "\n".join(messages)
+    assert len(provider.requests) == 1
 
 
 @pytest.mark.parametrize(("drm", "preview"), [(True, 0), (False, 1)])

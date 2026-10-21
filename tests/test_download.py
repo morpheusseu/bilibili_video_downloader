@@ -45,6 +45,10 @@ async def test_sdk_to_streams_to_real_ffmpeg_and_existing_output(tmp_path, media
         assert all(
             "视频流" in e.message or "音频流" in e.message for e in progress if e.phase == "bytes"
         )
+        percentages = [e.percent for e in progress if e.percent is not None]
+        assert percentages == sorted(percentages) and percentages[-1] == 100
+        assert all(e.percent != 100 or e.phase == "done" for e in progress)
+        assert len([e for e in progress if e.phase == "done"]) == 1
         contents = result[0].path.read_bytes()
         again = await download_source(
             api, Source("video", BV), tmp_path, format=format, media_transport=transport
@@ -195,3 +199,28 @@ async def test_progressive_segments_are_concatenated_in_server_order(tmp_path, m
     assert len(starts) == 2
     assert "音视频片段 1/2（同一视频）" in starts[0]
     assert "音视频片段 2/2（同一视频）" in starts[1]
+    percentages = [e.percent for e in progress if e.percent is not None]
+    assert percentages == sorted(percentages) and percentages[-1] == 100
+
+
+async def test_unknown_media_lengths_remain_indeterminate_until_real_completion(tmp_path, media):
+    class Chunks(httpx.AsyncByteStream):
+        def __init__(self, content):
+            self.content = content
+
+        async def __aiter__(self):
+            yield self.content
+
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(200, stream=Chunks(media[request.url.path.lstrip("/")]))
+    )
+    progress = []
+    async with Provider().api() as api:
+        result = await download_source(
+            api, Source("video", BV), tmp_path, media_transport=transport, report=progress.append
+        )
+    assert result[0].path.stat().st_size > 100
+    byte_events = [e for e in progress if e.phase == "bytes"]
+    assert len(byte_events) == 2 and all(e.percent is None for e in byte_events)
+    assert [e.percent for e in progress if e.phase == "convert"] == [95]
+    assert [e.percent for e in progress if e.phase == "done"] == [100]

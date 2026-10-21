@@ -4,7 +4,7 @@ import asyncio
 import os
 import shutil
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from urllib.parse import urljoin, urlparse
@@ -22,6 +22,9 @@ class Progress:
     message: str
     completed: int = 0
     total: int | None = None
+    # Current output file, not the whole (possibly still paginating) collection.
+    # Equal stream stages occupy 95%; only atomic publication reaches 100%.
+    percent: int | None = None
 
 
 @dataclass(frozen=True)
@@ -208,13 +211,28 @@ async def download_part(
         ) as http:
             for index, (label, url) in enumerate(transfers):
                 path = work / f"{index}.m4s"
-                report(Progress("download", f"下载{label}：{part.title} / P{part.number}"))
+                report(
+                    Progress(
+                        "download",
+                        f"下载{label}：{part.title} / P{part.number}",
+                        percent=int(95 * index / len(transfers)),
+                    )
+                )
+
+                def report_transfer(event, *, index=index):
+                    percent = None
+                    if event.phase == "bytes" and event.total:
+                        percent = int(
+                            95 * (index + min(1, event.completed / event.total)) / len(transfers)
+                        )
+                    report(replace(event, percent=percent))
+
                 await transfer(
                     http,
                     api.gate,
                     url,
                     path,
-                    report,
+                    report_transfer,
                     user_agent=api.http.user_agent or "Mozilla/5.0",
                     label=label,
                 )
@@ -225,7 +243,7 @@ async def download_part(
             if not combined and format == "mp4" and len(transfers) == 2
             else f"转换并生成 1 个 {format.upper()} 文件"
         )
-        report(Progress("convert", f"{action}：{part.title}"))
+        report(Progress("convert", f"{action}：{part.title}", percent=95))
         await convert(executable, inputs, staged, combined=combined)
         try:
             # Atomic publication without overwriting a file created by another job.
@@ -236,7 +254,7 @@ async def download_part(
         except FileExistsError:
             report(Progress("skipped", f"文件已由其他任务生成，跳过：{target.name}"))
             return Result(target, skipped=True)
-    report(Progress("done", f"完成：{target.name}"))
+    report(Progress("done", f"完成：{target.name}", percent=100))
     return Result(target)
 
 

@@ -55,6 +55,7 @@ from .api import Bilibili, safe_error
 from .auth import Session, forget_session, load_session, save_session
 from .browser_login import chrome_login
 from .download import Progress, download_source
+from .download_button import DownloadButton
 from .library import FavoriteView
 from .sources import DownloadError, parse_source
 from .theme import STYLE
@@ -158,6 +159,7 @@ class MainWindow(QMainWindow):
         self._session_mid = None
         self._pending_library = False
         self._library_job = False
+        self._download_job = False
         self._library_view = FavoriteView()
         root = QWidget()
         layout = QVBoxLayout(root)
@@ -395,27 +397,39 @@ class MainWindow(QMainWindow):
         task_layout = QVBoxLayout(task)
         task_layout.setContentsMargins(32, 16, 32, 16)
         task_layout.setSpacing(10)
+        self.task_details = QWidget()
+        detail_layout = QVBoxLayout(self.task_details)
+        detail_layout.setContentsMargins(0, 0, 0, 0)
+        detail_layout.setSpacing(10)
         status_row = QHBoxLayout()
         self.task_title = self.label("准备就绪", "taskTitle")
         status_row.addWidget(self.task_title)
         status_row.addStretch()
         self.open_output = QPushButton("打开文件夹")
         self.open_output.setObjectName("link")
-        self.details = QPushButton("操作详情")
-        self.details.setObjectName("link")
-        self.details.setCheckable(True)
         status_row.addWidget(self.open_output)
-        status_row.addWidget(self.details)
-        task_layout.addLayout(status_row)
+        detail_layout.addLayout(status_row)
         self.status = self.label("粘贴内容链接，检查来源或直接开始下载。", "hint")
-        task_layout.addWidget(self.status)
+        detail_layout.addWidget(self.status)
         self.bar = QProgressBar()
         self.bar.setValue(0)
         self.bar.setTextVisible(False)
         self.bar.setFixedHeight(6)
-        task_layout.addWidget(self.bar)
+        detail_layout.addWidget(self.bar)
+        self.log = QPlainTextEdit()
+        self.log.setReadOnly(True)
+        self.log.document().setMaximumBlockCount(500)
+        self.log.setFixedHeight(100)
+        self.log.setAccessibleName("下载与操作详情")
+        self.log.setPlaceholderText("操作详情会显示在这里；不记录 Cookie 或带签名的下载地址。")
+        detail_layout.addWidget(self.log)
+        self.task_details.hide()
+        task_layout.addWidget(self.task_details)
         actions = QHBoxLayout()
         actions.setSpacing(12)
+        self.details = DownloadButton()
+        self.details.toggled.connect(self.task_details.setVisible)
+        actions.addWidget(self.details)
         pacing = self.label("串行请求 · 间隔 0.5–1.5 秒", "finePrint")
         pacing.setWordWrap(False)
         actions.addWidget(pacing)
@@ -430,14 +444,6 @@ class MainWindow(QMainWindow):
         actions.addWidget(self.cancel)
         actions.addWidget(self.start_download)
         task_layout.addLayout(actions)
-        self.log = QPlainTextEdit()
-        self.log.setReadOnly(True)
-        self.log.document().setMaximumBlockCount(500)
-        self.log.setFixedHeight(100)
-        self.log.setPlaceholderText("操作详情会显示在这里；不记录 Cookie 或带签名的下载地址。")
-        self.log.hide()
-        self.details.toggled.connect(self.log.setVisible)
-        task_layout.addWidget(self.log)
         layout.addWidget(task)
         self.setCentralWidget(root)
         self.mode.currentIndexChanged.connect(self.mode_changed)
@@ -684,12 +690,22 @@ class MainWindow(QMainWindow):
         self.library_controls()
 
     def launch(
-        self, operation, title="正在处理", note="请求串行执行，可随时取消。", *, library=False
+        self,
+        operation,
+        title="正在处理",
+        note="请求串行执行，可随时取消。",
+        *,
+        library=False,
+        download=False,
     ):
         if self.busy:
             return
         self.set_busy(True)
         self._library_job = library
+        self._download_job = download
+        self.details.set_progress(download)
+        if not library:
+            self.details.setChecked(True)
         self.task_title.setText(title)
         self.status.setText(note)
         self.bar.setRange(0, 0)
@@ -701,6 +717,8 @@ class MainWindow(QMainWindow):
 
     def on_idle(self):
         self._library_job = False
+        self._download_job = False
+        self.details.set_progress(False)
         self.set_busy(False)
         if self.bar.maximum() == 0:
             self.bar.setRange(0, 100)
@@ -710,6 +728,7 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(0, self.load_library)
 
     def show_error(self, text):
+        self.details.setChecked(True)
         if self._library_job:
             self.auto_library.setChecked(False)
             self.library_hint.setText(f"{text}；自动检查已暂停，原有缓存保留。")
@@ -720,6 +739,7 @@ class MainWindow(QMainWindow):
         self.log.appendPlainText(text)
 
     def show_cancelled(self):
+        self.details.setChecked(True)
         if self._library_job:
             self.auto_library.setChecked(False)
         self.task_title.setText("已取消")
@@ -740,12 +760,16 @@ class MainWindow(QMainWindow):
                 f"{event.message} · {megabytes:.1f} MiB"
                 + (f" / {event.total / 1024 / 1024:.1f} MiB" if event.total else "")
             )
-            self.bar.setRange(0, 100 if event.total else 0)
-            if event.total:
-                self.bar.setValue(min(100, int(100 * event.completed / event.total)))
         else:
-            self.bar.setRange(0, 0)
             self.log.appendPlainText(event.message)
+        if event.phase != "summary":
+            self.bar.setRange(0, 100 if event.percent is not None else 0)
+            if event.percent is not None:
+                self.bar.setValue(event.percent)
+            if self._download_job:
+                self.details.set_progress(True, event.percent)
+                if event.phase == "done":
+                    self.details.completed()
 
     def show_session(self, session):
         mid = session.mid if session else None
@@ -859,6 +883,7 @@ class MainWindow(QMainWindow):
             self.task_title.setText("来源已检查" if parts else "没有找到内容")
             self.status.setText(self.preview_hint.text())
         self.log.appendPlainText(self.status.text())
+        self.details.setChecked(False)
 
     def finish_login(self, session, remember):
         if remember:
@@ -944,6 +969,7 @@ class MainWindow(QMainWindow):
             ),
             "正在下载",
             "正在读取内容，随后下载并转换；已有文件会跳过。",
+            download=True,
         )
 
     def preview_source(self):

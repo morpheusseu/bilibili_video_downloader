@@ -1,6 +1,8 @@
 import asyncio
+import threading
 import time
 
+import httpx
 import pytest
 from conftest import BV, PNG, Provider, library_provider
 from PyQt5.QtCore import Qt
@@ -98,10 +100,114 @@ def test_profile_renders_from_login_memory_without_fetching_again(app, window):
 def test_byte_progress_preserves_video_and_audio_stream_labels(app, window):
     widget, provider = window
     for label in ("视频流（画面）", "音频流（声音）", "音视频片段 1/2（同一视频）"):
-        widget.show_progress(Progress("bytes", f"下载{label}", 1024 * 1024, 2 * 1024 * 1024))
+        widget.show_progress(
+            Progress("bytes", f"下载{label}", 1024 * 1024, 2 * 1024 * 1024, percent=50)
+        )
         assert label in widget.status.text()
         assert "1.0 MiB / 2.0 MiB" in widget.status.text()
         assert widget.bar.value() == 50
+    assert not provider.requests
+
+
+def test_download_tray_counts_files_not_streams_and_acknowledges_on_open(
+    app, window, monkeypatch, tmp_path, media
+):
+    widget, provider = window
+    real_download = gui.download_source
+    requests = []
+
+    def cdn(request):
+        requests.append(request)
+        return httpx.Response(200, content=media[request.url.path.lstrip("/")])
+
+    async def download(*args, **kwargs):
+        return await real_download(*args, **kwargs, media_transport=httpx.MockTransport(cdn))
+
+    monkeypatch.setattr(gui, "download_source", download)
+    assert widget.task_details.isHidden() and not widget.details.isChecked()
+    assert widget.details.new_count == 0 and not widget.details.active
+    widget.source.setText(BV)
+    widget.all_parts.setChecked(True)
+    widget.destination.setText(str(tmp_path))
+    widget.start_download.click()
+    assert widget.task_details.isVisible() and widget.details.active
+    wait_for(app, lambda: not widget.busy)
+    assert len(list(tmp_path.glob("*.mp4"))) == 2 and len(requests) == 4
+    assert widget.task_details.isHidden() and not widget.details.active
+    assert widget.details.new_count == 2 and "新完成 2 个文件" in widget.details.accessibleName()
+    assert "视频流（画面）" in widget.log.toPlainText()
+    assert "音频流（声音）" in widget.log.toPlainText()
+    assert widget.start_download.isVisible() and widget.start_download.isEnabled()
+    widget.details.click()
+    assert widget.log.isVisible() and widget.details.new_count == 0
+    widget.start_download.click()
+    wait_for(app, lambda: not widget.busy)
+    assert widget.task_details.isHidden() and widget.details.new_count == 0
+    assert "0 个文件已生成，2 个已存在" in widget.status.text()
+    assert len(requests) == 4  # No media transfers and no badge for existing output.
+
+
+@pytest.mark.parametrize("interrupt", ["cancel", "error"])
+def test_collapsed_download_keeps_cancel_and_partial_results(
+    app, window, monkeypatch, tmp_path, media, interrupt
+):
+    widget, provider = window
+    real_download = gui.download_source
+    second_video, release = threading.Event(), asyncio.Event()
+    videos = 0
+
+    async def cdn(request):
+        nonlocal videos
+        if request.url.path == "/video":
+            videos += 1
+            if videos == 2:
+                second_video.set()
+                await release.wait()
+                return httpx.Response(503)
+        return httpx.Response(200, content=media[request.url.path.lstrip("/")])
+
+    async def download(*args, **kwargs):
+        return await real_download(*args, **kwargs, media_transport=httpx.MockTransport(cdn))
+
+    monkeypatch.setattr(gui, "download_source", download)
+    widget.source.setText(BV)
+    widget.all_parts.setChecked(True)
+    widget.destination.setText(str(tmp_path))
+    widget.start_download.click()
+    wait_for(
+        app,
+        lambda: second_video.is_set()
+        and widget.details.new_count == 1
+        and widget.details.percent == 0,
+    )
+    widget.details.click()
+    assert widget.task_details.isHidden() and widget.details.active
+    assert widget.details.new_count == 1  # First output is durable, second is still pending.
+    assert widget.cancel.isVisible() and widget.cancel.isEnabled()
+    assert widget.details.percent == 0 and "当前文件约 0%" in widget.details.toolTip()
+    if interrupt == "cancel":
+        widget.cancel.click()
+    else:
+        widget.engine.loop.call_soon_threadsafe(release.set)
+    wait_for(app, lambda: not widget.busy)
+    assert widget.task_details.isVisible() and not widget.details.active
+    assert (
+        "取消" in widget.status.text() if interrupt == "cancel" else "503" in widget.status.text()
+    )
+    assert len(list(tmp_path.glob("*.mp4"))) == 1
+    assert not list(tmp_path.glob(".bili-download-*"))
+    assert widget.start_download.isEnabled()
+
+
+def test_ring_preserves_known_percentage_and_marks_unknown_lengths(app, window):
+    widget, provider = window
+    widget._download_job = True
+    widget.show_progress(Progress("bytes", "下载视频流（画面）", 2, 4, percent=24))
+    assert widget.details.active and widget.details.percent == widget.bar.value() == 24
+    assert "24%" in widget.details.accessibleName()
+    widget.show_progress(Progress("bytes", "下载音频流（声音）", 1, None))
+    assert widget.details.active and widget.details.percent is None
+    assert widget.bar.maximum() == 0 and "进度未知" in widget.details.accessibleName()
     assert not provider.requests
 
 
@@ -251,7 +357,7 @@ def test_download_captures_options_and_keeps_completed_progress(app, window, mon
     async def synthetic_download(api, source, output, **options):
         captured.update(source=source, output=output, options=options.copy())
         assert api is widget.engine.api
-        options["report"](Progress("convert", "合成转换"))
+        options["report"](Progress("convert", "合成转换", percent=95))
         return [Result(output / "generated.wav"), Result(output / "existing.wav", skipped=True)]
 
     monkeypatch.setattr(gui, "download_source", synthetic_download)

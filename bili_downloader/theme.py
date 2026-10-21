@@ -15,6 +15,7 @@ COLORS = {
     "soft": "#f0f0f0",
     "disabled": "#7a7a7a",
     "pink": "#cf2f73",
+    "red": "#c62828",
     "down": Path(__file__).with_name("chevron-down.svg").as_posix(),
     "up": Path(__file__).with_name("chevron-up.svg").as_posix(),
 }
@@ -84,6 +85,8 @@ STYLE = Template("""
         min-width: 42px; max-width: 42px; min-height: 42px; max-height: 42px; }
     QPushButton#favoritesStar:checked { background: $parchment; border: 1px solid $hairline; }
     QPushButton#favoritesStar:focus { border: 1px solid $focus; }
+    QPushButton#downloadDetails { padding: 0; border: none;
+        min-width: 56px; max-width: 56px; min-height: 56px; max-height: 56px; }
     QCheckBox { spacing: 8px; min-height: 26px; }
     QCheckBox::indicator { width: 16px; height: 16px; }
     QCheckBox:disabled, QLabel:disabled { color: $disabled; }

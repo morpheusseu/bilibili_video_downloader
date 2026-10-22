@@ -165,5 +165,5 @@ async def test_avatar_never_requests_arbitrary_hosts(url):
         raise AssertionError("untrusted avatar was requested")
 
     async with Bilibili(image_transport=httpx.MockTransport(no_request)) as api:
-        assert await api.avatar_image(url) == b""
+        assert await api.cdn_image(url) == b""
         assert api.gate.count == 0

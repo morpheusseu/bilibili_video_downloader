@@ -25,6 +25,7 @@ STYLE = Template("""
         background: $parchment;
     }
     QWidget { color: $ink; font-size: 14px; font-weight: 400; }
+    QDialog#accountDialog { background: $white; }
     QLabel { background: transparent; }
     QLabel#brand { font-size: 17px; font-weight: 600; }
     QLabel#hero { font-size: 34px; font-weight: 600; }
@@ -85,6 +86,11 @@ STYLE = Template("""
         min-width: 42px; max-width: 42px; min-height: 42px; max-height: 42px; }
     QPushButton#favoritesStar:checked { background: $parchment; border: 1px solid $hairline; }
     QPushButton#favoritesStar:focus { border: 1px solid $focus; }
+    QPushButton#inboxMail { background: transparent; border: 1px solid transparent;
+        border-radius: 22px; padding: 0;
+        min-width: 42px; max-width: 42px; min-height: 42px; max-height: 42px; }
+    QPushButton#inboxMail:checked { background: $parchment; border: 1px solid $hairline; }
+    QPushButton#inboxMail:focus { border: 1px solid $focus; }
     QPushButton#downloadDetails { padding: 0; border: none;
         min-width: 56px; max-width: 56px; min-height: 56px; max-height: 56px; }
     QCheckBox { spacing: 8px; min-height: 26px; }
@@ -94,10 +100,10 @@ STYLE = Template("""
     QProgressBar::chunk { background: $blue; border-radius: 3px; }
     QPlainTextEdit { background: $pearl; border: 1px solid $hairline; border-radius: 8px;
         padding: 8px; font-size: 12px; selection-background-color: $blue; }
-    QTreeWidget { background: $pearl; border: 1px solid $hairline; border-radius: 8px;
+    QTreeWidget, QListWidget { background: $pearl; border: 1px solid $hairline; border-radius: 8px;
         padding: 4px; outline: 0; }
-    QTreeWidget::item { padding: 6px 4px; }
-    QTreeWidget::item:selected { background: $blue; color: $white; }
+    QTreeWidget::item, QListWidget::item { padding: 6px 4px; }
+    QTreeWidget::item:selected, QListWidget::item:selected { background: $blue; color: $white; }
     QHeaderView::section { background: $pearl; color: $muted; border: none;
         border-bottom: 1px solid $hairline; padding: 7px; font-size: 12px; }
     QScrollBar:vertical { background: transparent; width: 8px; margin: 4px 0; }

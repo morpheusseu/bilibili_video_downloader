@@ -1,9 +1,11 @@
 """Synthetic provider responses; tests never load credentials or call Bilibili."""
 
 import base64
+import json
 import os
 import subprocess
 from pathlib import Path
+from urllib.parse import parse_qs
 
 import httpx
 import pytest
@@ -114,6 +116,8 @@ class Provider:
         self.requests = []
         self.handler = handler
         self.pages = pages
+        self.images = []
+        self.image_handler = None
 
     def __call__(self, request):
         self.requests.append(request)
@@ -139,7 +143,16 @@ class Provider:
         raise AssertionError(f"Unexpected synthetic request: {path}")
 
     def api(self):
-        return Bilibili(gate=RequestGate(0, 0), transport=httpx.MockTransport(self))
+        def image(request):
+            self.images.append(request)
+            assert self.image_handler is not None, "Unexpected synthetic image request"
+            return self.image_handler(request)
+
+        return Bilibili(
+            gate=RequestGate(0, 0),
+            transport=httpx.MockTransport(self),
+            image_transport=httpx.MockTransport(image),
+        )
 
 
 @pytest.fixture(scope="session")
@@ -240,3 +253,138 @@ def library_provider(count=21):
         raise AssertionError(path)
 
     return Provider(handler), state
+
+
+def private_message(seq, talker=7, **changes):
+    row = {
+        "sender_uid": talker,
+        "receiver_id": 42,
+        "receiver_type": 1,
+        "msg_type": 1,
+        "content": json.dumps({"content": f"合成私信 {seq}"}),
+        "msg_seqno": seq,
+        "msg_key": 1000 + seq,
+        "timestamp": 1700000000 + seq,
+        "msg_status": 0,
+        "msg_source": 0,
+        "notify_code": "",
+    }
+    row.update(changes)
+    return row
+
+
+def private_session(talker, timestamp):
+    return {
+        "talker_id": talker,
+        "session_type": 1,
+        "session_ts": timestamp,
+        "top_ts": 0,
+        "ack_seqno": 0,
+        "ack_ts": 0,
+        "max_seqno": 25,
+        "unread_count": 2,
+        "system_msg_type": 0,
+        "is_follow": 0,
+        "is_dnd": 0,
+        "last_msg": private_message(25, talker),
+    }
+
+
+def inbox_provider(count=2):
+    provider, library_state = library_provider(1)
+    library_handler = provider.handler
+    state = {
+        "lanes": {
+            1: [private_session(7 + i, 3000000 - i) for i in range(count)],
+            2: [private_session(99, 2000000)],
+        },
+        "messages": [private_message(i) for i in range(1, 26)],
+        "repeat_sessions": False,
+        "repeat_messages": False,
+        "risk": False,
+        "names_fail": False,
+        "faces": {},
+        "sent": {},
+        "send_mode": "ok",
+        "posts": 0,
+        "read_failures": 0,
+    }
+
+    def handler(request):
+        if request.url.host != "api.vc.bilibili.com":
+            return library_handler(request)
+        if state["risk"]:
+            return httpx.Response(429)
+        path, params = request.url.path, request.url.params
+        assert "SESSDATA=" in request.headers.get("cookie", "")
+        if path.endswith("send_msg"):
+            assert request.method == "POST"
+            form = {key: values[0] for key, values in parse_qs(request.content.decode()).items()}
+            assert form["msg[sender_uid]"] == "42"
+            assert form["msg[receiver_type]"] == form["msg[msg_type]"] == "1"
+            assert form["csrf"] == "synthetic-csrf"
+            state["posts"] += 1
+            if state["send_mode"] == "reject":
+                return response({}, code=-403)
+            talker = int(form["msg[receiver_id]"])
+            seq = 26 + len(state["sent"].get(talker, []))
+            if state["send_mode"] != "lost":
+                state["sent"].setdefault(talker, []).append(
+                    private_message(
+                        seq, sender_uid=42, receiver_id=talker, content=form["msg[content]"]
+                    )
+                )
+            if state["send_mode"] in {"timeout", "lost"}:
+                raise httpx.ReadTimeout("synthetic uncertain submission")
+            return response({} if state["send_mode"] == "missing_key" else {"msg_key": 1000 + seq})
+        assert request.method == "GET"
+        if path.endswith("get_sessions"):
+            rows = state["lanes"][int(params["session_type"])]
+            if "end_ts" in params and not state["repeat_sessions"]:
+                rows = [row for row in rows if row["session_ts"] < int(params["end_ts"])]
+            return response(
+                {
+                    "session_list": rows[:20] or None,
+                    "has_more": int(len(rows) > 20),
+                    "is_address_list_empty": 0,
+                    "anti_disturb_cleaning": False,
+                    "show_level": False,
+                }
+            )
+        if path.endswith("user/cards"):
+            if state["names_fail"]:
+                return httpx.Response(500)
+            return response(
+                [
+                    {
+                        "mid": int(mid),
+                        "name": f"测试联系人 {mid}",
+                        "face": state["faces"].get(int(mid), ""),
+                    }
+                    for mid in params["uids"].split(",")
+                ]
+            )
+        if path.endswith("fetch_session_msgs"):
+            if state["posts"] and state["read_failures"]:
+                state["read_failures"] -= 1
+                return httpx.Response(500)
+            talker = int(params["talker_id"])
+            rows = [dict(row, sender_uid=talker) for row in state["messages"]]
+            rows.extend(state["sent"].get(talker, []))
+            if "end_seqno" in params and not state["repeat_messages"]:
+                rows = [row for row in rows if row["msg_seqno"] < int(params["end_seqno"])]
+            page = sorted(rows, key=lambda row: row["msg_seqno"], reverse=True)[:20]
+            return response(
+                {
+                    "messages": page or None,
+                    "has_more": int(len(rows) > 20),
+                    "min_seqno": min((row["msg_seqno"] for row in page), default=0),
+                    "max_seqno": max((row["msg_seqno"] for row in page), default=0),
+                }
+            )
+        raise AssertionError(f"Unexpected private endpoint: {path}")
+
+    provider.handler = handler
+    state["library"] = library_state
+    provider.inbox_state = state
+    return provider, state

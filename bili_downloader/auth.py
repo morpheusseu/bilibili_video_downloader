@@ -1,4 +1,4 @@
-"""Explicit, opt-in OS credential storage. No plaintext credential fallback."""
+"""Native OS credential storage, controlled by the login dialog. No plaintext fallback."""
 
 import json
 import sys

@@ -1,0 +1,355 @@
+"""Native, plain-text inbox presentation; never performs provider requests itself."""
+
+from datetime import datetime
+
+from PyQt5.QtCore import QSize, Qt, pyqtSignal
+from PyQt5.QtGui import QKeySequence, QPixmap
+from PyQt5.QtWidgets import (
+    QApplication,
+    QFrame,
+    QHBoxLayout,
+    QHeaderView,
+    QLabel,
+    QListWidget,
+    QListWidgetItem,
+    QPlainTextEdit,
+    QPushButton,
+    QSplitter,
+    QTreeWidget,
+    QTreeWidgetItem,
+    QVBoxLayout,
+    QWidget,
+)
+
+from .artwork import avatar_icon
+from .inbox import message_text
+
+
+class ReplyEditor(QPlainTextEdit):
+    submit_requested = pyqtSignal()
+
+    def __init__(self):
+        super().__init__()
+        self.composing = False
+
+    def inputMethodEvent(self, event):
+        self.composing = bool(event.preeditString())
+        super().inputMethodEvent(event)
+
+    def keyPressEvent(self, event):
+        if (
+            event.key() in (Qt.Key_Return, Qt.Key_Enter)
+            and event.modifiers() & (Qt.ControlModifier | Qt.MetaModifier)
+            and not self.composing
+        ):
+            self.submit_requested.emit()
+            event.accept()
+        else:
+            super().keyPressEvent(event)
+
+
+class MessageList(QListWidget):
+    def keyPressEvent(self, event):
+        if event.matches(QKeySequence.Copy):
+            QApplication.clipboard().setText(
+                "\n\n".join(item.text() for item in self.selectedItems())
+            )
+            event.accept()
+        else:
+            super().keyPressEvent(event)
+
+
+class InboxPanel(QFrame):
+    refresh_requested = pyqtSignal()
+    more_requested = pyqtSignal()
+    open_requested = pyqtSignal(object, bool)
+    older_requested = pyqtSignal()
+    send_requested = pyqtSignal(object, str)
+    reconcile_requested = pyqtSignal()
+
+    def __init__(self, avatars):
+        super().__init__()
+        self.setObjectName("card")
+        self.thread = None
+        self.view = None
+        self.account_id = None
+        self.avatars = avatars
+        self.self_icon = avatar_icon(QPixmap(), "我")
+        self.pending = False
+        self.busy = False
+        self.logged_in = False
+        self.drafts = {}
+        self.draft_talker = None
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 20, 24, 20)
+        heading = QHBoxLayout()
+        title = QLabel("私信")
+        title.setObjectName("sectionTitle")
+        heading.addWidget(title)
+        heading.addStretch()
+        self.refresh = QPushButton("刷新会话")
+        self.more = QPushButton("更多会话")
+        heading.addWidget(self.refresh)
+        heading.addWidget(self.more)
+        layout.addLayout(heading)
+        self.hint = QLabel("按需加载，不标记已读、不后台轮询。支持文字回复，发送前确认收件人。")
+        self.hint.setWordWrap(True)
+        self.hint.setObjectName("hint")
+        layout.addWidget(self.hint)
+        splitter = QSplitter(Qt.Horizontal)
+        self.splitter = splitter
+        self.sessions = QTreeWidget()
+        self.sessions.setAccessibleName("私信会话列表")
+        self.sessions.setHeaderLabels(["会话", "最近消息", "未读"])
+        self.sessions.setRootIsDecorated(False)
+        self.sessions.setIconSize(QSize(32, 32))
+        self.sessions.header().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.sessions.header().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.sessions.header().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        splitter.addWidget(self.sessions)
+        history = QWidget()
+        self.message_pane = history
+        history_layout = QVBoxLayout(history)
+        history_layout.setContentsMargins(8, 0, 0, 0)
+        self.title = QLabel("选择会话以读取消息")
+        self.title.setTextFormat(Qt.PlainText)
+        history_layout.addWidget(self.title)
+        self.body = MessageList()
+        self.body.setIconSize(QSize(32, 32))
+        self.body.setWordWrap(True)
+        self.body.setTextElideMode(Qt.ElideNone)
+        self.body.setSpacing(6)
+        self.body.setSelectionMode(QListWidget.ExtendedSelection)
+        self.body.setAccessibleName("私信消息历史")
+        history_layout.addWidget(self.body)
+        actions = QHBoxLayout()
+        self.refresh_thread = QPushButton("刷新消息")
+        self.older = QPushButton("更早消息")
+        actions.addWidget(self.refresh_thread)
+        actions.addWidget(self.older)
+        history_layout.addLayout(actions)
+        self.reply = ReplyEditor()
+        self.reply.setAccessibleName("私信回复内容")
+        self.reply.setPlaceholderText("文字回复 · Enter 换行，⌘/Ctrl+Enter 发送")
+        self.reply.setMaximumHeight(64)
+        history_layout.addWidget(self.reply)
+        send_row = QHBoxLayout()
+        self.check_send = QPushButton("核对发送结果")
+        self.send = QPushButton("发送")
+        self.send.setObjectName("primary")
+        send_row.addWidget(self.check_send)
+        send_row.addWidget(self.send)
+        history_layout.addLayout(send_row)
+        self.send_notice = QLabel("只发给选中的单聊；不会自动重试发送。")
+        self.send_notice.setWordWrap(True)
+        self.send_notice.setTextFormat(Qt.PlainText)
+        self.send_notice.setObjectName("hint")
+        history_layout.addWidget(self.send_notice)
+        splitter.addWidget(history)
+        splitter.setSizes([320, 360])
+        self.set_compact(False)
+        layout.addWidget(splitter)
+        self.refresh.clicked.connect(self.refresh_requested)
+        self.more.clicked.connect(self.more_requested)
+        self.sessions.itemSelectionChanged.connect(self.selection_changed)
+        self.refresh_thread.clicked.connect(lambda: self.open_requested.emit(self.selected(), True))
+        self.older.clicked.connect(self.older_requested)
+        self.send.clicked.connect(self.request_send)
+        self.reply.submit_requested.connect(self.request_send)
+        self.reply.textChanged.connect(self.update_controls)
+        self.check_send.clicked.connect(self.reconcile_requested)
+        self.set_busy(False, False)
+
+    def set_compact(self, compact):
+        # QSplitter derives its cross-axis maximum from its children.
+        self.message_pane.setMaximumHeight(330 if compact else 440)
+        self.splitter.setMinimumHeight(300 if compact else 340)
+
+    def selected(self):
+        item = self.sessions.currentItem()
+        return item.data(0, Qt.UserRole) if item else None
+
+    def selection_changed(self):
+        talker_id = self.selected()
+        if self.draft_talker != talker_id:
+            if self.draft_talker is not None:
+                self.drafts[self.draft_talker] = self.reply.toPlainText()
+            self.draft_talker = talker_id
+            self.reply.setPlainText(self.drafts.get(talker_id, ""))
+        if self.thread is None or self.thread.talker_id != talker_id:
+            self.thread = None
+            self.body.clear()
+        self.refresh_thread.setEnabled(talker_id is not None)
+        self.older.setEnabled(False)
+        if talker_id is not None:
+            self.title.setText("正在读取所选会话…")
+            self.open_requested.emit(talker_id, False)
+        else:
+            self.title.setText(
+                "群/系统会话暂不支持展开" if self.sessions.currentItem() else "选择会话以读取消息"
+            )
+        self.update_controls()
+
+    def request_send(self):
+        if self.send.isEnabled():
+            self.send_requested.emit(self.selected(), self.reply.toPlainText())
+
+    def set_busy(self, busy, logged_in):
+        self.busy, self.logged_in = busy, logged_in
+        self.update_controls()
+
+    def update_controls(self):
+        ready = self.logged_in and not self.busy
+        editable = ready and not self.pending
+        self.sessions.setEnabled(editable)
+        self.refresh.setEnabled(editable)
+        self.more.setEnabled(editable and self.view is not None and self.view.has_more)
+        self.refresh_thread.setEnabled(editable and self.selected() is not None)
+        self.older.setEnabled(editable and self.thread is not None and self.thread.has_more)
+        self.reply.setReadOnly(not editable or self.thread is None)
+        self.send.setEnabled(
+            editable and self.thread is not None and bool(self.reply.toPlainText().strip())
+        )
+        self.check_send.setEnabled(ready and self.pending)
+
+    def clear(self):
+        self.sessions.blockSignals(True)
+        self.sessions.clear()
+        self.sessions.blockSignals(False)
+        self.body.clear()
+        self.thread, self.view, self.account_id = None, None, None
+        self.pending = False
+        self.drafts.clear()
+        self.draft_talker = None
+        self.reply.clear()
+        self.send_notice.setText("只发给选中的单聊；不会自动重试发送。")
+        self.title.setText("选择会话以读取消息")
+        self.hint.setText("按需加载，不标记已读、不后台轮询。支持文字回复，发送前确认收件人。")
+        self.set_busy(False, False)
+
+    def show_inbox(self, view, account_id):
+        selected = self.selected()
+        self.view, self.account_id = view, account_id
+        self.sessions.blockSignals(True)
+        self.sessions.clear()
+        kept = False
+        for row in view.conversations:
+            session = row.session
+            item = QTreeWidgetItem(
+                [
+                    row.name,
+                    message_text(session.last_msg).replace("\n", " ")[:100],
+                    str(session.unread_count) if session.unread_count else "",
+                ]
+            )
+            item.setToolTip(0, f"UID {session.talker_id} · 会话类型 {session.session_type}")
+            item.setData(0, Qt.UserRole + 1, row.avatar_url)
+            item.setData(0, Qt.UserRole + 2, row.name)
+            item.setIcon(0, self.avatars(row.avatar_url, row.name))
+            if session.session_type == 1:
+                item.setData(0, Qt.UserRole, session.talker_id)
+            self.sessions.addTopLevelItem(item)
+            if session.session_type == 1 and session.talker_id == selected:
+                self.sessions.setCurrentItem(item)
+                kept = True
+        self.sessions.blockSignals(False)
+        if not kept:
+            self.thread = None
+            self.body.clear()
+            if self.draft_talker is not None:
+                self.drafts[self.draft_talker] = self.reply.toPlainText()
+            self.draft_talker = None
+            self.reply.clear()
+            self.title.setText("选择会话以读取消息")
+        self.hint.setText(
+            f"已读取 {len(view.conversations)} 个会话"
+            + ("，可加载更多。" if view.has_more else "，已到列表末尾。")
+            + " 查看不标记已读；未读数量为服务端值。"
+            + (" 昵称暂不可用，部分会话显示 UID。" if not view.names_available else "")
+        )
+
+    def show_messages(self, view):
+        if view is None or view.talker_id != self.selected():
+            return
+        older = self.thread is not None and len(view.messages) > len(self.thread.messages)
+        self.thread = view
+        name = self.sessions.currentItem().text(0)
+        self.title.setText(
+            f"{name} · {len(view.messages)} 条消息" + ("，可读取更早消息" if view.has_more else "")
+        )
+        self.body.clear()
+        peer_url = self.sessions.currentItem().data(0, Qt.UserRole + 1)
+        for message in view.messages:
+            try:
+                stamp = (
+                    datetime.fromtimestamp(message.timestamp).astimezone().strftime("%m-%d %H:%M")
+                )
+            except (ValueError, OverflowError, OSError):
+                stamp = "时间未知"
+            sender = "我" if message.sender_uid == self.account_id else name
+            item = QListWidgetItem(f"{stamp} · {sender}\n{message_text(message)}")
+            item.setData(Qt.UserRole, message.sender_uid)
+            item.setData(Qt.UserRole + 1, peer_url if message.sender_uid != self.account_id else "")
+            item.setData(Qt.UserRole + 2, sender)
+            item.setIcon(
+                self.self_icon
+                if message.sender_uid == self.account_id
+                else self.avatars(peer_url, sender)
+            )
+            self.body.addItem(item)
+        if not view.messages:
+            self.body.addItem("此会话暂无消息。")
+        if not older:
+            self.body.scrollToBottom()
+
+    def set_account(self, account_id, icon):
+        self.account_id, self.self_icon = account_id, icon
+        for index in range(self.body.count()):
+            item = self.body.item(index)
+            if item.data(Qt.UserRole) == account_id:
+                item.setIcon(icon)
+
+    def visible_avatar_urls(self):
+        urls = []
+        selected = self.sessions.currentItem()
+        if selected and selected.data(0, Qt.UserRole + 1):
+            urls.append(selected.data(0, Qt.UserRole + 1))
+        for tree in (self.sessions, self.body):
+            region = tree.viewport().visibleRegion()
+            count = tree.topLevelItemCount() if tree is self.sessions else tree.count()
+            for index in range(count):
+                item = tree.topLevelItem(index) if tree is self.sessions else tree.item(index)
+                url = (
+                    item.data(0, Qt.UserRole + 1)
+                    if tree is self.sessions
+                    else item.data(Qt.UserRole + 1)
+                )
+                if url and region.intersects(tree.visualItemRect(item)) and url not in urls:
+                    urls.append(url)
+        return urls
+
+    def update_avatar(self, url):
+        for index in range(self.sessions.topLevelItemCount()):
+            item = self.sessions.topLevelItem(index)
+            if item.data(0, Qt.UserRole + 1) == url:
+                item.setIcon(0, self.avatars(url, item.text(0)))
+        for index in range(self.body.count()):
+            item = self.body.item(index)
+            if item.data(Qt.UserRole + 1) == url:
+                item.setIcon(self.avatars(url, item.data(Qt.UserRole + 2)))
+
+    def show_receipt(self, receipt):
+        if receipt.request.talker_id != self.selected():
+            return
+        if receipt.history:
+            self.show_messages(receipt.history)
+            if receipt.history.messages:
+                self.sessions.currentItem().setText(
+                    1, message_text(receipt.history.messages[-1]).replace("\n", " ")[:100]
+                )
+        self.pending = not receipt.confirmed
+        if receipt.confirmed and self.reply.toPlainText() == receipt.request.text:
+            self.reply.clear()
+            self.drafts.pop(receipt.request.talker_id, None)
+        self.send_notice.setText(receipt.notice)
+        self.update_controls()

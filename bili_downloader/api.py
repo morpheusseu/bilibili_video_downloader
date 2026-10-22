@@ -10,10 +10,17 @@ from urllib.parse import urlparse
 
 import httpx
 from bpi import AsyncBpiClient
-from bpi.errors import ApiError, AuthenticationError, HttpStatusError, ResponseDecodeError
+from bpi.errors import (
+    ApiError,
+    AuthenticationError,
+    HttpStatusError,
+    ResponseDecodeError,
+    TransportError,
+)
 from bpi.session import parse_cookie
 
 from .auth import Session, normalized_cookie
+from .inbox import Inbox
 from .library import FavoriteLibrary
 from .sources import DownloadError, Source, VideoPart
 
@@ -66,16 +73,32 @@ class ApiHttpClient(httpx.AsyncClient):
         self.user_agent = ""
 
     async def send(self, request, **kwargs):
+        private_send = (
+            request.method == "POST"
+            and request.url.host == "api.vc.bilibili.com"
+            and request.url.path == "/web_im/v1/web_im/send_msg"
+        )
         if (
-            request.method != "GET"
+            (request.method != "GET" and not private_send)
             or request.url.scheme != "https"
             or request.url.host
             not in {
                 "api.bilibili.com",
                 "passport.bilibili.com",
+                "api.vc.bilibili.com",
             }
+            or (
+                request.url.host == "api.vc.bilibili.com"
+                and not private_send
+                and request.url.path
+                not in {
+                    "/session_svr/v1/session_svr/get_sessions",
+                    "/svr_sync/v1/svr_sync/fetch_session_msgs",
+                    "/account/v1/user/cards",
+                }
+            )
         ):
-            raise DownloadError("拒绝非只读或非受信 API 请求")
+            raise DownloadError("拒绝未获支持或非受信 API 请求；写操作仅允许显式私信发送")
         async with self.gate.request():
             if self.user_agent:
                 request.headers["User-Agent"] = self.user_agent
@@ -101,7 +124,7 @@ def safe_error(error: Exception) -> str:
         return f"Bilibili API 返回 HTTP {error.status_code}；没有自动重试"
     if isinstance(error, ResponseDecodeError):
         return "Bilibili 响应与 bpi-py 数据模型不兼容；已停止，不会把空数据当作成功"
-    if isinstance(error, (httpx.HTTPError, OSError)):
+    if isinstance(error, (httpx.HTTPError, OSError, TransportError)):
         return f"网络或文件操作失败（{type(error).__name__}）；未输出 Cookie 或下载地址"
     return f"操作失败（{type(error).__name__}）"
 
@@ -114,6 +137,7 @@ class Bilibili:
         self.session: Session | None = None
         self.image_transport = image_transport
         self.favorites = FavoriteLibrary(self.sdk.fav)
+        self.inbox = Inbox(self.sdk.message, self.sdk.user)
 
     async def __aenter__(self):
         return self
@@ -128,6 +152,7 @@ class Bilibili:
         self.http.user_agent = ""
         self.session = None
         self.favorites.clear()
+        self.inbox.clear()
 
     async def use_cookie(self, cookie: str, *, user_agent: str = "") -> Session:
         self.clear_session()
@@ -143,7 +168,7 @@ class Bilibili:
             avatar = b""
             if nav.face:
                 try:
-                    avatar = await self.avatar_image(nav.face)
+                    avatar = await self.cdn_image(nav.face)
                 except (DownloadError, httpx.HTTPError):
                     pass  # A missing avatar must not turn valid authentication into failure.
             self.session = Session(
@@ -154,7 +179,7 @@ class Bilibili:
             self.clear_session()
             raise
 
-    async def avatar_image(self, value: str) -> bytes:
+    async def cdn_image(self, value: str) -> bytes:
         url = urlparse(value)
         host = url.hostname or ""
         if (
@@ -195,6 +220,14 @@ class Bilibili:
                             return b""
                         body.extend(chunk)
                     return bytes(body)
+
+    async def send_message(self, talker_id, text):
+        if self.session is None:
+            raise DownloadError("请先登录当前账号")
+        cookie = parse_cookie(self.session.cookie)
+        if cookie.get("DedeUserID") != str(self.session.mid) or not cookie.get("bili_jct"):
+            raise DownloadError("登录缺少发送所需的身份或验证字段，请重新登录；未发送")
+        return await self.inbox.send(talker_id, self.session.mid, text)
 
     async def parts(self, source: Source, *, all_parts=False, page=1) -> AsyncIterator[VideoPart]:
         if page < 1:

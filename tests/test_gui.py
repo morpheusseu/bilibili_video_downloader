@@ -4,13 +4,16 @@ import time
 
 import httpx
 import pytest
-from conftest import BV, PNG, Provider, library_provider
-from PyQt5.QtCore import Qt
-from PyQt5.QtWidgets import QApplication
+from conftest import BV, PNG, Provider, inbox_provider, library_provider, private_message
+from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtGui import QInputMethodEvent
+from PyQt5.QtTest import QTest
+from PyQt5.QtWidgets import QApplication, QMessageBox
 
 from bili_downloader import gui
 from bili_downloader.auth import Session
 from bili_downloader.download import Progress, Result
+from bili_downloader.inbox_panel import ReplyEditor
 from bili_downloader.sources import DownloadError, Source
 
 
@@ -25,6 +28,10 @@ def wait_for(app, condition):
         app.processEvents()
         time.sleep(0.01)
     assert condition()
+
+
+def history_text(panel):
+    return "\n\n".join(panel.body.item(index).text() for index in range(panel.body.count()))
 
 
 @pytest.fixture
@@ -94,7 +101,7 @@ def test_profile_renders_from_login_memory_without_fetching_again(app, window):
     assert widget.identity.isHidden() and not widget.library_toggle.isEnabled()
     assert widget.account_toggle.text() == "登录" and widget.account_toggle.icon().isNull()
     widget.account_toggle.click()
-    assert widget.account_panel.isVisible() and not provider.requests
+    assert widget.account_dialog.isVisible() and not provider.requests
 
 
 def test_byte_progress_preserves_video_and_audio_stream_labels(app, window):
@@ -107,6 +114,304 @@ def test_byte_progress_preserves_video_and_audio_stream_labels(app, window):
         assert "1.0 MiB / 2.0 MiB" in widget.status.text()
         assert widget.bar.value() == 50
     assert not provider.requests
+
+
+@pytest.mark.parametrize("window", [lambda: inbox_provider()[0]], indirect=True)
+def test_floating_login_remembers_by_default_and_user_can_opt_out(app, window, monkeypatch):
+    widget, provider = window
+    saved = []
+    monkeypatch.setattr(gui, "save_session", saved.append)
+
+    async def browser(api, report):
+        report("3/4 · 合成身份验证")
+        return await api.use_cookie("SESSDATA=synthetic; DedeUserID=42")
+
+    monkeypatch.setattr(gui, "chrome_login", browser)
+    dialog = widget.account_dialog
+    assert dialog.isWindow() and dialog.remember.isChecked()
+    widget.account_toggle.click()
+    assert dialog.isVisible()
+    dialog.login.click()
+    wait_for(app, lambda: not widget.busy and bool(widget._library_view.items))
+    assert len(saved) == 1 and saved[0].mid == 42
+    assert dialog.isHidden() and not widget.account_toggle.isChecked()
+    widget.account_toggle.click()
+    dialog.remember.setChecked(False)
+    dialog.login.click()
+    wait_for(app, lambda: not widget.busy)
+    assert len(saved) == 1 and dialog.isHidden()
+
+
+@pytest.mark.parametrize("window", [lambda: inbox_provider()[0]], indirect=True)
+def test_closing_login_float_cancels_before_saving(app, window, monkeypatch):
+    widget, provider = window
+    entered = threading.Event()
+    saved = []
+    monkeypatch.setattr(gui, "save_session", saved.append)
+
+    async def browser(api, report):
+        entered.set()
+        report("2/4 · 等待合成扫码")
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(gui, "chrome_login", browser)
+    widget.account_toggle.click()
+    widget.account_dialog.login.click()
+    wait_for(app, lambda: entered.is_set() and "2/4" in widget.account_dialog.status.text())
+    widget.account_dialog.reject()
+    wait_for(app, lambda: not widget.busy)
+    assert not saved and widget.account_dialog.isHidden()
+    assert not widget.account_toggle.isChecked() and "取消" in widget.status.text()
+
+
+def test_reply_enter_and_ime_commit_do_not_submit(app):
+    editor = ReplyEditor()
+    submitted = []
+    editor.submit_requested.connect(lambda: submitted.append(True))
+    editor.show()
+    editor.setPlainText("你好")
+    editor.moveCursor(editor.textCursor().End)
+    QTest.keyClick(editor, Qt.Key_Return)
+    assert not submitted and "\n" in editor.toPlainText()
+    QApplication.sendEvent(editor, QInputMethodEvent("候选词", []))
+    QTest.keyClick(editor, Qt.Key_Return, Qt.ControlModifier)
+    assert not submitted
+    QApplication.sendEvent(editor, QInputMethodEvent("", []))
+    QTest.keyClick(editor, Qt.Key_Return, Qt.ControlModifier)
+    assert submitted == [True]
+    editor.close()
+
+
+def test_closed_worker_rejects_late_login_refresh_and_artwork(app, window):
+    widget, provider = window
+    assert widget.engine.shutdown()
+    widget._session_mid = 42
+    widget.load_library()
+    widget.engine.request_artwork("https://i0.hdslb.com/bfs/face/late.png")
+    with pytest.raises(DownloadError, match="后台已关闭"):
+        widget.engine.submit(lambda api: api.sdk.login.nav())
+    app.processEvents()
+    assert not widget.busy and not provider.requests and not provider.images
+
+
+def avatar_inbox_provider():
+    provider, state = inbox_provider()
+    state["faces"] = {
+        7: "https://i0.hdslb.com/bfs/face/seven.png",
+        8: "https://i0.hdslb.com/bfs/face/eight.png",
+    }
+    provider.image_handler = lambda request: httpx.Response(
+        200, content=PNG, headers={"content-type": "image/png"}
+    )
+    return provider
+
+
+def open_test_inbox(widget, app):
+    widget.launch(
+        lambda api: api.use_cookie("SESSDATA=synthetic; DedeUserID=42; bili_jct=synthetic-csrf")
+    )
+    wait_for(app, lambda: not widget.busy and bool(widget._library_view.items))
+    widget.inbox_toggle.click()
+    wait_for(app, lambda: not widget.busy)
+    widget.inbox_panel.sessions.setCurrentItem(widget.inbox_panel.sessions.topLevelItem(0))
+    wait_for(app, lambda: not widget.busy)
+
+
+@pytest.mark.parametrize("window", [lambda: inbox_provider()[0]], indirect=True)
+def test_private_reply_and_status_remain_visible_in_small_window(app, window):
+    widget, provider = window
+    open_test_inbox(widget, app)
+    widget.resize(760, 650)
+    app.processEvents()
+    app.processEvents()
+    for control in (
+        widget.inbox_panel.reply,
+        widget.inbox_panel.send,
+        widget.inbox_panel.send_notice,
+    ):
+        assert control.visibleRegion().contains(control.rect().center())
+        assert widget.rect().contains(control.mapTo(widget, control.rect().bottomRight()))
+
+
+@pytest.mark.parametrize("window", [avatar_inbox_provider], indirect=True)
+def test_avatars_drafts_and_real_confirmation_to_single_post_receipt(app, window, monkeypatch):
+    widget, provider = window
+    monkeypatch.setattr(gui.QApplication, "applicationState", lambda: Qt.ApplicationActive)
+    open_test_inbox(widget, app)
+    panel = widget.inbox_panel
+    face = "https://i0.hdslb.com/bfs/face/seven.png"
+    wait_for(app, lambda: face in widget._artwork and widget._artwork_pending is None)
+    assert sum(str(request.url) == face for request in provider.images) == 1
+    assert all(not panel.body.item(index).icon().isNull() for index in range(panel.body.count()))
+    panel.reply.setPlainText("文字回复 <plain>\n第二行")
+    panel.sessions.setCurrentItem(panel.sessions.topLevelItem(1))
+    wait_for(app, lambda: not widget.busy)
+    assert not panel.reply.toPlainText()
+    panel.reply.setPlainText("另一个人的草稿")
+    panel.sessions.setCurrentItem(panel.sessions.topLevelItem(0))
+    wait_for(app, lambda: not widget.busy)
+    assert panel.reply.toPlainText() == "文字回复 <plain>\n第二行"
+    confirmations = []
+
+    def decide(answer):
+        box = app.activeModalWidget()
+        confirmations.append((box.text(), box.informativeText(), box.textFormat()))
+        box.done(answer)
+
+    QTimer.singleShot(0, lambda: decide(QMessageBox.No))
+    panel.send.click()
+    assert provider.inbox_state["posts"] == 0 and panel.reply.toPlainText()
+    QTimer.singleShot(0, lambda: decide(QMessageBox.Yes))
+    panel.send.click()
+    assert widget.busy and not widget.cancel.isEnabled()
+    wait_for(app, lambda: not widget.busy)
+    assert all("UID 7" in row[0] and row[2] == Qt.PlainText for row in confirmations)
+    assert confirmations[-1][1] == "文字回复 <plain>\n第二行"
+    assert provider.inbox_state["posts"] == 1
+    assert not panel.pending and not panel.reply.toPlainText()
+    assert "回读确认" in panel.send_notice.text()
+    assert panel.body.item(panel.body.count() - 1).icon().cacheKey() == panel.self_icon.cacheKey()
+    assert "第二行" in history_text(panel) and "第二行" not in widget.log.toPlainText()
+
+
+@pytest.mark.parametrize("window", [lambda: inbox_provider()[0]], indirect=True)
+def test_uncertain_reply_locks_resend_until_explicit_readback(app, window, monkeypatch):
+    widget, provider = window
+    open_test_inbox(widget, app)
+    panel = widget.inbox_panel
+    state = provider.inbox_state
+    state["send_mode"] = "lost"
+    monkeypatch.setattr(widget, "confirm_reply", lambda *args: True)
+    panel.reply.setPlainText("待核对的私信")
+    panel.send.click()
+    wait_for(app, lambda: not widget.busy)
+    assert panel.pending and not panel.send.isEnabled() and panel.check_send.isEnabled()
+    assert panel.reply.isReadOnly() and panel.reply.toPlainText() == "待核对的私信"
+    assert not panel.sessions.isEnabled()
+    panel.send.click()
+    assert state["posts"] == 1
+    state["sent"][7] = [
+        private_message(26, sender_uid=42, receiver_id=7, content='{"content":"待核对的私信"}')
+    ]
+    panel.check_send.click()
+    wait_for(app, lambda: not widget.busy)
+    assert not panel.pending and not panel.reply.toPlainText()
+    assert not panel.check_send.isEnabled() and state["posts"] == 1
+
+
+@pytest.mark.parametrize("window", [lambda: inbox_provider()[0]], indirect=True)
+def test_mail_button_reads_only_selected_thread_and_scrubs_on_logout(app, window, monkeypatch):
+    widget, provider = window
+    monkeypatch.setattr(gui, "forget_session", lambda: None)
+    assert not widget.inbox_toggle.isEnabled()
+    widget.launch(lambda api: api.use_cookie("SESSDATA=synthetic; DedeUserID=42"))
+    wait_for(app, lambda: not widget.busy and bool(widget._library_view.items))
+    assert not any(r.url.host == "api.vc.bilibili.com" for r in provider.requests)
+    widget.inbox_toggle.click()
+    wait_for(app, lambda: not widget.busy)
+    panel = widget.inbox_panel
+    assert panel.isVisible() and not widget.library_panel.isVisible()
+    assert panel.sessions.topLevelItemCount() == 3 and not panel.body.count()
+    panel.sessions.setCurrentItem(panel.sessions.topLevelItem(0))
+    wait_for(app, lambda: not widget.busy)
+    assert panel.thread.talker_id == 7 and len(panel.thread.messages) == 20
+    assert "合成私信 25" in history_text(panel)
+    assert panel.sessions.topLevelItem(0).text(2) == "2"
+    panel.older.click()
+    wait_for(app, lambda: not widget.busy)
+    text = history_text(panel)
+    assert len(panel.thread.messages) == 25 and not panel.older.isEnabled()
+    assert text.index("\n合成私信 1\n\n") < text.index("\n合成私信 20\n\n")
+    count = len(provider.requests)
+    widget.inbox_toggle.click()
+    widget.inbox_toggle.click()
+    assert len(provider.requests) == count  # Opening the cached list never polls.
+    widget.account_dialog.forget.click()
+    wait_for(app, lambda: not widget.busy)
+    assert not widget.inbox_toggle.isEnabled() and panel.isHidden()
+    assert not panel.body.count() and not panel.sessions.topLevelItemCount()
+    assert widget.engine.api.inbox.thread is None
+    assert all(r.method == "GET" for r in provider.requests)
+    assert "合成私信" not in widget.log.toPlainText()
+
+
+def cover_provider(count=21):
+    provider, state = library_provider(count)
+    for index, item in enumerate(state["items"]):
+        item["cover"] = f"http://i0.hdslb.com/bfs/archive/cover{max(1, index)}.png"
+
+    def image(request):
+        assert request.url.scheme == "https" and "cookie" not in request.headers
+        return httpx.Response(200, content=PNG, headers={"content-type": "image/png"})
+
+    provider.image_handler = image
+    return provider
+
+
+def visible_cover_urls(widget):
+    region = widget.favorite_items.viewport().visibleRegion()
+    return {
+        item.data(0, Qt.UserRole + 1)
+        for index in range(widget.favorite_items.topLevelItemCount())
+        if region.intersects(
+            widget.favorite_items.visualItemRect(item := widget.favorite_items.topLevelItem(index))
+        )
+    }
+
+
+@pytest.mark.parametrize("window", [cover_provider], indirect=True)
+def test_visible_favorite_covers_are_cached_and_never_fetch_hidden_rows(app, window, monkeypatch):
+    widget, provider = window
+    monkeypatch.setattr(gui.QApplication, "applicationState", lambda: Qt.ApplicationActive)
+    widget.launch(lambda api: api.use_cookie("SESSDATA=synthetic; DedeUserID=42"))
+    wait_for(app, lambda: not widget.busy and bool(widget._library_view.items))
+    app.processEvents()
+    visible = visible_cover_urls(widget)
+    assert visible and len(visible) < 20
+    wait_for(app, lambda: visible <= widget._artwork.keys() and widget._artwork_pending is None)
+    assert len(provider.images) == len(visible)  # Same URL on two entries is downloaded once.
+    first = widget.favorite_items.topLevelItem(0)
+    first_url = first.data(0, Qt.UserRole + 1)
+    assert first.icon(0).cacheKey() != widget._cover_placeholder.cacheKey()
+    count = len(provider.images)
+    widget.load_library()
+    wait_for(app, lambda: not widget.busy)
+    widget.load_visible_artwork()
+    assert len(provider.images) == count
+    assert widget.engine.api.gate.count == len(provider.requests) + len(provider.images)
+    widget.library_toggle.click()
+    widget.load_visible_artwork()
+    assert len(provider.images) == count
+    widget.show_session(None)
+    assert not widget._artwork and widget._artwork_pending is None
+    widget.show_artwork(42, first_url, PNG, "")
+    assert not widget._artwork  # Late image replies cannot repopulate a logged-out account.
+
+
+@pytest.mark.parametrize("window", [lambda: cover_provider(1)], indirect=True)
+def test_slow_cover_is_preempted_by_foreground_operation(app, window, monkeypatch):
+    widget, provider = window
+    entered, cancelled = threading.Event(), threading.Event()
+    monkeypatch.setattr(gui.QApplication, "applicationState", lambda: Qt.ApplicationActive)
+
+    async def image(request):
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    provider.image_handler = image
+    widget.launch(lambda api: api.use_cookie("SESSDATA=synthetic; DedeUserID=42"))
+    wait_for(app, lambda: not widget.busy and entered.is_set())
+    assert not widget.busy and widget._artwork_pending
+    widget.library_toggle.click()
+    widget.source.setText(BV)
+    widget.preview.click()
+    wait_for(app, lambda: not widget.busy and widget._artwork_pending is None)
+    assert cancelled.is_set() and len(provider.images) == 1
+    assert widget.preview_items.isVisible() and widget.task_title.text() == "来源已检查"
+    assert "未能完成" not in widget.log.toPlainText()
 
 
 def test_download_tray_counts_files_not_streams_and_acknowledges_on_open(
@@ -201,7 +506,7 @@ def test_collapsed_download_keeps_cancel_and_partial_results(
 
 def test_ring_preserves_known_percentage_and_marks_unknown_lengths(app, window):
     widget, provider = window
-    widget._download_job = True
+    widget._job = "download"
     widget.show_progress(Progress("bytes", "下载视频流（画面）", 2, 4, percent=24))
     assert widget.details.active and widget.details.percent == widget.bar.value() == 24
     assert "24%" in widget.details.accessibleName()
@@ -253,7 +558,7 @@ def test_login_favorites_browse_cache_and_fill_download_source(app, window, monk
     async def denied(api):
         raise DownloadError("合成刷新失败")
 
-    widget.launch(denied, library=True)
+    widget.launch(denied, kind="library")
     wait_for(app, lambda: not widget.busy)
     assert not widget.auto_library.isChecked()
     assert widget.favorite_items.topLevelItemCount() == 21
@@ -410,5 +715,5 @@ def test_keychain_save_failure_stays_visible_without_losing_memory_login(app, wi
     assert widget.task_title.text() == "未能完成"
     assert "当前登录可用，但未能保存" in widget.status.text()
     assert widget.identity.text() == "Synthetic user"
-    assert widget.account_identity.text() == "Synthetic user · UID 42"
+    assert widget.account_dialog.identity.text() == "Synthetic user · UID 42"
     assert not provider.requests

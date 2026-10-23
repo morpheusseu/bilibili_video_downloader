@@ -1,6 +1,7 @@
-"""The sole provider/session owner. All provider API calls go through bpi-py."""
+"""Session owner: bpi-py HTTP acquisition plus independent Broadcast routing hints."""
 
 import asyncio
+import logging
 import random
 import re
 import time
@@ -19,10 +20,15 @@ from bpi.errors import (
 )
 from bpi.session import parse_cookie
 
+from .account_content import AccountContent
 from .auth import Session, normalized_cookie
+from .broadcast import BroadcastClient, BroadcastState, Wakeup
+from .cache import AccountCache
 from .inbox import Inbox
 from .library import FavoriteLibrary
 from .sources import DownloadError, Source, VideoPart
+
+log = logging.getLogger(__name__)
 
 
 class RequestGate:
@@ -130,7 +136,16 @@ def safe_error(error: Exception) -> str:
 
 
 class Bilibili:
-    def __init__(self, *, gate: RequestGate | None = None, transport=None, image_transport=None):
+    def __init__(
+        self,
+        *,
+        gate: RequestGate | None = None,
+        transport=None,
+        image_transport=None,
+        broadcast_factory=BroadcastClient,
+        cache_root=None,
+        cache_keys=None,
+    ):
         self.gate = gate or RequestGate()
         self.http = ApiHttpClient(self.gate, transport=transport)
         self.sdk = AsyncBpiClient(http_client=self.http)
@@ -138,23 +153,58 @@ class Bilibili:
         self.image_transport = image_transport
         self.favorites = FavoriteLibrary(self.sdk.fav)
         self.inbox = Inbox(self.sdk.message, self.sdk.user)
+        self.account_content = AccountContent(self.sdk)
+        self.broadcast_factory = broadcast_factory
+        self._live_task = None
+        self._live_owner = None
+        self.cache_root, self.cache_keys = cache_root, cache_keys
+        self.cache = None
+        self.cache_notice = ""
 
     async def __aenter__(self):
         return self
 
     async def __aexit__(self, *args):
+        await self.stop_inbox_live()
         self.clear_session()
         await self.sdk.aclose()
         await self.http.aclose()
 
     def clear_session(self):
+        if self._live_task and not self._live_task.done():
+            self._live_task.cancel()
+        self._live_owner = None
         self.http.cookies.clear()
         self.http.user_agent = ""
         self.session = None
+        if self.cache is not None:
+            self.cache.close()
+            self.cache = None
+        self.cache_notice = ""
         self.favorites.clear()
         self.inbox.clear()
+        # A login owns its inbox. A late old-account operation cannot repopulate
+        # the new account's state, even if it was already awaiting provider I/O.
+        self.inbox = Inbox(self.sdk.message, self.sdk.user)
+        self.account_content = AccountContent(self.sdk)
+
+    async def forget_account_cache(self, account_id):
+        await self.stop_inbox_live()
+        self.clear_session()
+        if self.cache_root is not None and account_id is not None:
+            AccountCache.forget(self.cache_root, account_id, keys=self.cache_keys)
+
+    async def read_account_content(self, kind, *, more=False, check=False):
+        owner, content = self.session, self.account_content
+        if owner is None:
+            raise DownloadError("请先登录当前账号")
+        view = await content.read(kind, owner.mid, more=more, check=check)
+        if self.session is not owner or self.account_content is not content:
+            raise DownloadError("账号已变化，未发布旧账号的内容")
+        return view
 
     async def use_cookie(self, cookie: str, *, user_agent: str = "") -> Session:
+        await self.stop_inbox_live()
         self.clear_session()
         try:
             if any(c in user_agent for c in "\r\n"):
@@ -165,6 +215,28 @@ class Bilibili:
             nav = await self.sdk.login.nav()
             if not nav.is_login or not nav.mid:
                 raise DownloadError("登录身份验证失败")
+            if self.cache_root is not None:
+                try:
+                    self.cache = AccountCache(self.cache_root, nav.mid, keys=self.cache_keys)
+                    self.inbox = Inbox(self.sdk.message, self.sdk.user, cache=self.cache)
+                    self.account_content = AccountContent(self.sdk, cache=self.cache)
+                    count = sum(len(view.messages) for view in self.inbox.threads.values())
+                    self.cache_notice = (
+                        f"已恢复 {len(self.inbox.threads)} 个会话、{count} 条本地消息；"
+                        "联网后按游标补增量。"
+                    )
+                    log.info(
+                        "Account cache restored threads=%s messages=%s",
+                        len(self.inbox.threads),
+                        count,
+                    )
+                except DownloadError as error:
+                    if self.cache is not None:
+                        self.cache.close()
+                    self.cache = None
+                    self.inbox = Inbox(self.sdk.message, self.sdk.user)
+                    self.account_content = AccountContent(self.sdk)
+                    self.cache_notice = f"{error}；本次仅使用内存，未覆盖原缓存。"
             avatar = b""
             if nav.face:
                 try:
@@ -179,6 +251,122 @@ class Bilibili:
             self.clear_session()
             raise
 
+    def start_inbox_live(self, on_update, on_status):
+        """Start once for this exact login, not again after every foreground action."""
+        session = self.session
+        if session is None or self._live_owner is session:
+            return
+        self._live_owner = session
+        if not session.user_agent or parse_cookie(session.cookie).get("DedeUserID") != str(
+            session.mid
+        ):
+            on_status(
+                session, BroadcastState("stopped", "实时收信需要 Chrome 登录及匹配的账号 Cookie")
+            )
+            return
+        self._live_task = asyncio.create_task(
+            self._run_inbox_live(session, self.inbox, on_update, on_status)
+        )
+
+    async def stop_inbox_live(self):
+        task, self._live_task = self._live_task, None
+        self._live_owner = None
+        if task and task is not asyncio.current_task():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    async def _run_inbox_live(self, session, inbox, on_update, on_status):
+        pending, talkers, refresh = asyncio.Event(), set(), False
+        bootstrapped = False
+
+        def current():
+            return self.session is session and self.inbox is inbox and self._live_owner is session
+
+        def status(value):
+            nonlocal bootstrapped
+            if current():
+                on_status(session, value)
+                if value.kind == "connected" and not bootstrapped:
+                    bootstrapped = True
+                    hint(Wakeup(refresh_sessions=True))
+
+        def hint(value):
+            nonlocal refresh
+            talkers.update(value.talkers)
+            refresh |= value.refresh_sessions
+            if len(talkers) > 256:
+                raise DownloadError("实时收信待处理会话过多，已暂停；请手动检查")
+            if talkers or refresh:
+                pending.set()
+
+        def publish(count=0):
+            if current():
+                on_update(session, inbox.view, inbox.thread, count)
+
+        async def consume():
+            nonlocal refresh
+            while True:
+                await pending.wait()
+                # Bounded trailing debounce: fold fetch/list/unread hints for one DM,
+                # but continuous traffic cannot postpone acquisition indefinitely.
+                deadline = time.monotonic() + 1.5
+                while time.monotonic() < deadline:
+                    pending.clear()
+                    try:
+                        await asyncio.wait_for(
+                            pending.wait(), min(0.35, deadline - time.monotonic())
+                        )
+                    except TimeoutError:
+                        break
+                targets, needs_heads = set(talkers), refresh or bool(talkers)
+                talkers.clear()
+                refresh = False
+                pending.clear()
+                known = {
+                    row.session.talker_id
+                    for row in inbox.view.conversations
+                    if row.session.session_type == 1
+                }
+                heads_read = not known or not targets or not targets.issubset(known)
+                if heads_read:
+                    await inbox.refresh_heads(session.mid)
+                    # On explicit reconnect, reconcile only previously read threads
+                    # whose provider frontier advanced while the socket was down.
+                    targets.update(
+                        row.session.talker_id
+                        for row in inbox.view.conversations
+                        if row.session.session_type == 1
+                        and row.session.talker_id in inbox.high_water
+                        and row.session.max_seqno > inbox.high_water[row.session.talker_id]
+                    )
+                    publish()
+                for target in sorted(targets):
+                    count = await inbox.sync_talker(target, session.mid)
+                    log.info("Broadcast directed sync messages=%s", count)
+                    publish(count)
+                if needs_heads and not heads_read:
+                    await inbox.refresh_heads(session.mid)
+                    publish()
+
+        tasks = []
+        try:
+            client = self.broadcast_factory(session, self.gate)
+            tasks = [asyncio.create_task(client.run(hint, status)), asyncio.create_task(consume())]
+            done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                await task
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            text = safe_error(error)
+            log.warning("Broadcast stopped: %s", text)
+            if current():
+                on_status(session, BroadcastState("stopped", text))
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
     async def cdn_image(self, value: str) -> bytes:
         url = urlparse(value)
         host = url.hostname or ""
@@ -191,6 +379,11 @@ class Bilibili:
         ):
             return b""
         value = url._replace(scheme="https").geturl()
+        cache = self.cache
+        if cache is not None:
+            body = cache.image(value)
+            if body is not None:
+                return body
         # No login cookies, redirects or arbitrary hosts. Same request gate as the API.
         async with httpx.AsyncClient(
             transport=self.image_transport, timeout=10, trust_env=False
@@ -219,7 +412,10 @@ class Bilibili:
                         if len(body) + len(chunk) > 1024 * 1024:
                             return b""
                         body.extend(chunk)
-                    return bytes(body)
+                    result = bytes(body)
+                    if cache is not None:
+                        cache.put_image(value, result)
+                    return result
 
     async def send_message(self, talker_id, text):
         if self.session is None:

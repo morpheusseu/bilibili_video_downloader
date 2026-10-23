@@ -9,8 +9,10 @@ from urllib.parse import parse_qs
 
 import httpx
 import pytest
+from cryptography.fernet import Fernet
 
 from bili_downloader.api import Bilibili, RequestGate
+from bili_downloader.broadcast import BroadcastClient
 from bili_downloader.download import ffmpeg_executable
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -19,6 +21,23 @@ PNG = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAACXBIWXMAAA9hAAAPYQGoP6dp"
     "AAAAFElEQVQImWNkSDvzn4GBgYGJAQoAIHwCNeos0L0AAAAASUVORK5CYII="
 )
+
+
+class MemoryCacheKeys:
+    """External native key-store boundary, never touches real OS credentials."""
+
+    def __init__(self):
+        self.values = {}
+
+    def get_or_create(self, account_id, *, create=True):
+        if account_id not in self.values:
+            if not create:
+                raise ValueError("Missing synthetic key")
+            self.values[account_id] = Fernet.generate_key()
+        return self.values[account_id]
+
+    def forget(self, account_id):
+        self.values.pop(account_id, None)
 
 
 def video(bvid=BV, pages=1):
@@ -118,6 +137,9 @@ class Provider:
         self.pages = pages
         self.images = []
         self.image_handler = None
+        self.broadcast_factory = BroadcastClient
+        self.cache_root = None
+        self.cache_keys = None
 
     def __call__(self, request):
         self.requests.append(request)
@@ -152,6 +174,9 @@ class Provider:
             gate=RequestGate(0, 0),
             transport=httpx.MockTransport(self),
             image_transport=httpx.MockTransport(image),
+            broadcast_factory=self.broadcast_factory,
+            cache_root=self.cache_root,
+            cache_keys=self.cache_keys,
         )
 
 
@@ -373,6 +398,8 @@ def inbox_provider(count=2):
             rows.extend(state["sent"].get(talker, []))
             if "end_seqno" in params and not state["repeat_messages"]:
                 rows = [row for row in rows if row["msg_seqno"] < int(params["end_seqno"])]
+            if "begin_seqno" in params:
+                rows = [row for row in rows if row["msg_seqno"] > int(params["begin_seqno"])]
             page = sorted(rows, key=lambda row: row["msg_seqno"], reverse=True)[:20]
             return response(
                 {

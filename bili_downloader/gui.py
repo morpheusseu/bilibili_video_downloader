@@ -1,15 +1,18 @@
 """PyQt5 UI; one persistent asyncio worker owns the bpi-py session and request gate."""
 
 import asyncio
+import logging
 import sys
 import threading
 from collections import OrderedDict
 from collections.abc import Callable
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from PyQt5.QtCore import (
     QSettings,
     QSize,
+    QStandardPaths,
     Qt,
     QThread,
     QTimer,
@@ -46,6 +49,8 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
+from .account_content import TITLES, ContentView
+from .account_content_panel import AccountContentPanel
 from .account_dialog import AccountDialog
 from .api import Bilibili, safe_error
 from .artwork import avatar_icon, decode_image
@@ -69,10 +74,19 @@ class Engine(QThread):
     progress = pyqtSignal(object)
     session_changed = pyqtSignal(object)
     artwork_ready = pyqtSignal(object, str, object, str)
+    inbox_updated = pyqtSignal(object, object, object, int)
+    inbox_status = pyqtSignal(object, object)
 
-    def __init__(self, parent=None, api_factory: Callable = Bilibili):
+    def __init__(self, parent=None, api_factory: Callable | None = None):
         super().__init__(parent)
-        self.api_factory = api_factory
+        self.api_factory = api_factory or (
+            lambda: Bilibili(
+                cache_root=Path(
+                    QStandardPaths.writableLocation(QStandardPaths.AppLocalDataLocation)
+                )
+                / "cache"
+            )
+        )
         self.ready = threading.Event()
         self.future = None
         self.active = None
@@ -122,6 +136,11 @@ class Engine(QThread):
         finally:
             self.active = None
             self.session_changed.emit(self.api.session)
+            if self.api.session is not None and self.api.inbox.view.cached:
+                self.inbox_updated.emit(
+                    self.api.session, self.api.inbox.view, self.api.inbox.thread, 0
+                )
+            self.api.start_inbox_live(self.inbox_updated.emit, self.inbox_status.emit)
             self.idle.emit()
 
     async def stop_artwork(self):
@@ -136,7 +155,7 @@ class Engine(QThread):
     async def load_artwork(self, url):
         session = self.api.session
         if session is None or self.active:
-            self.artwork_ready.emit(session.mid if session else None, url, None, "")
+            self.artwork_ready.emit(session, url, None, "")
             return
         self.artwork_task = asyncio.current_task()
         body, error = None, ""
@@ -148,7 +167,7 @@ class Engine(QThread):
             error = safe_error(caught)
         finally:
             self.artwork_task = None
-            self.artwork_ready.emit(session.mid, url, body, error)
+            self.artwork_ready.emit(session, url, body, error)
 
     def cancel(self):
         if self.ready.is_set():
@@ -170,7 +189,7 @@ class Engine(QThread):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, *, api_factory: Callable = Bilibili):
+    def __init__(self, *, api_factory: Callable | None = None):
         super().__init__()
         self.setWindowTitle("Bilibili 下载器")
         self.setWindowIcon(QIcon(str(Path(__file__).with_name("icon.png"))))
@@ -190,9 +209,13 @@ class MainWindow(QMainWindow):
         self.engine.session_changed.connect(self.show_session)
         self.engine.idle.connect(self.on_idle)
         self.engine.artwork_ready.connect(self.show_artwork)
+        self.engine.inbox_updated.connect(self.show_live_inbox)
+        self.engine.inbox_status.connect(self.show_live_status)
         self.engine.start()
         self.busy = False
         self._session_mid = None
+        self._session = None
+        self._live_kind = None
         self._pending_library = False
         self._job = None
         self._artwork = OrderedDict()
@@ -219,6 +242,14 @@ class MainWindow(QMainWindow):
         self.inbox_toggle.setCheckable(True)
         self.inbox_toggle.setEnabled(False)
         header_layout.addWidget(self.inbox_toggle)
+        self.content_toggle = QPushButton("浏览")
+        self.content_toggle.setObjectName("link")
+        self.content_toggle.setFixedHeight(44)
+        self.content_toggle.setAccessibleName("关注动态、关注列表与观看历史")
+        self.content_toggle.setToolTip("关注动态 · 关注的人 · 观看历史（只读）")
+        self.content_toggle.setCheckable(True)
+        self.content_toggle.setEnabled(False)
+        header_layout.addWidget(self.content_toggle)
         self.library_toggle = QPushButton()
         self.library_toggle.setObjectName("favoritesStar")
         star_path = str(Path(__file__).with_name("star.svg"))
@@ -234,7 +265,7 @@ class MainWindow(QMainWindow):
         header_layout.addWidget(self.library_toggle)
         self.identity = self.label("", "identity")
         self.identity.setWordWrap(False)
-        self.identity.setMaximumWidth(220)
+        self.identity.setMaximumWidth(160)
         self.identity.hide()
         header_layout.addWidget(self.identity)
         self.account_toggle = QPushButton("登录")
@@ -306,6 +337,9 @@ class MainWindow(QMainWindow):
         self.inbox_panel = InboxPanel(self.avatar_for)
         self.inbox_panel.hide()
         body_layout.addWidget(self.inbox_panel)
+        self.content_panel = AccountContentPanel(self.avatar_for)
+        self.content_panel.hide()
+        body_layout.addWidget(self.content_panel)
 
         source_box, source_layout = self.section("内容来源", "01")
         form = QFormLayout()
@@ -496,6 +530,11 @@ class MainWindow(QMainWindow):
         self.inbox_panel.older_requested.connect(lambda: self.load_thread(older=True))
         self.inbox_panel.send_requested.connect(self.send_reply)
         self.inbox_panel.reconcile_requested.connect(self.reconcile_reply)
+        self.inbox_panel.reconnect_requested.connect(self.reconnect_inbox)
+        self.content_toggle.toggled.connect(self.toggle_account_content)
+        self.content_panel.tab_changed.connect(self.account_content_tab_changed)
+        self.content_panel.read_requested.connect(self.load_account_content)
+        self.content_panel.open_requested.connect(lambda url: QDesktopServices.openUrl(QUrl(url)))
         self.artwork_timer = QTimer(self)
         self.artwork_timer.setSingleShot(True)
         self.artwork_timer.setInterval(180)
@@ -509,12 +548,19 @@ class MainWindow(QMainWindow):
         self.inbox_panel.body.verticalScrollBar().valueChanged.connect(
             lambda: self.artwork_timer.start()
         )
+        self.content_panel.items.verticalScrollBar().valueChanged.connect(
+            lambda: self.artwork_timer.start()
+        )
         self.scroll.verticalScrollBar().valueChanged.connect(lambda: self.artwork_timer.start())
         QApplication.instance().applicationStateChanged.connect(self.schedule_artwork)
         self.library_timer = QTimer(self)
         self.library_timer.setInterval(60000)
         self.library_timer.timeout.connect(self.check_library)
         self.library_timer.start()
+        self.content_timer = QTimer(self)
+        self.content_timer.setInterval(60000)
+        self.content_timer.timeout.connect(self.check_account_content)
+        self.content_timer.start()
         self.mode_changed()
 
     @staticmethod
@@ -553,11 +599,14 @@ class MainWindow(QMainWindow):
         super().resizeEvent(event)
         if hasattr(self, "inbox_panel"):
             self.inbox_panel.set_compact(self.height() < 760)
+        if hasattr(self, "content_panel"):
+            self.content_panel.set_compact(self.height() < 760)
 
     def toggle_library(self, visible):
         self.library_panel.setVisible(visible)
         if visible:
             self.inbox_toggle.setChecked(False)
+            self.content_toggle.setChecked(False)
             self.scroll.verticalScrollBar().setValue(0)
             if self._session_mid and not self._library_view.folders:
                 self.load_library()
@@ -565,13 +614,52 @@ class MainWindow(QMainWindow):
 
     def toggle_inbox(self, visible):
         self.inbox_panel.setVisible(visible)
-        self.intro.setVisible(not visible)
+        self.intro.setVisible(not (visible or self.content_toggle.isChecked()))
         if visible:
             self.library_toggle.setChecked(False)
+            self.content_toggle.setChecked(False)
             self.scroll.verticalScrollBar().setValue(0)
             if self._session_mid and self.inbox_panel.view is None:
                 self.load_inbox()
             self.artwork_timer.start()
+
+    def toggle_account_content(self, visible):
+        self.content_panel.setVisible(visible)
+        self.intro.setVisible(not (visible or self.inbox_toggle.isChecked()))
+        if visible:
+            self.library_toggle.setChecked(False)
+            self.inbox_toggle.setChecked(False)
+            self.scroll.verticalScrollBar().setValue(0)
+            self.account_content_tab_changed()
+
+    def account_content_tab_changed(self):
+        if (
+            self.content_panel.isVisible()
+            and self.content_panel.kind not in self.content_panel.views
+        ):
+            self.load_account_content()
+        self.artwork_timer.start()
+
+    def load_account_content(self, more=False, check=False):
+        if self.busy or self._session_mid is None:
+            return
+        kind = self.content_panel.kind
+        self.launch(
+            lambda api: api.read_account_content(kind, more=more, check=check),
+            "正在读取" + TITLES[kind],
+            "只读、按需分页；不会点赞、关注、上传播放记录或标记已读。",
+            kind="content",
+        )
+
+    def check_account_content(self):
+        if (
+            self.content_panel.auto.isChecked()
+            and self.content_panel.isVisible()
+            and self.content_panel.kind == "dynamic"
+            and not self.isMinimized()
+            and QApplication.applicationState() == Qt.ApplicationActive
+        ):
+            self.load_account_content(check=True)
 
     def load_inbox(self, *, more=False):
         if self.busy or self._session_mid is None:
@@ -662,6 +750,38 @@ class MainWindow(QMainWindow):
             return await api.inbox.reconcile(api.session.mid)
 
         self.launch(operation, "正在核对发送结果", "只回读消息，不会再次发送。", kind="inbox")
+
+    def reconnect_inbox(self):
+        async def operation(api):
+            if api.gate.stopped:
+                raise DownloadError("本实例已因风控停止；请到官方客户端检查账号后再重启应用")
+            await api.stop_inbox_live()
+            return "live_restart"
+
+        self.launch(operation, "正在恢复实时收信", "只建立订阅，不发送私信。", kind="inbox")
+
+    def show_live_status(self, owner, state):
+        if owner is not self._session:
+            return
+        self.inbox_panel.show_live_status(state)
+        self.inbox_toggle.setToolTip(self.inbox_panel.live_status.text())
+        if state.kind != self._live_kind or state.kind == "stopped":
+            self.log.appendPlainText(state.detail)
+        self._live_kind = state.kind
+
+    def show_live_inbox(self, owner, view, thread, count):
+        if owner is not self._session:
+            return
+        initial = self.inbox_panel.view is None
+        self.inbox_panel.show_inbox(view, owner.mid)
+        if initial and view.cached and thread is not None:
+            self.inbox_panel.select_cached_thread(thread)
+        if thread is not None:
+            self.inbox_panel.show_messages(thread)
+        self.inbox_panel.update_controls()
+        if count:
+            self.log.appendPlainText(f"实时私信：定向同步 {count} 条消息，未标记已读。")
+        self.artwork_timer.start()
 
     def check_library(self):
         if (
@@ -816,6 +936,8 @@ class MainWindow(QMainWindow):
         ):
             return
         urls = self.inbox_panel.visible_avatar_urls() if self.inbox_panel.isVisible() else []
+        if self.content_panel.isVisible():
+            urls.extend(self.content_panel.visible_artwork_urls())
         if self.library_panel.isVisible():
             visible = self.favorite_items.viewport().visibleRegion()
             for index in range(self.favorite_items.topLevelItemCount()):
@@ -824,20 +946,22 @@ class MainWindow(QMainWindow):
                     urls.append(item.data(0, Qt.UserRole + 1))
         for url in urls:
             if url and url not in self._artwork:
-                self._artwork_pending = (self._session_mid, url)
+                self._artwork_pending = (self._session, url)
                 self.engine.request_artwork(url)
                 return
 
-    def show_artwork(self, mid, url, body, error):
-        if self._artwork_pending != (mid, url):
+    def show_artwork(self, owner, url, body, error):
+        if self._artwork_pending != (owner, url):
+            return
+        if owner is not self._session:
             return
         self._artwork_pending = None
-        if mid != self._session_mid:
-            return
         if error:
             self._artwork_paused = True
             self.library_hint.setText(f"封面读取已暂停，条目仍可用：{error}")
             self.inbox_panel.send_notice.setText(f"头像读取已暂停，消息仍可用：{error}")
+            if self.content_panel.isVisible():
+                self.content_panel.hint.setText(f"图片读取已暂停，条目仍可用：{error}")
         elif body is not None:
             pixmap = decode_image(body)
             self._artwork[url] = pixmap
@@ -849,6 +973,8 @@ class MainWindow(QMainWindow):
                 if item.data(0, Qt.UserRole + 1) == url and not pixmap.isNull():
                     item.setIcon(0, QIcon(pixmap))
             self.inbox_panel.update_avatar(url)
+            if not pixmap.isNull():
+                self.content_panel.update_artwork(url, pixmap)
         self.artwork_timer.start()
 
     def mode_changed(self):
@@ -900,6 +1026,8 @@ class MainWindow(QMainWindow):
         self.cancel.setEnabled(busy and self._job != "send")
         self.library_controls()
         self.inbox_panel.set_busy(busy, self._session_mid is not None)
+        self.content_toggle.setEnabled(not busy and self._session_mid is not None)
+        self.content_panel.set_busy(busy, self._session_mid is not None)
 
     def launch(
         self,
@@ -916,7 +1044,7 @@ class MainWindow(QMainWindow):
         if kind == "login":
             self.account_dialog.status.setText(note)
         self.details.set_progress(kind == "download")
-        if kind != "library":
+        if kind not in {"library", "content"}:
             self.details.setChecked(True)
         self.task_title.setText(title)
         self.status.setText(note)
@@ -949,6 +1077,9 @@ class MainWindow(QMainWindow):
         if self._job == "library":
             self.auto_library.setChecked(False)
             self.library_hint.setText(f"{text}；自动检查已暂停，原有缓存保留。")
+        if self._job == "content":
+            self.content_panel.auto.setChecked(False)
+            self.content_panel.hint.setText(f"{text}；自动检查已暂停，已加载内容保留。")
         self.task_title.setText("未能完成")
         self.status.setText(text)
         self.bar.setRange(0, 100)
@@ -963,6 +1094,9 @@ class MainWindow(QMainWindow):
             self.inbox_panel.title.setText("已取消读取；已有内容保留")
         if self._job == "library":
             self.auto_library.setChecked(False)
+        if self._job == "content":
+            self.content_panel.auto.setChecked(False)
+            self.content_panel.hint.setText("读取已取消，已加载内容保留；不会自动重试。")
         self.task_title.setText("已取消")
         self.status.setText("任务已取消；没有发布不完整文件，已完成文件会保留。")
         self.bar.setRange(0, 100)
@@ -996,7 +1130,7 @@ class MainWindow(QMainWindow):
 
     def show_session(self, session):
         mid = session.mid if session else None
-        if mid != self._session_mid:
+        if session is not self._session:
             self._library_view = FavoriteView()
             self.folders.blockSignals(True)
             self.folders.clear()
@@ -1006,9 +1140,16 @@ class MainWindow(QMainWindow):
             self._artwork_pending = None
             self._artwork_paused = False
             self.inbox_panel.clear()
+            self.content_panel.clear()
+            if session is not None:
+                for view in tuple(self.engine.api.account_content.views.values()):
+                    self.content_panel.show_view(view)
+            self._live_kind = None
+        self._session = session
         self._session_mid = mid
         self.library_toggle.setEnabled(session is not None)
         self.inbox_toggle.setEnabled(session is not None)
+        self.content_toggle.setEnabled(session is not None and not self.busy)
         self.identity.setText(
             self.identity.fontMetrics().elidedText(session.name, Qt.ElideRight, 200)
             if session
@@ -1020,8 +1161,10 @@ class MainWindow(QMainWindow):
         if session is None:
             self.library_toggle.setChecked(False)
             self.inbox_toggle.setChecked(False)
+            self.content_toggle.setChecked(False)
         self.library_controls()
         self.inbox_panel.set_busy(self.busy, session is not None)
+        self.content_panel.set_busy(self.busy, session is not None)
         self.account_dialog.identity.setText(
             f"{session.name} · UID {session.mid}"
             if session
@@ -1049,7 +1192,9 @@ class MainWindow(QMainWindow):
         self.bar.setValue(100)
         if isinstance(result, Session):
             self.task_title.setText("登录成功")
-            self.status.setText("登录成功；没有后台心跳或自动下载")
+            self.status.setText("登录成功；正在连接实时私信，不会自动下载或标记已读")
+            if self.engine.api.cache_notice:
+                self.status.setText(self.status.text() + "。" + self.engine.api.cache_notice)
             self.show()
             self.raise_()
             self.activateWindow()
@@ -1060,9 +1205,15 @@ class MainWindow(QMainWindow):
             self.library_toggle.setChecked(True)
         elif result == "logout":
             self.status.setText("已退出并忘记本应用保存的登录；未操作其他客户端。")
+        elif result == "live_restart":
+            self.status.setText("正在重新建立实时私信订阅；连接结果显示在私信面板。")
         elif isinstance(result, FavoriteView):
             self.task_title.setText("收藏夹已检查")
             self.show_library(result)
+        elif isinstance(result, ContentView):
+            self.content_panel.show_view(result)
+            self.task_title.setText(TITLES[result.kind] + "已读取")
+            self.status.setText(f"已加载 {len(result.items)} 项；" + result.notice)
         elif isinstance(result, InboxView):
             self.task_title.setText("私信会话已读取")
             self.inbox_panel.show_inbox(result, self._session_mid)
@@ -1162,7 +1313,9 @@ class MainWindow(QMainWindow):
             return
 
         async def operation(api):
-            api.clear_session()
+            saved = load_session() if api.session is None else None
+            account_id = api.session.mid if api.session else (saved.mid if saved else None)
+            await api.forget_account_cache(account_id)
             forget_session()
             return "logout"
 
@@ -1263,6 +1416,7 @@ class MainWindow(QMainWindow):
         self._pending_library = False
         self.artwork_timer.stop()
         self.library_timer.stop()
+        self.content_timer.stop()
         self.account_dialog.hide()
         if self.engine.shutdown():
             event.accept()
@@ -1274,6 +1428,17 @@ class MainWindow(QMainWindow):
 def main():
     app = QApplication(sys.argv)
     app.setApplicationName("Bilibili Downloader")
+    # Bounded, provider-body-free diagnostics survive a window close/disconnection.
+    folder = Path(QStandardPaths.writableLocation(QStandardPaths.AppLocalDataLocation)) / "logs"
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+        handler = RotatingFileHandler(folder / "broadcast.log", maxBytes=1024 * 1024, backupCount=2)
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        logger = logging.getLogger("bili_downloader")
+        logger.setLevel(logging.INFO)
+        logger.addHandler(handler)
+    except OSError:
+        pass  # A read-only log directory must not make the application unusable.
     window = MainWindow()
     window.show()
     sys.exit(app.exec_())

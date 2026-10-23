@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+from collections import OrderedDict
 from dataclasses import dataclass, field, replace
 
 from bpi.errors import (
@@ -13,6 +14,7 @@ from bpi.errors import (
 )
 from bpi.message.models import PrivateMessage, Session
 
+from .cache import MAX_MESSAGES, MAX_THREADS
 from .sources import DownloadError
 
 
@@ -46,6 +48,7 @@ class InboxView:
     conversations: tuple[Conversation, ...] = ()
     has_more: bool = False
     names_available: bool = True
+    cached: bool = False
 
 
 @dataclass(frozen=True)
@@ -53,6 +56,13 @@ class MessageView:
     talker_id: int
     messages: tuple[PrivateMessage, ...] = ()
     has_more: bool = False
+    cached: bool = False
+
+
+@dataclass(frozen=True)
+class Profile:
+    name: str
+    face: str = ""
 
 
 def validate_reply(text):
@@ -94,9 +104,13 @@ class SendReceipt:
 
 
 class Inbox:
-    def __init__(self, messages, users):
+    def __init__(self, messages, users, *, cache=None):
         self.messages, self.users = messages, users
+        self.cache = cache
+        self._lock = asyncio.Lock()
         self.clear()
+        if cache is not None:
+            self._restore()
 
     def clear(self):
         self.view = InboxView()
@@ -104,14 +118,117 @@ class Inbox:
         self.profiles = {}
         self.frontiers = {}
         self.pending = None
+        self.high_water = {}
+        self.threads = OrderedDict()
+
+    def _restore(self):
+        try:
+            header = self.cache.get("inbox", "head")
+            conversations = []
+            if header is not None:
+                for item in header:
+                    session = Session.model_validate(item["session"])
+                    if session.session_type == 1 and session.last_msg:
+                        self._validate_message(
+                            session.last_msg, self.cache.account_id, session.talker_id
+                        )
+                    profile = Profile(item["name"], item["avatar_url"])
+                    if not isinstance(profile.name, str) or not isinstance(profile.face, str):
+                        raise ValueError("Invalid cached profile")
+                    self.profiles[session.talker_id] = profile
+                    conversations.append(Conversation(session, profile.name, profile.face))
+                self.view = InboxView(tuple(conversations), True, True, True)
+                self.frontiers = {1: (None, True), 2: (None, True)}
+            for peer, record in self.cache.threads():
+                rows = tuple(PrivateMessage.model_validate(row) for row in record["messages"])
+                for row in rows:
+                    self._validate_message(row, self.cache.account_id, peer)
+                if (
+                    not rows
+                    or len(rows) > MAX_MESSAGES
+                    or record["high_water"] != max(row.msg_seqno for row in rows)
+                ):
+                    raise ValueError("Cursor without cached messages")
+                self.threads[peer] = MessageView(peer, rows, bool(record["has_more"]), True)
+                self.high_water[peer] = record["high_water"]
+            selected = self.cache.get("selected", "last")
+            if selected in {
+                row.session.talker_id for row in conversations if row.session.session_type == 1
+            }:
+                self.thread = self.threads.get(selected)
+        except DownloadError:
+            raise
+        except Exception:
+            raise DownloadError("消息缓存结构无效，未恢复其正文或游标") from None
+
+    @staticmethod
+    def _message_record(message):
+        value = message.model_dump(mode="json")
+        if message.msg_status == 1 or message.msg_type == 5:
+            value["content"] = ""
+        return value
+
+    def _save_header(self, view):
+        if self.cache is not None:
+            header = []
+            for row in view.conversations[:100]:
+                session = row.session.model_dump(mode="json")
+                if row.session.last_msg is not None:
+                    session["last_msg"] = self._message_record(row.session.last_msg)
+                header.append({"session": session, "name": row.name, "avatar_url": row.avatar_url})
+            self.cache.put_many({("inbox", "head"): header})
+
+    def _commit_thread(self, view, *, select=False):
+        watermark = max((row.msg_seqno for row in view.messages), default=0)
+        if self.cache is not None:
+            values = {}
+            if watermark:
+                values[("thread", str(view.talker_id))] = {
+                    "messages": [
+                        self._message_record(row) for row in view.messages[-MAX_MESSAGES:]
+                    ],
+                    "high_water": watermark,
+                    "has_more": view.has_more or len(view.messages) > MAX_MESSAGES,
+                }
+            if select:
+                values[("selected", "last")] = view.talker_id
+            self.cache.put_many(values)
+        self.threads[view.talker_id] = view
+        self.threads.move_to_end(view.talker_id)
+        if watermark:
+            self.high_water[view.talker_id] = watermark
+        while len(self.threads) > MAX_THREADS:
+            peer, _ = self.threads.popitem(last=False)
+            self.high_water.pop(peer, None)
+        if select or (self.thread and self.thread.talker_id == view.talker_id):
+            self.thread = view
 
     async def refresh(self, account_id):
-        return await self._sessions(account_id, {1: (None, True), 2: (None, True)}, previous=())
+        async with self._lock:
+            return await self._sessions(account_id, {1: (None, True), 2: (None, True)}, previous=())
 
     async def more(self, account_id):
-        if not self.view.has_more:
+        async with self._lock:
+            if not self.view.has_more:
+                return self.view
+            return await self._sessions(
+                account_id, self.frontiers, previous=self.view.conversations
+            )
+
+    async def refresh_heads(self, account_id):
+        """Notification-driven list refresh without discarding already loaded pages."""
+        async with self._lock:
+            frontiers = self.frontiers.copy()
+            await self._sessions(
+                account_id,
+                {1: (None, True), 2: (None, True)},
+                previous=self.view.conversations,
+            )
+            self.frontiers.update(frontiers)
+            self.view = replace(
+                self.view, has_more=any(more for _, more in self.frontiers.values())
+            )
             return self.view
-        return await self._sessions(account_id, self.frontiers, previous=self.view.conversations)
 
     async def _sessions(self, account_id, frontiers, *, previous):
         rows = {(row.session.session_type, row.session.talker_id): row.session for row in previous}
@@ -131,7 +248,8 @@ class Inbox:
                 if row.session_type == 1 and row.last_msg:
                     self._validate_message(row.last_msg, account_id, row.talker_id)
                 key = (row.session_type, row.talker_id)
-                if key not in rows or row.session_ts > rows[key].session_ts:
+                # Unread/ack state can change without a newer message timestamp.
+                if key not in rows or row.session_ts >= rows[key].session_ts:
                     rows[key] = row
             next_frontiers[category] = (oldest, bool(data.has_more))
         missing = sorted(
@@ -144,7 +262,13 @@ class Inbox:
             try:
                 for start in range(0, len(missing), 100):
                     cards = await self.users.cards(mids=missing[start : start + 100])
-                    profiles.update({card.mid: card for card in cards if card.mid in missing})
+                    profiles.update(
+                        {
+                            card.mid: Profile(card.name, card.face)
+                            for card in cards
+                            if card.mid in missing
+                        }
+                    )
             except (ApiError, HttpStatusError, ResponseDecodeError, TransportError):
                 names_available = (
                     False  # Names are labels, not a reason to hide valid conversations.
@@ -159,17 +283,22 @@ class Inbox:
             )
             for row in sorted(rows.values(), key=lambda row: row.session_ts, reverse=True)
         )
-        self.profiles, self.frontiers = profiles, next_frontiers
-        self.view = InboxView(
+        view = InboxView(
             conversations, any(more for _, more in next_frontiers.values()), names_available
         )
+        self._save_header(view)
+        self.profiles, self.frontiers, self.view = profiles, next_frontiers, view
         return self.view
 
     async def open(self, talker_id, account_id, *, refresh=False):
-        self.ensure_target(talker_id)
-        if not refresh and self.thread and self.thread.talker_id == talker_id:
-            return self.thread
-        return await self._history(talker_id, account_id)
+        async with self._lock:
+            self.ensure_target(talker_id)
+            if not refresh and talker_id in self.threads:
+                if self.cache is not None:
+                    self.cache.put_many({("selected", "last"): talker_id})
+                self.thread = self.threads[talker_id]
+                return self.thread
+            return await self._history(talker_id, account_id)
 
     def ensure_target(self, talker_id):
         if not any(
@@ -179,6 +308,10 @@ class Inbox:
             raise DownloadError("请选择列表中的普通用户私信；群/系统会话暂不支持展开")
 
     async def send(self, talker_id, account_id, text):
+        async with self._lock:
+            return await self._send(talker_id, account_id, text)
+
+    async def _send(self, talker_id, account_id, text):
         validate_reply(text)
         self.ensure_target(talker_id)
         if self.pending is not None:
@@ -198,9 +331,13 @@ class Inbox:
             raise  # Retain the uncertainty fence even if the caller is interrupted.
         except Exception:
             pass  # No retry; only a read-back can resolve uncertain submission.
-        return await self.reconcile(account_id)
+        return await self._reconcile(account_id)
 
     async def reconcile(self, account_id):
+        async with self._lock:
+            return await self._reconcile(account_id)
+
+    async def _reconcile(self, account_id):
         pending = self.pending
         if pending is None or pending.account_id != account_id:
             raise DownloadError("当前账号没有待核对的发送")
@@ -228,11 +365,63 @@ class Inbox:
         return SendReceipt(pending, pending.message_key, False, history)
 
     async def older(self, account_id):
-        if self.thread is None or not self.thread.has_more:
-            return self.thread
-        return await self._history(self.thread.talker_id, account_id, previous=self.thread.messages)
+        async with self._lock:
+            if self.thread is None or not self.thread.has_more:
+                return self.thread
+            return await self._history(
+                self.thread.talker_id, account_id, previous=self.thread.messages
+            )
+
+    async def sync_talker(self, talker_id, account_id):
+        """Read only the notified user thread; commit the cursor after all delta pages.
+
+        First contact bootstraps one recent page, not the entire private history.
+        Subsequent notifications drain messages above the last successful sequence.
+        """
+        async with self._lock:
+            return await self._sync_talker(talker_id, account_id)
+
+    async def _sync_talker(self, talker_id, account_id):
+        self.ensure_target(talker_id)
+        baseline, end, collected = self.high_water.get(talker_id), None, {}
+        data = None
+        for _ in range(25):  # Drain at most 500 new messages; never advance across an unfilled gap.
+            data = await self.messages.session_messages(
+                talker_id=talker_id, size=20, begin_seqno=baseline, end_seqno=end
+            )
+            rows = data.messages or []
+            for row in rows:
+                self._validate_message(row, account_id, talker_id)
+                if baseline is not None and row.msg_seqno < baseline:
+                    raise DownloadError("私信增量接口未遵守序号边界，游标未推进")
+            lowest = min((row.msg_seqno for row in rows), default=None)
+            if data.has_more and (lowest is None or (end is not None and lowest >= end)):
+                raise DownloadError("私信增量分页未推进，原有游标保留")
+            collected.update(
+                {row.msg_seqno: row for row in rows if baseline is None or row.msg_seqno > baseline}
+            )
+            if baseline is None or not data.has_more or (lowest is not None and lowest <= baseline):
+                break
+            end = lowest
+        else:
+            raise DownloadError("本次私信增量超过 500 条，已暂停；原有游标保留，请手动检查")
+        if collected:
+            previous = self.threads.get(talker_id)
+            merged = {row.msg_seqno: row for row in previous.messages} if previous else {}
+            merged.update(collected)
+            view = MessageView(
+                talker_id,
+                tuple(merged[key] for key in sorted(merged)),
+                previous.has_more if previous else bool(data.has_more),
+            )
+            self._commit_thread(view)
+        return len(collected)
 
     async def _history(self, talker_id, account_id, *, previous=()):
+        # A refresh/send preflight must not jump over a restart gap by replacing
+        # a saved cursor with the latest page's maximum. Drain forward first.
+        if not previous and talker_id in self.high_water:
+            await self._sync_talker(talker_id, account_id)
         before = min((row.msg_seqno for row in previous), default=None)
         data = await self.messages.session_messages(talker_id=talker_id, size=20, end_seqno=before)
         rows = data.messages or []
@@ -241,10 +430,13 @@ class Inbox:
         older = [row for row in rows if before is None or row.msg_seqno < before]
         if (data.has_more and not older) or (before is not None and rows and not older):
             raise DownloadError("私信消息分页未推进，保留已读取的内容")
-        merged = {row.msg_seqno: row for row in (*older, *previous)}
-        self.thread = MessageView(
+        cached = self.threads.get(talker_id)
+        existing = previous or (cached.messages if cached else ())
+        merged = {row.msg_seqno: row for row in (*existing, *older)}
+        view = MessageView(
             talker_id, tuple(merged[key] for key in sorted(merged)), bool(data.has_more)
         )
+        self._commit_thread(view, select=True)
         return self.thread
 
     @staticmethod

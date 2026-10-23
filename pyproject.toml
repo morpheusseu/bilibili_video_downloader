@@ -6,10 +6,12 @@ requires-python = ">=3.11"
 dependencies = [
     "bpi-py==0.3.1",
     "httpx==0.28.1",
+    "websockets==15.0.1",
     "PyQt5==5.15.11",
     "playwright>=1.50,<2",
     "keyring>=25,<26",
     "imageio-ffmpeg==0.6.0",
+    "cryptography==50.0.2",
 ]
 
 [project.scripts]

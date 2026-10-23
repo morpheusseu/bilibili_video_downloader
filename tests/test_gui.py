@@ -1,10 +1,21 @@
 import asyncio
 import threading
 import time
+from functools import partial
 
 import httpx
 import pytest
-from conftest import BV, PNG, Provider, inbox_provider, library_provider, private_message
+from account_content_provider import content_provider, dynamic
+from broadcast_peer import BroadcastPeer, notice
+from conftest import (
+    BV,
+    PNG,
+    MemoryCacheKeys,
+    Provider,
+    inbox_provider,
+    library_provider,
+    private_message,
+)
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QInputMethodEvent
 from PyQt5.QtTest import QTest
@@ -12,6 +23,7 @@ from PyQt5.QtWidgets import QApplication, QMessageBox
 
 from bili_downloader import gui
 from bili_downloader.auth import Session
+from bili_downloader.broadcast import BroadcastClient, BroadcastState
 from bili_downloader.download import Progress, Result
 from bili_downloader.inbox_panel import ReplyEditor
 from bili_downloader.sources import DownloadError, Source
@@ -717,3 +729,286 @@ def test_keychain_save_failure_stays_visible_without_losing_memory_login(app, wi
     assert widget.identity.text() == "Synthetic user"
     assert widget.account_dialog.identity.text() == "Synthetic user · UID 42"
     assert not provider.requests
+
+
+def live_inbox_provider():
+    provider, _ = inbox_provider()
+    provider.broadcast_peer = BroadcastPeer()
+    provider.broadcast_factory = partial(
+        BroadcastClient, connect_factory=provider.broadcast_peer.connect
+    )
+    return provider
+
+
+@pytest.mark.parametrize("window", [live_inbox_provider], indirect=True)
+def test_broadcast_to_sdk_to_ui_without_manual_refresh_or_read_ack(app, window, monkeypatch):
+    widget, provider = window
+    monkeypatch.setattr(gui, "forget_session", lambda: None)
+    widget.launch(
+        lambda api: api.use_cookie(
+            "SESSDATA=synthetic; DedeUserID=42", user_agent="Synthetic Browser"
+        )
+    )
+    wait_for(app, lambda: not widget.busy and widget.inbox_panel.view is not None)
+    widget.inbox_toggle.click()
+    panel = widget.inbox_panel
+    panel.sessions.setCurrentItem(panel.sessions.topLevelItem(0))
+    wait_for(app, lambda: not widget.busy and panel.thread is not None)
+    panel.reply.setPlainText("不要清除这份草稿")
+    peer = provider.broadcast_peer
+    before = len(provider.requests)
+    new = private_message(26)
+    state = provider.inbox_state
+    state["messages"].append(new)
+    state["lanes"][1][0].update(last_msg=new, max_seqno=26, unread_count=3)
+    widget.engine.loop.call_soon_threadsafe(peer.incoming.put_nowait, notice())
+    widget.engine.loop.call_soon_threadsafe(peer.incoming.put_nowait, notice(metadata=True))
+    wait_for(
+        app,
+        lambda: panel.thread.messages[-1].msg_seqno == 26
+        and panel.sessions.currentItem().text(2) == "3",
+    )
+    assert "合成私信 26" in history_text(panel)
+    assert panel.reply.toPlainText() == "不要清除这份草稿" and panel.selected() == 7
+    reads = [r for r in provider.requests[before:] if r.url.path.endswith("fetch_session_msgs")]
+    assert len(reads) == 1 and reads[0].url.params["begin_seqno"] == "25"
+    assert "合成私信" not in widget.log.toPlainText() and all(
+        r.method == "GET" for r in provider.requests
+    )
+    assert peer.connections == 1 and "通知 2 次" in panel.live_status.text()
+
+    # A foreground task does not own the socket or discard incoming wakeups.
+    entered, release = threading.Event(), asyncio.Event()
+
+    async def foreground(api):
+        entered.set()
+        await release.wait()
+
+    widget.launch(foreground)
+    wait_for(app, entered.is_set)
+    state["messages"].append(private_message(27))
+    widget.engine.loop.call_soon_threadsafe(peer.incoming.put_nowait, notice())
+    wait_for(app, lambda: panel.thread.messages[-1].msg_seqno == 27)
+    assert widget.busy and panel.reply.toPlainText() == "不要清除这份草稿"
+    widget.engine.loop.call_soon_threadsafe(release.set)
+    wait_for(app, lambda: not widget.busy)
+
+    owner, old_view, old_thread = widget._session, panel.view, panel.thread
+    widget.logout()
+    wait_for(app, lambda: not widget.busy and widget._session is None and peer.closed)
+    widget.show_live_inbox(owner, old_view, old_thread, 1)
+    widget.show_live_status(owner, BroadcastState("connected", "stale callback"))
+    assert not panel.body.count() and not panel.sessions.topLevelItemCount()
+    assert "stale callback" not in panel.live_status.text()
+
+
+@pytest.mark.parametrize("window", [content_provider], indirect=True)
+def test_account_browser_real_worker_tabs_pagination_caching_and_logout(app, window, monkeypatch):
+    widget, provider = window
+    monkeypatch.setattr(gui, "forget_session", lambda: None)
+    assert not widget.content_toggle.isEnabled()
+    widget.launch(lambda api: api.use_cookie("SESSDATA=synthetic; DedeUserID=42"))
+    wait_for(app, lambda: not widget.busy and bool(widget._library_view.items))
+    assert not any(
+        "/feed/" in r.url.path or "history/" in r.url.path or "followings" in r.url.path
+        for r in provider.requests
+    )
+    widget.content_toggle.click()
+    panel = widget.content_panel
+    wait_for(app, lambda: not widget.busy and panel.items.topLevelItemCount() == 20)
+    assert panel.isVisible() and widget.library_panel.isHidden() and widget.inbox_panel.isHidden()
+    assert panel.more.isEnabled() and panel.auto.isVisible()
+    panel.items.setCurrentItem(panel.items.topLevelItem(0))
+    assert "<plain>" in panel.body.toPlainText() and "图片 1 张" in panel.body.toPlainText()
+    panel.more.click()
+    wait_for(app, lambda: not widget.busy and panel.items.topLevelItemCount() == 21)
+    assert not panel.more.isEnabled()
+    for index, expected in ((1, "合成签名"), (2, "播放进度 12 秒")):
+        panel.tabs.setCurrentIndex(index)
+        wait_for(app, lambda: not widget.busy and panel.items.topLevelItemCount() == 20)
+        assert panel.auto.isHidden()
+        panel.items.setCurrentItem(panel.items.topLevelItem(0))
+        assert expected in panel.body.toPlainText()
+    count = len(provider.requests)
+    panel.tabs.setCurrentIndex(0)
+    assert panel.items.topLevelItemCount() == 21 and len(provider.requests) == count
+    opened = []
+    monkeypatch.setattr(gui.QDesktopServices, "openUrl", lambda url: opened.append(url.toString()))
+    panel.items.setCurrentItem(panel.items.topLevelItem(0))
+    panel.open.click()
+    assert opened == ["https://t.bilibili.com/21"]
+    assert len(provider.requests) == count  # Opening the fixed canonical URL is user initiated.
+    widget.resize(760, 650)
+    app.processEvents()
+    assert widget.rect().contains(
+        widget.account_toggle.mapTo(widget, widget.account_toggle.rect().bottomRight())
+    )
+    assert panel.refresh.visibleRegion().contains(panel.refresh.rect().center())
+    assert "合成动态" not in widget.log.toPlainText() and "合成观看" not in widget.log.toPlainText()
+    widget.logout()
+    wait_for(app, lambda: not widget.busy)
+    assert not panel.views and not panel.items.topLevelItemCount() and not panel.body.toPlainText()
+    assert not widget.content_toggle.isEnabled() and panel.isHidden()
+    assert not widget.engine.api.account_content.views
+    assert all(r.method == "GET" for r in provider.requests)
+
+
+@pytest.mark.parametrize("window", [content_provider], indirect=True)
+def test_dynamic_checks_only_visible_foreground_idle_and_pause_on_error(app, window, monkeypatch):
+    widget, provider = window
+    widget.launch(lambda api: api.use_cookie("SESSDATA=synthetic; DedeUserID=42"))
+    wait_for(app, lambda: not widget.busy and bool(widget._library_view.items))
+    widget.content_toggle.click()
+    panel = widget.content_panel
+    wait_for(app, lambda: not widget.busy)
+    first = panel.items.topLevelItem(0)
+    panel.items.setCurrentItem(first)
+    monkeypatch.setattr(gui.QApplication, "applicationState", lambda: Qt.ApplicationActive)
+    count = len(provider.requests)
+    widget.check_account_content()
+    wait_for(app, lambda: not widget.busy)
+    assert len(provider.requests) == count + 1
+    assert provider.requests[-1].url.path.endswith("/update")
+    assert panel.items.currentItem() is first and "暂无新动态" in panel.hint.text()
+    provider.content_state["dynamic"].insert(0, dynamic(99))
+    provider.content_state["new"] = 1
+    widget.check_account_content()
+    wait_for(app, lambda: not widget.busy)
+    assert panel.items.topLevelItem(0).data(0, Qt.UserRole).key == "99"
+    assert panel.items.currentItem().data(0, Qt.UserRole).key == "21"
+    assert "合成动态 21" in panel.body.toPlainText()
+    count = len(provider.requests)
+    widget.set_busy(True)
+    widget.check_account_content()
+    widget.set_busy(False)
+    with monkeypatch.context() as context:
+        context.setattr(widget, "isMinimized", lambda: True)
+        widget.check_account_content()
+    panel.auto.setChecked(False)
+    widget.check_account_content()
+    panel.auto.setChecked(True)
+    widget.content_toggle.click()
+    widget.check_account_content()
+    assert len(provider.requests) == count
+    widget.content_toggle.click()
+    monkeypatch.setattr(gui.QApplication, "applicationState", lambda: Qt.ApplicationInactive)
+    widget.check_account_content()
+    assert len(provider.requests) == count
+    panel.tabs.setCurrentIndex(1)
+    wait_for(app, lambda: not widget.busy)
+    count = len(provider.requests)
+    monkeypatch.setattr(gui.QApplication, "applicationState", lambda: Qt.ApplicationActive)
+    widget.check_account_content()
+    assert len(provider.requests) == count  # Followings and history never auto-poll.
+    panel.tabs.setCurrentIndex(0)
+    provider.content_state["risk"] = 429
+    widget.check_account_content()
+    wait_for(app, lambda: not widget.busy)
+    assert not panel.auto.isChecked() and "保留" in panel.hint.text()
+    assert panel.items.topLevelItemCount() == 20 and widget.engine.api.gate.stopped
+    count = len(provider.requests)
+    widget.check_account_content()
+    panel.refresh.click()
+    wait_for(app, lambda: not widget.busy)
+    assert len(provider.requests) == count
+
+
+@pytest.mark.parametrize("window", [content_provider], indirect=True)
+def test_account_content_visible_images_reuse_shared_private_free_cache(app, window, monkeypatch):
+    widget, provider = window
+    monkeypatch.setattr(gui.QApplication, "applicationState", lambda: Qt.ApplicationActive)
+    face = "https://i0.hdslb.com/bfs/face/content.png"
+    for row in provider.content_state["dynamic"]:
+        row["modules"]["module_author"]["face"] = face
+    for row in provider.content_state["followings"]:
+        row["face"] = face
+
+    def image(request):
+        assert "cookie" not in request.headers
+        return httpx.Response(200, content=PNG, headers={"content-type": "image/png"})
+
+    provider.image_handler = image
+    widget.launch(lambda api: api.use_cookie("SESSDATA=synthetic; DedeUserID=42"))
+    wait_for(app, lambda: not widget.busy and bool(widget._library_view.items))
+    widget.content_toggle.click()
+    wait_for(app, lambda: face in widget._artwork and widget._artwork_pending is None)
+    assert len(provider.images) == 1
+    widget.content_panel.tabs.setCurrentIndex(1)
+    wait_for(app, lambda: not widget.busy)
+    widget.load_visible_artwork()
+    assert len(provider.images) == 1
+    assert widget.engine.api.gate.count == len(provider.requests) + len(provider.images)
+
+
+@pytest.mark.parametrize("window", [content_provider], indirect=True)
+def test_restart_restores_ui_then_broadcast_catches_up_and_forget_scrubs_cache(
+    app, window, monkeypatch, tmp_path
+):
+    widget, provider = window
+    provider.cache_root, provider.cache_keys = tmp_path, MemoryCacheKeys()
+    assert widget.engine.ready.wait(5)
+    # The worker may have been constructed before these test-boundary settings.
+    widget.engine.api.cache_root, widget.engine.api.cache_keys = tmp_path, provider.cache_keys
+    forgotten = []
+    monkeypatch.setattr(gui, "forget_session", lambda: forgotten.append(True))
+    open_test_inbox(widget, app)
+    widget.content_toggle.click()
+    wait_for(app, lambda: not widget.busy)
+    widget.content_panel.tabs.setCurrentIndex(2)
+    wait_for(app, lambda: not widget.busy)
+    assert widget.engine.shutdown()
+    widget.close()
+
+    state = provider.inbox_state
+    state["messages"].extend(private_message(i) for i in range(26, 71))
+    state["lanes"][1][0].update(last_msg=private_message(70), max_seqno=70, unread_count=4)
+    peer = BroadcastPeer()
+    provider.broadcast_factory = partial(BroadcastClient, connect_factory=peer.connect)
+    second = gui.MainWindow(api_factory=provider.api)
+    second.show()
+    try:
+        before = len(provider.requests)
+        second.launch(
+            lambda api: api.use_cookie(
+                "SESSDATA=synthetic; DedeUserID=42", user_agent="Synthetic Browser"
+            )
+        )
+        wait_for(app, lambda: second.inbox_panel.thread is not None)
+        assert second.inbox_panel.selected() == 7
+        assert "合成私信 25" in history_text(second.inbox_panel)
+        assert set(second.content_panel.views) == {"dynamic", "history"}
+        assert all(view.cached for view in second.content_panel.views.values())
+        wait_for(
+            app, lambda: second.inbox_panel.thread.messages[-1].msg_seqno == 70 and not second.busy
+        )
+        assert "合成私信 26" in history_text(second.inbox_panel)
+        assert "合成私信 70" in history_text(second.inbox_panel)
+        reads = [r for r in provider.requests[before:] if r.url.path.endswith("fetch_session_msgs")]
+        assert len(reads) == 3 and all(r.url.params["begin_seqno"] == "25" for r in reads)
+        assert not any(
+            "/feed/all" in r.url.path or "history/cursor" in r.url.path
+            for r in provider.requests[before:]
+        )
+        second.logout()
+        wait_for(app, lambda: not second.busy and second._session is None)
+        assert not list(tmp_path.glob("*/cache.sqlite3")) and not provider.cache_keys.values
+        assert forgotten == [True] and not second.inbox_panel.body.count()
+        assert not second.content_panel.views and peer.closed
+    finally:
+        assert second.engine.shutdown()
+        second.busy = False
+        second.close()
+
+
+def test_late_image_from_same_uid_previous_login_cannot_refill_current_cache(app, window):
+    widget, _ = window
+    old = Session(42, "old", "synthetic")
+    current = Session(42, "current", "synthetic")
+    url = "https://i0.hdslb.com/bfs/face/same.png"
+    widget.show_session(old)
+    widget.show_session(current)
+    widget._artwork_pending = (current, url)
+    widget.show_artwork(old, url, PNG, "")
+    assert not widget._artwork and widget._artwork_pending == (current, url)
+    widget.show_artwork(current, url, PNG, "")
+    assert url in widget._artwork and widget._artwork_pending is None

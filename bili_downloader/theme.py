@@ -96,6 +96,10 @@ STYLE = Template("""
     QCheckBox { spacing: 8px; min-height: 26px; }
     QCheckBox::indicator { width: 16px; height: 16px; }
     QCheckBox:disabled, QLabel:disabled { color: $disabled; }
+    QTabBar::tab { background: $pearl; color: $muted; border: 1px solid $hairline;
+        padding: 9px 12px; min-height: 20px; }
+    QTabBar::tab:selected { background: $white; color: $blue; border-bottom: 2px solid $blue; }
+    QTabBar::tab:disabled { color: $disabled; }
     QProgressBar { background: $soft; border: none; border-radius: 3px; }
     QProgressBar::chunk { background: $blue; border-radius: 3px; }
     QPlainTextEdit { background: $pearl; border: 1px solid $hairline; border-radius: 8px;

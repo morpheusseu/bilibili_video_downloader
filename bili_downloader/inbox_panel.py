@@ -66,6 +66,7 @@ class InboxPanel(QFrame):
     older_requested = pyqtSignal()
     send_requested = pyqtSignal(object, str)
     reconcile_requested = pyqtSignal()
+    reconnect_requested = pyqtSignal()
 
     def __init__(self, avatars):
         super().__init__()
@@ -80,6 +81,7 @@ class InboxPanel(QFrame):
         self.logged_in = False
         self.drafts = {}
         self.draft_talker = None
+        self.live_kind = "idle"
         layout = QVBoxLayout(self)
         layout.setContentsMargins(24, 20, 24, 20)
         heading = QHBoxLayout()
@@ -89,10 +91,17 @@ class InboxPanel(QFrame):
         heading.addStretch()
         self.refresh = QPushButton("刷新会话")
         self.more = QPushButton("更多会话")
+        self.reconnect = QPushButton("恢复实时连接")
         heading.addWidget(self.refresh)
         heading.addWidget(self.more)
+        heading.addWidget(self.reconnect)
         layout.addLayout(heading)
-        self.hint = QLabel("按需加载，不标记已读、不后台轮询。支持文字回复，发送前确认收件人。")
+        self.live_status = QLabel("登录后连接实时私信；断线或拒绝时停止，可手动恢复。")
+        self.live_status.setTextFormat(Qt.PlainText)
+        self.live_status.setWordWrap(True)
+        self.live_status.setObjectName("hint")
+        layout.addWidget(self.live_status)
+        self.hint = QLabel("通知驱动更新，不标记已读、不定时轮询。文字回复仍需确认收件人。")
         self.hint.setWordWrap(True)
         self.hint.setObjectName("hint")
         layout.addWidget(self.hint)
@@ -151,6 +160,7 @@ class InboxPanel(QFrame):
         layout.addWidget(splitter)
         self.refresh.clicked.connect(self.refresh_requested)
         self.more.clicked.connect(self.more_requested)
+        self.reconnect.clicked.connect(self.reconnect_requested)
         self.sessions.itemSelectionChanged.connect(self.selection_changed)
         self.refresh_thread.clicked.connect(lambda: self.open_requested.emit(self.selected(), True))
         self.older.clicked.connect(self.older_requested)
@@ -204,6 +214,7 @@ class InboxPanel(QFrame):
         self.sessions.setEnabled(editable)
         self.refresh.setEnabled(editable)
         self.more.setEnabled(editable and self.view is not None and self.view.has_more)
+        self.reconnect.setEnabled(ready and self.live_kind in {"idle", "stopped"})
         self.refresh_thread.setEnabled(editable and self.selected() is not None)
         self.older.setEnabled(editable and self.thread is not None and self.thread.has_more)
         self.reply.setReadOnly(not editable or self.thread is None)
@@ -224,8 +235,20 @@ class InboxPanel(QFrame):
         self.reply.clear()
         self.send_notice.setText("只发给选中的单聊；不会自动重试发送。")
         self.title.setText("选择会话以读取消息")
-        self.hint.setText("按需加载，不标记已读、不后台轮询。支持文字回复，发送前确认收件人。")
+        self.hint.setText("通知驱动更新，不标记已读、不定时轮询。文字回复仍需确认收件人。")
+        self.live_kind = "idle"
+        self.live_status.setText("登录后连接实时私信；断线或拒绝时停止，可手动恢复。")
         self.set_busy(False, False)
+
+    def show_live_status(self, state):
+        self.live_kind = state.kind
+        counts = (
+            f" · 心跳 {state.heartbeats} 次 · 通知 {state.notifications} 次"
+            if state.kind == "connected"
+            else ""
+        )
+        self.live_status.setText(state.detail + counts)
+        self.update_controls()
 
     def show_inbox(self, view, account_id):
         selected = self.selected()
@@ -262,20 +285,42 @@ class InboxPanel(QFrame):
             self.reply.clear()
             self.title.setText("选择会话以读取消息")
         self.hint.setText(
-            f"已读取 {len(view.conversations)} 个会话"
+            ("本地缓存，尚待联网校验。 " if view.cached else "")
+            + f"已读取 {len(view.conversations)} 个会话"
             + ("，可加载更多。" if view.has_more else "，已到列表末尾。")
             + " 查看不标记已读；未读数量为服务端值。"
             + (" 昵称暂不可用，部分会话显示 UID。" if not view.names_available else "")
         )
 
+    def select_cached_thread(self, thread):
+        self.sessions.blockSignals(True)
+        for index in range(self.sessions.topLevelItemCount()):
+            item = self.sessions.topLevelItem(index)
+            if item.data(0, Qt.UserRole) == thread.talker_id:
+                self.sessions.setCurrentItem(item)
+                self.draft_talker = thread.talker_id
+                break
+        self.sessions.blockSignals(False)
+
     def show_messages(self, view):
         if view is None or view.talker_id != self.selected():
             return
-        older = self.thread is not None and len(view.messages) > len(self.thread.messages)
+        scrollbar = self.body.verticalScrollBar()
+        position = scrollbar.value()
+        at_bottom = position >= scrollbar.maximum() - 4
+        older = bool(
+            self.thread
+            and self.thread.messages
+            and view.messages
+            and view.messages[0].msg_seqno < self.thread.messages[0].msg_seqno
+        )
+        first_load = self.thread is None
         self.thread = view
         name = self.sessions.currentItem().text(0)
         self.title.setText(
-            f"{name} · {len(view.messages)} 条消息" + ("，可读取更早消息" if view.has_more else "")
+            f"{name} · {len(view.messages)} 条消息"
+            + ("，可读取更早消息" if view.has_more else "")
+            + (" · 本地缓存" if view.cached else "")
         )
         self.body.clear()
         peer_url = self.sessions.currentItem().data(0, Qt.UserRole + 1)
@@ -299,8 +344,10 @@ class InboxPanel(QFrame):
             self.body.addItem(item)
         if not view.messages:
             self.body.addItem("此会话暂无消息。")
-        if not older:
+        if first_load or (at_bottom and not older):
             self.body.scrollToBottom()
+        else:
+            scrollbar.setValue(position)
 
     def set_account(self, account_id, icon):
         self.account_id, self.self_icon = account_id, icon

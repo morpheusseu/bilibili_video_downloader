@@ -51,6 +51,7 @@ class AccountDialog(QDialog):
         explanation = QLabel(
             "默认保存到系统加密凭据存储，不保存明文。使用独立 Chrome 临时会话，"
             "不读取现有浏览器配置；启动时不会自动读取钥匙串。"
+            "内容缓存另按账号加密保存；“退出并忘记”会一并清除。"
         )
         explanation.setWordWrap(True)
         explanation.setObjectName("hint")

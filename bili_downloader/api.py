@@ -144,7 +144,6 @@ class Bilibili:
         image_transport=None,
         broadcast_factory=BroadcastClient,
         cache_root=None,
-        cache_keys=None,
     ):
         self.gate = gate or RequestGate()
         self.http = ApiHttpClient(self.gate, transport=transport)
@@ -157,7 +156,7 @@ class Bilibili:
         self.broadcast_factory = broadcast_factory
         self._live_task = None
         self._live_owner = None
-        self.cache_root, self.cache_keys = cache_root, cache_keys
+        self.cache_root = cache_root
         self.cache = None
         self.cache_notice = ""
 
@@ -192,7 +191,7 @@ class Bilibili:
         await self.stop_inbox_live()
         self.clear_session()
         if self.cache_root is not None and account_id is not None:
-            AccountCache.forget(self.cache_root, account_id, keys=self.cache_keys)
+            AccountCache.forget(self.cache_root, account_id)
 
     async def read_account_content(self, kind, *, more=False, check=False):
         owner, content = self.session, self.account_content
@@ -217,7 +216,7 @@ class Bilibili:
                 raise DownloadError("登录身份验证失败")
             if self.cache_root is not None:
                 try:
-                    self.cache = AccountCache(self.cache_root, nav.mid, keys=self.cache_keys)
+                    self.cache = AccountCache(self.cache_root, nav.mid)
                     self.inbox = Inbox(self.sdk.message, self.sdk.user, cache=self.cache)
                     self.account_content = AccountContent(self.sdk, cache=self.cache)
                     count = sum(len(view.messages) for view in self.inbox.threads.values())

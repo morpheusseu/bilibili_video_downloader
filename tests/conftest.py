@@ -9,8 +9,8 @@ from urllib.parse import parse_qs
 
 import httpx
 import pytest
-from cryptography.fernet import Fernet
 
+from bili_downloader import local_store
 from bili_downloader.api import Bilibili, RequestGate
 from bili_downloader.broadcast import BroadcastClient
 from bili_downloader.download import ffmpeg_executable
@@ -23,21 +23,10 @@ PNG = base64.b64decode(
 )
 
 
-class MemoryCacheKeys:
-    """External native key-store boundary, never touches real OS credentials."""
-
-    def __init__(self):
-        self.values = {}
-
-    def get_or_create(self, account_id, *, create=True):
-        if account_id not in self.values:
-            if not create:
-                raise ValueError("Missing synthetic key")
-            self.values[account_id] = Fernet.generate_key()
-        return self.values[account_id]
-
-    def forget(self, account_id):
-        self.values.pop(account_id, None)
+@pytest.fixture(autouse=True)
+def isolated_local_storage(tmp_path, monkeypatch):
+    # Production auth/cache code runs normally, but can never touch saved user logins.
+    monkeypatch.setattr(local_store, "data_root", lambda: tmp_path / "private")
 
 
 def video(bvid=BV, pages=1):
@@ -139,7 +128,6 @@ class Provider:
         self.image_handler = None
         self.broadcast_factory = BroadcastClient
         self.cache_root = None
-        self.cache_keys = None
 
     def __call__(self, request):
         self.requests.append(request)
@@ -176,7 +164,6 @@ class Provider:
             image_transport=httpx.MockTransport(image),
             broadcast_factory=self.broadcast_factory,
             cache_root=self.cache_root,
-            cache_keys=self.cache_keys,
         )
 
 

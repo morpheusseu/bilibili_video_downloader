@@ -7,9 +7,8 @@ from conftest import BV, Provider, favorite_item, folder_info, response
 from playwright.async_api import Error as BrowserError
 from playwright.async_api import TimeoutError as BrowserTimeout
 
-from bili_downloader import auth, browser_login
-from bili_downloader.api import Bilibili, RequestGate, safe_error
-from bili_downloader.auth import Session, load_session, save_session
+from bili_downloader import browser_login
+from bili_downloader.api import Bilibili, RequestGate
 from bili_downloader.sources import DownloadError, Source, VideoPart, parse_source
 
 
@@ -132,27 +131,6 @@ async def test_spacing_and_risk_latch():
             with pytest.raises(DownloadError):
                 await api.sdk.video.view(bvid=BV)
     assert len(calls) == 1
-
-
-def test_opt_in_keychain_roundtrip_and_failure(monkeypatch):
-    records = {}
-    backend = SimpleNamespace(
-        set_password=lambda service, key, value: records.update({(service, key): value}),
-        get_password=lambda service, key: records.get((service, key)),
-    )
-    monkeypatch.setattr(auth, "_backend", lambda: backend)
-    assert load_session() is None
-    session = Session(42, "Synthetic", "SESSDATA=synthetic; DedeUserID=42", "Synthetic Chrome")
-    save_session(session)
-    assert load_session() == session
-
-    def unavailable():
-        raise RuntimeError("sensitive=never-display")
-
-    monkeypatch.setattr(auth, "_backend", unavailable)
-    with pytest.raises(DownloadError) as error:
-        save_session(session)
-    assert "sensitive" not in safe_error(error.value)
 
 
 class Browser:

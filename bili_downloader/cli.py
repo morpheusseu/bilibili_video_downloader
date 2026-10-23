@@ -60,7 +60,9 @@ async def run(args):
 def main():
     parser = argparse.ArgumentParser(description="bpi-py Bilibili 视频/音频下载器")
     commands = parser.add_subparsers(dest="command", required=True)
-    login = commands.add_parser("login", help="在真实 Chrome 中登录；--remember 保存到系统钥匙串")
+    login = commands.add_parser(
+        "login", help="在真实 Chrome 中登录；--remember 保存到本机未加密文件"
+    )
     login.add_argument("--remember", action="store_true")
     for name in ("inspect", "download"):
         command = commands.add_parser(name)

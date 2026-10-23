@@ -122,7 +122,7 @@ class AccountContentPanel(QFrame):
             + ("可加载更多。 " if view.has_more else "本次列表已结束。 ")
             + view.notice
             if view
-            else "首次只读取当前页；已加载页加密缓存，可按需加载更早内容。"
+            else "首次只读取当前页；已加载页在本机缓存，可按需加载更早内容。"
         )
         self.update_controls()
 

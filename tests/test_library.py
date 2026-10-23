@@ -2,6 +2,7 @@ import httpx
 import pytest
 from conftest import PNG, favorite_item, library_provider, response
 
+from bili_downloader import local_store
 from bili_downloader.api import Bilibili, RequestGate
 from bili_downloader.auth import load_session, save_session
 from bili_downloader.sources import DownloadError
@@ -102,7 +103,7 @@ async def test_inconsistent_identifiers_never_certify_unchanged_content():
 
 
 @pytest.mark.parametrize("image_status", [200, 302, 404])
-async def test_login_profile_fetches_avatar_once_without_credentials(image_status, monkeypatch):
+async def test_login_profile_fetches_avatar_once_without_credentials(image_status):
     requests, images = [], []
 
     def nav(request):
@@ -138,22 +139,12 @@ async def test_login_profile_fetches_avatar_once_without_credentials(image_statu
         assert session.avatar == (PNG if image_status == 200 else b"")
         assert len(requests) == len(images) == 1
         assert "avatar" not in repr(session) and "SESSDATA" not in repr(session)
-        records = {}
-        from types import SimpleNamespace
-
-        from bili_downloader import auth
-
-        monkeypatch.setattr(
-            auth,
-            "_backend",
-            lambda: SimpleNamespace(
-                set_password=lambda service, key, value: records.update({key: value}),
-                get_password=lambda service, key: records.get(key),
-            ),
-        )
         save_session(session)
         assert load_session().avatar == b""  # Image is not persisted alongside the credential.
-        assert "avatar" not in records["default"]
+        credential = (
+            local_store.account_folder(local_store.data_root() / "accounts", 42) / "session.json"
+        )
+        assert "avatar" not in local_store.read_json(credential)
 
 
 @pytest.mark.parametrize(

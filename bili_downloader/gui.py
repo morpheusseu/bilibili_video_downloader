@@ -49,6 +49,7 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
+from . import local_store
 from .account_content import TITLES, ContentView
 from .account_content_panel import AccountContentPanel
 from .account_dialog import AccountDialog
@@ -79,14 +80,7 @@ class Engine(QThread):
 
     def __init__(self, parent=None, api_factory: Callable | None = None):
         super().__init__(parent)
-        self.api_factory = api_factory or (
-            lambda: Bilibili(
-                cache_root=Path(
-                    QStandardPaths.writableLocation(QStandardPaths.AppLocalDataLocation)
-                )
-                / "cache"
-            )
-        )
+        self.api_factory = api_factory or (lambda: Bilibili(cache_root=local_store.data_root()))
         self.ready = threading.Event()
         self.future = None
         self.active = None
@@ -1259,12 +1253,12 @@ class MainWindow(QMainWindow):
     def finish_login(self, session, remember):
         if remember:
             try:
-                # Keep native credential operations on the single owner worker.
+                # Keep credential writes on the single owner worker.
                 # Cancelling an executor future would not stop its underlying write,
                 # which could otherwise race a subsequent "forget login".
                 save_session(session)
             except DownloadError as error:
-                raise DownloadError(f"当前登录可用，但未能保存到钥匙串：{error}") from error
+                raise DownloadError(f"当前登录可用，但未能保存到本机：{error}") from error
         return session
 
     def browser_login(self, remember):
@@ -1289,14 +1283,14 @@ class MainWindow(QMainWindow):
         async def operation(api):
             session = load_session()
             if session is None:
-                raise DownloadError("系统钥匙串中没有保存的登录，请扫码")
+                raise DownloadError("本机没有保存的登录，请在 Chrome 中登录一次")
             restored = await api.use_cookie(session.cookie, user_agent=session.user_agent)
             if restored.mid != session.mid:
                 api.clear_session()
                 raise DownloadError("保存的登录与当前账号不一致，已清除本次内存登录")
             return restored
 
-        self.launch(operation, "正在读取钥匙串登录", kind="login")
+        self.launch(operation, "正在恢复本机登录", kind="login")
 
     def logout(self):
         if (
@@ -1316,7 +1310,7 @@ class MainWindow(QMainWindow):
             saved = load_session() if api.session is None else None
             account_id = api.session.mid if api.session else (saved.mid if saved else None)
             await api.forget_account_cache(account_id)
-            forget_session()
+            forget_session(account_id)
             return "logout"
 
         self.launch(operation, "正在退出并忘记登录")

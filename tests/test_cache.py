@@ -1,10 +1,12 @@
 import asyncio
+import os
 import sqlite3
+import stat
 
 import httpx
 import pytest
 from account_content_provider import content_provider
-from conftest import PNG, MemoryCacheKeys, inbox_provider, private_message
+from conftest import PNG, inbox_provider, private_message
 
 from bili_downloader import cache as storage
 from bili_downloader.cache import AccountCache, account_folder
@@ -13,7 +15,7 @@ from bili_downloader.sources import DownloadError
 
 
 def persistent(provider, root):
-    provider.cache_root, provider.cache_keys = root, MemoryCacheKeys()
+    provider.cache_root = root
     return provider
 
 
@@ -52,9 +54,9 @@ async def test_received_messages_images_and_selection_restore_without_refetch(tm
         assert api.inbox.high_water[7] == 26
         assert message_text(api.inbox.threads[7].messages[-1]) == "合成私信 26"
     raw = (account_folder(tmp_path, 42) / "cache.sqlite3").read_bytes()
-    for marker in ("合成私信", "测试联系人", "SESSDATA", url):
-        assert marker.encode() not in raw
-    assert PNG not in raw and provider.cache_keys.values[42] not in raw
+    # This is deliberately local plaintext storage, not a credential vault.
+    assert url.encode() in raw
+    assert b"SESSDATA" not in raw
 
 
 async def test_sqlite_failure_does_not_commit_cursor_or_publish_unstored_messages(tmp_path):
@@ -157,10 +159,14 @@ async def test_over_content_cache_cap_does_not_save_cursor_past_missing_pages(tm
 
 
 def test_account_isolation_limits_expiry_and_precise_forget(tmp_path, monkeypatch):
-    keys, clock = MemoryCacheKeys(), [100000.0]
+    clock = [100000.0]
     monkeypatch.setattr(storage, "MAX_IMAGES", 2)
-    one = AccountCache(tmp_path, 42, keys=keys, clock=lambda: clock[0])
-    two = AccountCache(tmp_path, 43, keys=keys, clock=lambda: clock[0])
+    one = AccountCache(tmp_path, 42, clock=lambda: clock[0])
+    two = AccountCache(tmp_path, 43, clock=lambda: clock[0])
+    if os.name == "posix":
+        assert stat.S_IMODE(tmp_path.stat().st_mode) == 0o700
+        assert stat.S_IMODE(one.folder.stat().st_mode) == 0o700
+        assert stat.S_IMODE((one.folder / "cache.sqlite3").stat().st_mode) == 0o600
     for i in range(3):
         one.put_image(f"image-{i}", PNG)
         clock[0] += 1
@@ -170,16 +176,16 @@ def test_account_isolation_limits_expiry_and_precise_forget(tmp_path, monkeypatc
     clock[0] += storage.IMAGE_AGE + 1
     assert one.image("image-2") is None
     one.close()
-    AccountCache.forget(tmp_path, 42, keys=keys)
-    assert not account_folder(tmp_path, 42).exists() and 42 not in keys.values
-    assert account_folder(tmp_path, 43).exists() and 43 in keys.values
+    AccountCache.forget(tmp_path, 42)
+    assert not account_folder(tmp_path, 42).exists()
+    assert account_folder(tmp_path, 43).exists()
     with pytest.raises(DownloadError, match="关闭"):
         one.put_many({("inbox", "head"): []})
     assert not account_folder(tmp_path, 42).exists()
     two.close()
 
 
-async def test_corrupt_cache_falls_back_to_memory_without_overwriting_or_plaintext(tmp_path):
+async def test_corrupt_cache_falls_back_to_memory_without_overwriting(tmp_path):
     provider, _ = inbox_provider()
     persistent(provider, tmp_path)
     async with provider.api() as api:
@@ -188,9 +194,7 @@ async def test_corrupt_cache_falls_back_to_memory_without_overwriting_or_plainte
         await api.inbox.open(7, 42)
     path = account_folder(tmp_path, 42) / "cache.sqlite3"
     with sqlite3.connect(path) as db:
-        db.execute(
-            "UPDATE records SET value=? WHERE kind='thread'", (b"corrupt synthetic ciphertext",)
-        )
+        db.execute("UPDATE records SET value=? WHERE kind='thread'", (b"corrupt synthetic JSON",))
     with sqlite3.connect(path) as db:
         original = db.execute("SELECT kind,key,value FROM records ORDER BY kind,key").fetchall()
     async with provider.api() as api:
@@ -206,32 +210,20 @@ async def test_corrupt_cache_falls_back_to_memory_without_overwriting_or_plainte
         )
 
 
-def test_missing_key_never_generates_a_replacement_for_existing_cache(tmp_path):
-    keys = MemoryCacheKeys()
-    cache = AccountCache(tmp_path, 42, keys=keys)
-    cache.put_many({("inbox", "head"): []})
-    cache.close()
-    keys.forget(42)
-    with pytest.raises(DownloadError, match="密钥"):
-        AccountCache(tmp_path, 42, keys=keys)
-    assert 42 not in keys.values
-
-
-async def test_unavailable_key_store_keeps_login_but_never_creates_plaintext_cache(tmp_path):
+async def test_symlink_cache_keeps_memory_login_without_touching_unrelated_data(tmp_path):
     provider, _ = inbox_provider()
-    provider.cache_root = tmp_path
-
-    class UnavailableKeys:
-        def get_or_create(self, *args, **kwargs):
-            raise RuntimeError("synthetic denied native key access")
-
-    provider.cache_keys = UnavailableKeys()
+    provider.cache_root = tmp_path / "cache"
+    outside = tmp_path / "unrelated"
+    outside.mkdir()
+    marker = outside / "keep.txt"
+    marker.write_text("unrelated data")
+    provider.cache_root.symlink_to(outside, target_is_directory=True)
     async with provider.api() as api:
         session = await api.use_cookie("SESSDATA=synthetic; DedeUserID=42")
         assert session.mid == 42 and api.cache is None and "仅使用内存" in api.cache_notice
         await api.inbox.refresh(42)
         await api.inbox.open(7, 42)
-    assert not list(tmp_path.iterdir())
+    assert list(outside.iterdir()) == [marker] and marker.read_text() == "unrelated data"
 
 
 async def test_uncertain_send_is_not_saved_as_an_action_or_replayed_after_restart(tmp_path):

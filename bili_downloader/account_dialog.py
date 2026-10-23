@@ -40,18 +40,18 @@ class AccountDialog(QDialog):
         self.login.setObjectName("primary")
         layout.addWidget(self.login)
         actions = QHBoxLayout()
-        self.restore = QPushButton("读取钥匙串登录")
+        self.restore = QPushButton("使用已保存登录")
         self.forget = QPushButton("退出并忘记")
         actions.addWidget(self.restore)
         actions.addWidget(self.forget)
         layout.addLayout(actions)
-        self.remember = QCheckBox("记住登录（系统钥匙串，可取消）")
+        self.remember = QCheckBox("记住登录（本机保存，无需钥匙串，可取消）")
         self.remember.setChecked(True)
         layout.addWidget(self.remember)
         explanation = QLabel(
-            "默认保存到系统加密凭据存储，不保存明文。使用独立 Chrome 临时会话，"
-            "不读取现有浏览器配置；启动时不会自动读取钥匙串。"
-            "内容缓存另按账号加密保存；“退出并忘记”会一并清除。"
+            "登录凭证与内容缓存按账号保存在当前用户的本机文件中，不使用系统钥匙串、"
+            "不要求输入 Mac 密码。文件未加密，同一系统用户下的其他程序可能读取。"
+            "使用独立 Chrome 临时会话；“退出并忘记”清除当前账号的凭证与缓存。"
         )
         explanation.setWordWrap(True)
         explanation.setObjectName("hint")
@@ -62,7 +62,7 @@ class AccountDialog(QDialog):
         cookie_row = QHBoxLayout(self.cookie_panel)
         cookie_row.setContentsMargins(0, 0, 0, 0)
         self.cookie = QLineEdit()
-        self.cookie.setPlaceholderText("粘贴 Cookie · 隐藏显示，不写入配置文件")
+        self.cookie.setPlaceholderText("粘贴 Cookie · 隐藏显示；勾选记住登录时保存到本机")
         self.cookie.setAccessibleName("已有 Cookie")
         self.cookie.setEchoMode(QLineEdit.Password)
         self.import_cookie = QPushButton("使用 Cookie")
@@ -71,7 +71,7 @@ class AccountDialog(QDialog):
         layout.addWidget(self.cookie_panel)
         self.cookie_panel.hide()
         self.advanced.toggled.connect(self.cookie_panel.setVisible)
-        self.status = QLabel("选择登录方式；保存失败会明确提示，绝不降级为明文。")
+        self.status = QLabel("首次在 Chrome 中登录；之后可直接使用本机保存的登录。")
         self.status.setObjectName("hint")
         self.status.setTextFormat(Qt.PlainText)
         self.status.setWordWrap(True)

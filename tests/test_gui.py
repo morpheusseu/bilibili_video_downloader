@@ -1,6 +1,7 @@
 import asyncio
 import threading
 import time
+from dataclasses import replace
 from functools import partial
 
 import httpx
@@ -10,7 +11,6 @@ from broadcast_peer import BroadcastPeer, notice
 from conftest import (
     BV,
     PNG,
-    MemoryCacheKeys,
     Provider,
     inbox_provider,
     library_provider,
@@ -314,7 +314,7 @@ def test_uncertain_reply_locks_resend_until_explicit_readback(app, window, monke
 @pytest.mark.parametrize("window", [lambda: inbox_provider()[0]], indirect=True)
 def test_mail_button_reads_only_selected_thread_and_scrubs_on_logout(app, window, monkeypatch):
     widget, provider = window
-    monkeypatch.setattr(gui, "forget_session", lambda: None)
+    monkeypatch.setattr(gui, "forget_session", lambda account_id: None)
     assert not widget.inbox_toggle.isEnabled()
     widget.launch(lambda api: api.use_cookie("SESSDATA=synthetic; DedeUserID=42"))
     wait_for(app, lambda: not widget.busy and bool(widget._library_view.items))
@@ -709,12 +709,12 @@ def test_download_captures_options_and_keeps_completed_progress(app, window, mon
     assert not provider.requests
 
 
-def test_keychain_save_failure_stays_visible_without_losing_memory_login(app, window, monkeypatch):
+def test_local_save_failure_stays_visible_without_losing_memory_login(app, window, monkeypatch):
     widget, provider = window
     session = Session(mid=42, name="Synthetic user", cookie="fake-cookie")
 
     def cannot_save(value):
-        raise DownloadError("合成钥匙串不可用")
+        raise DownloadError("合成本机存储不可用")
 
     monkeypatch.setattr(gui, "save_session", cannot_save)
 
@@ -743,7 +743,7 @@ def live_inbox_provider():
 @pytest.mark.parametrize("window", [live_inbox_provider], indirect=True)
 def test_broadcast_to_sdk_to_ui_without_manual_refresh_or_read_ack(app, window, monkeypatch):
     widget, provider = window
-    monkeypatch.setattr(gui, "forget_session", lambda: None)
+    monkeypatch.setattr(gui, "forget_session", lambda account_id: None)
     widget.launch(
         lambda api: api.use_cookie(
             "SESSDATA=synthetic; DedeUserID=42", user_agent="Synthetic Browser"
@@ -805,7 +805,7 @@ def test_broadcast_to_sdk_to_ui_without_manual_refresh_or_read_ack(app, window, 
 @pytest.mark.parametrize("window", [content_provider], indirect=True)
 def test_account_browser_real_worker_tabs_pagination_caching_and_logout(app, window, monkeypatch):
     widget, provider = window
-    monkeypatch.setattr(gui, "forget_session", lambda: None)
+    monkeypatch.setattr(gui, "forget_session", lambda account_id: None)
     assert not widget.content_toggle.isEnabled()
     widget.launch(lambda api: api.use_cookie("SESSDATA=synthetic; DedeUserID=42"))
     wait_for(app, lambda: not widget.busy and bool(widget._library_view.items))
@@ -941,17 +941,15 @@ def test_account_content_visible_images_reuse_shared_private_free_cache(app, win
 
 
 @pytest.mark.parametrize("window", [content_provider], indirect=True)
-def test_restart_restores_ui_then_broadcast_catches_up_and_forget_scrubs_cache(
-    app, window, monkeypatch, tmp_path
-):
+def test_restart_restores_ui_then_broadcast_catches_up_and_forget_scrubs_cache(app, window):
     widget, provider = window
-    provider.cache_root, provider.cache_keys = tmp_path, MemoryCacheKeys()
+    root = gui.local_store.data_root()
+    provider.cache_root = root
     assert widget.engine.ready.wait(5)
     # The worker may have been constructed before these test-boundary settings.
-    widget.engine.api.cache_root, widget.engine.api.cache_keys = tmp_path, provider.cache_keys
-    forgotten = []
-    monkeypatch.setattr(gui, "forget_session", lambda: forgotten.append(True))
+    widget.engine.api.cache_root = root
     open_test_inbox(widget, app)
+    gui.save_session(replace(widget._session, user_agent="Synthetic Browser"))
     widget.content_toggle.click()
     wait_for(app, lambda: not widget.busy)
     widget.content_panel.tabs.setCurrentIndex(2)
@@ -968,11 +966,7 @@ def test_restart_restores_ui_then_broadcast_catches_up_and_forget_scrubs_cache(
     second.show()
     try:
         before = len(provider.requests)
-        second.launch(
-            lambda api: api.use_cookie(
-                "SESSDATA=synthetic; DedeUserID=42", user_agent="Synthetic Browser"
-            )
-        )
+        second.account_dialog.restore.click()
         wait_for(app, lambda: second.inbox_panel.thread is not None)
         assert second.inbox_panel.selected() == 7
         assert "合成私信 25" in history_text(second.inbox_panel)
@@ -991,8 +985,9 @@ def test_restart_restores_ui_then_broadcast_catches_up_and_forget_scrubs_cache(
         )
         second.logout()
         wait_for(app, lambda: not second.busy and second._session is None)
-        assert not list(tmp_path.glob("*/cache.sqlite3")) and not provider.cache_keys.values
-        assert forgotten == [True] and not second.inbox_panel.body.count()
+        assert not list(root.glob("*/cache.sqlite3")) and gui.load_session() is None
+        assert not list(root.glob("accounts/*/session.json"))
+        assert not second.inbox_panel.body.count()
         assert not second.content_panel.views and peer.closed
     finally:
         assert second.engine.shutdown()

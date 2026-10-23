@@ -16,17 +16,20 @@ from conftest import (
     library_provider,
     private_message,
 )
-from PyQt5.QtCore import Qt, QTimer
-from PyQt5.QtGui import QInputMethodEvent
+from PyQt5.QtCore import QSize, Qt, QTimer
+from PyQt5.QtGui import QInputMethodEvent, QPalette, QPixmap
 from PyQt5.QtTest import QTest
 from PyQt5.QtWidgets import QApplication, QMessageBox
 
 from bili_downloader import gui
+from bili_downloader.account_content import ContentItem, ContentView
 from bili_downloader.auth import Session
 from bili_downloader.broadcast import BroadcastClient, BroadcastState
 from bili_downloader.download import Progress, Result
 from bili_downloader.inbox_panel import ReplyEditor
+from bili_downloader.message_rendering import CONTENT_ROLE
 from bili_downloader.sources import DownloadError, Source
+from bili_downloader.theme import COLORS
 
 
 @pytest.fixture(scope="module")
@@ -1007,3 +1010,115 @@ def test_late_image_from_same_uid_previous_login_cannot_refill_current_cache(app
     assert not widget._artwork and widget._artwork_pending == (current, url)
     widget.show_artwork(current, url, PNG, "")
     assert url in widget._artwork and widget._artwork_pending is None
+
+
+def test_cover_and_avatar_shapes_stay_consistent_after_load_and_rerender(app, window):
+    widget, _ = window
+    url = "https://i0.hdslb.com/shared-cover-avatar.png"
+    pixmap = QPixmap(160, 90)
+    pixmap.fill(Qt.blue)
+    cover = ContentItem("video", "视频", "视频信息", "视频正文", image=url, image_role="cover")
+    avatar = ContentItem("forward", "转发", "转发信息", "转发正文", image=url, image_role="avatar")
+    panel = widget.content_panel
+    view = ContentView("dynamic", (cover, avatar), False, "")
+    panel.show_view(view)
+    widget._artwork[url] = pixmap
+
+    def shapes():
+        cover_size = panel.items.topLevelItem(0).icon(0).pixmap(QSize(48, 40)).size()
+        avatar_size = panel.items.topLevelItem(1).icon(0).pixmap(QSize(48, 40)).size()
+        assert cover_size.width() > cover_size.height()
+        assert avatar_size.width() == avatar_size.height()
+
+    panel.update_artwork(url)
+    shapes()
+    panel.render()
+    shapes()
+    panel.show_view(ContentView("dynamic", tuple([cover, avatar]), False, "刷新"))
+    shapes()
+
+
+def emoji_inbox_provider():
+    provider, state = inbox_provider()
+    url = "https://i0.hdslb.com/bfs/emote/synthetic.png"
+    state["messages"][-1]["content"] = '{"content":"<b>普通文字</b>[热词系列测试]"}'
+    state["emojis"] = [{"text": "[热词系列测试]", "url": url, "size": 2}]
+    state["messages"][-2].update(msg_type=10, content='{"title":"通知标题","text":"通知正文"}')
+    state["messages"][-3].update(msg_type=18, content='{"content":"[{\\"text\\":\\"系统提示\\"}]"}')
+    provider.image_handler = lambda request: httpx.Response(
+        200, content=PNG, headers={"content-type": "image/png"}
+    )
+    return provider
+
+
+@pytest.mark.parametrize("window", [emoji_inbox_provider], indirect=True)
+def test_message_emoji_http_to_qt_renders_safe_image_and_retains_copyable_text(app, window):
+    widget, provider = window
+    open_test_inbox(widget, app)
+    url = provider.inbox_state["emojis"][0]["url"]
+    wait_for(app, lambda: url in widget._artwork and widget._artwork_pending is None)
+    panel = widget.inbox_panel
+    assert "通知正文" in history_text(panel) and "系统提示" in history_text(panel)
+    item = panel.body.item(panel.body.count() - 1)
+    document = panel.message_delegate.document(panel.body.indexFromItem(item), 300)
+    assert "bili-image:" in document.toHtml()
+    assert "<b>普通文字</b>" in document.toPlainText()
+    assert "<b>普通文字</b>[热词系列测试]" in item.text()
+    assert len(provider.images) == 1 and "cookie" not in provider.images[0].headers
+    assert widget.engine.api.gate.count == len(provider.requests) + len(provider.images)
+    # Exercise the actual delegate paint, not just its generated document: the
+    # full 72px image must remain visible inside the row at the bottom of the list.
+    pixmap = QPixmap(72, 72)
+    pixmap.fill(Qt.magenta)
+    widget._artwork[url] = pixmap
+    panel.update_artwork(url)
+    panel.body.scrollToBottom()
+    app.processEvents()
+    image = panel.body.viewport().grab().toImage()
+    colored = sum(
+        image.pixelColor(x, y).name() == "#ff00ff"
+        for y in range(image.height())
+        for x in range(image.width())
+    )
+    assert colored >= 70 * 70
+    provider.inbox_state["messages"][-1]["msg_status"] = 1
+    widget.load_thread(7, True)
+    wait_for(app, lambda: not widget.busy)
+    item = panel.body.item(panel.body.count() - 1)
+    assert item.data(CONTENT_ROLE).text == "[消息已撤回]"
+    assert (
+        "bili-image:"
+        not in panel.message_delegate.document(panel.body.indexFromItem(item), 300).toHtml()
+    )
+    assert len(provider.images) == 1
+
+
+@pytest.mark.parametrize("window", [emoji_inbox_provider], indirect=True)
+def test_messages_keep_contrast_with_a_dark_system_palette_and_selection(app, window):
+    widget, _ = window
+    original = app.palette()
+    dark = QPalette(original)
+    dark.setColor(QPalette.Text, Qt.white)
+    dark.setColor(QPalette.Base, Qt.black)
+    app.setPalette(dark)
+    try:
+        open_test_inbox(widget, app)
+        panel = widget.inbox_panel
+        item = panel.body.item(panel.body.count() - 1)
+        index = panel.body.indexFromItem(item)
+        document = panel.message_delegate.document(index, 300)
+        assert document.find("普通文字").charFormat().foreground().color().name() == COLORS["ink"]
+        selected = panel.message_delegate.document(index, 300, selected=True)
+        assert selected.find("普通文字").charFormat().foreground().color().name() == COLORS["white"]
+        panel.body.clearSelection()
+        panel.body.scrollToBottom()
+        app.processEvents()
+        image = panel.body.viewport().grab().toImage().copy(panel.body.visualItemRect(item))
+        visible_ink = sum(
+            image.pixelColor(x, y).name() == COLORS["ink"]
+            for y in range(image.height())
+            for x in range(image.width())
+        )
+        assert visible_ink > 20
+    finally:
+        app.setPalette(original)

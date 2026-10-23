@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import sqlite3
 import stat
@@ -11,6 +12,7 @@ from conftest import PNG, inbox_provider, private_message
 from bili_downloader import cache as storage
 from bili_downloader.cache import AccountCache, account_folder
 from bili_downloader.inbox import message_text
+from bili_downloader.message_content import MessageImage, message_content
 from bili_downloader.sources import DownloadError
 
 
@@ -57,6 +59,48 @@ async def test_received_messages_images_and_selection_restore_without_refetch(tm
     # This is deliberately local plaintext storage, not a credential vault.
     assert url.encode() in raw
     assert b"SESSDATA" not in raw
+
+
+async def test_emoji_metadata_and_image_restore_with_the_message_without_extra_api_reads(tmp_path):
+    provider, state = inbox_provider()
+    persistent(provider, tmp_path)
+    url = "https://i0.hdslb.com/bfs/emote/synthetic.png"
+    state["messages"][-1]["content"] = json.dumps({"content": "收到[热词系列测试]"})
+    state["emojis"] = [{"text": "[热词系列测试]", "url": url, "size": 2}]
+    provider.image_handler = lambda request: httpx.Response(
+        200, content=PNG, headers={"content-type": "image/png"}
+    )
+    async with provider.api() as api:
+        await api.use_cookie("SESSDATA=synthetic; DedeUserID=42")
+        await api.inbox.refresh(42)
+        before = len(provider.requests)
+        view = await api.inbox.open(7, 42)
+        assert len(provider.requests) == before + 1
+        assert view.messages[-1].emojis[0].url == url
+        assert await api.cdn_image(url) == PNG
+    before, image_count = len(provider.requests), len(provider.images)
+    async with provider.api() as api:
+        await api.use_cookie("SESSDATA=synthetic; DedeUserID=42")
+        view = await api.inbox.open(7, 42)
+        assert view.cached and len(provider.requests) == before + 1
+        content = message_content(view.messages[-1])
+        assert [part.url for part in content.parts if isinstance(part, MessageImage)] == [url]
+        assert await api.cdn_image(url) == PNG and len(provider.images) == image_count
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [None, "unexpected", {"url": "unexpected"}, [{"text": "bad"}], [{"text": "bad", "url": 7}]],
+)
+async def test_optional_emoji_metadata_does_not_block_plain_message_acquisition(metadata):
+    provider, state = inbox_provider()
+    state["emojis"] = metadata
+    async with provider.api() as api:
+        await api.use_cookie("SESSDATA=synthetic; DedeUserID=42")
+        await api.inbox.refresh(42)
+        view = await api.inbox.open(7, 42)
+        assert message_text(view.messages[-1]) == "合成私信 25"
+        assert view.messages[-1].emojis == []
 
 
 async def test_sqlite_failure_does_not_commit_cursor_or_publish_unstored_messages(tmp_path):
@@ -141,6 +185,33 @@ async def test_content_resumes_saved_pages_and_never_scans_on_login(tmp_path):
             assert len(view.items) == 21 and not view.has_more
             assert len(provider.requests) == start + 1
         assert provider.requests[-1].url.params["max"] == "2"
+
+
+async def test_stale_display_projection_does_not_disable_message_or_image_cache(tmp_path):
+    provider = persistent(content_provider(), tmp_path)
+    url = "https://i0.hdslb.com/saved-avatar.png"
+    async with provider.api() as api:
+        await api.use_cookie("SESSDATA=synthetic; DedeUserID=42")
+        await api.inbox.refresh(42)
+        await api.inbox.open(7, 42)
+        await api.read_account_content("dynamic")
+        api.cache.put_image(url, PNG)
+        stale = api.cache.get("content", "dynamic")
+        for row in stale["items"]:
+            row.pop("image_role")
+        api.cache.put_many({("content", "dynamic"): stale})
+    before = len(provider.requests)
+    async with provider.api() as api:
+        await api.use_cookie("SESSDATA=synthetic; DedeUserID=42")
+        assert api.cache is not None and len(provider.requests) == before + 1
+        assert api.inbox.high_water[7] == 25 and len(api.inbox.threads[7].messages) == 20
+        assert "dynamic" not in api.account_content.views
+        assert "dynamic" not in api.account_content.frontiers
+        assert await api.cdn_image(url) == PNG and not provider.images
+        before = len(provider.requests)
+        view = await api.read_account_content("dynamic")
+        assert len(provider.requests) == before + 1 and len(view.items) == 20
+        assert all(row.image_role in {"avatar", "cover"} for row in view.items)
 
 
 async def test_over_content_cache_cap_does_not_save_cursor_past_missing_pages(tmp_path):

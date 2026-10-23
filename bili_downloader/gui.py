@@ -328,10 +328,10 @@ class MainWindow(QMainWindow):
         library_layout.addWidget(self.auto_library)
         self.library_panel.hide()
         body_layout.addWidget(self.library_panel)
-        self.inbox_panel = InboxPanel(self.avatar_for)
+        self.inbox_panel = InboxPanel(self.avatar_for, self.pixmap_for)
         self.inbox_panel.hide()
         body_layout.addWidget(self.inbox_panel)
-        self.content_panel = AccountContentPanel(self.avatar_for)
+        self.content_panel = AccountContentPanel(self.avatar_for, self.pixmap_for)
         self.content_panel.hide()
         body_layout.addWidget(self.content_panel)
 
@@ -684,7 +684,7 @@ class MainWindow(QMainWindow):
         self.launch(
             operation,
             "正在读取私信消息",
-            "只读取所选会话，图片与未知类型显示占位文字。",
+            "只读取所选会话；图片按需加载，不标记已读或发送消息。",
             kind="inbox",
         )
 
@@ -914,7 +914,10 @@ class MainWindow(QMainWindow):
         self.favorite_items.verticalScrollBar().setValue(position)
 
     def avatar_for(self, url, name):
-        return avatar_icon(self._artwork.get(url, QPixmap()), name)
+        return avatar_icon(self.pixmap_for(url), name)
+
+    def pixmap_for(self, url):
+        return self._artwork.get(url, QPixmap())
 
     def schedule_artwork(self, state):
         self.artwork_timer.start()
@@ -929,7 +932,7 @@ class MainWindow(QMainWindow):
             or QApplication.applicationState() != Qt.ApplicationActive
         ):
             return
-        urls = self.inbox_panel.visible_avatar_urls() if self.inbox_panel.isVisible() else []
+        urls = self.inbox_panel.visible_artwork_urls() if self.inbox_panel.isVisible() else []
         if self.content_panel.isVisible():
             urls.extend(self.content_panel.visible_artwork_urls())
         if self.library_panel.isVisible():
@@ -957,7 +960,7 @@ class MainWindow(QMainWindow):
             if self.content_panel.isVisible():
                 self.content_panel.hint.setText(f"图片读取已暂停，条目仍可用：{error}")
         elif body is not None:
-            pixmap = decode_image(body)
+            pixmap = decode_image(body, QSize(320, 240))
             self._artwork[url] = pixmap
             self._artwork.move_to_end(url)
             while len(self._artwork) > 128:
@@ -966,9 +969,9 @@ class MainWindow(QMainWindow):
                 item = self.favorite_items.topLevelItem(index)
                 if item.data(0, Qt.UserRole + 1) == url and not pixmap.isNull():
                     item.setIcon(0, QIcon(pixmap))
-            self.inbox_panel.update_avatar(url)
+            self.inbox_panel.update_artwork(url)
             if not pixmap.isNull():
-                self.content_panel.update_artwork(url, pixmap)
+                self.content_panel.update_artwork(url)
         self.artwork_timer.start()
 
     def mode_changed(self):

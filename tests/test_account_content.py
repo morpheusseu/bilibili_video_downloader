@@ -36,6 +36,126 @@ async def test_three_read_only_surfaces_paginate_through_real_sdk_and_shared_gat
         assert api.gate.count == len(provider.requests)
 
 
+async def test_forward_keeps_only_first_original_text_and_picture_count_without_extra_reads(
+    tmp_path,
+):
+    provider = content_provider(1)
+    provider.cache_root = tmp_path
+    outer = dynamic(3)
+    outer["type"] = "DYNAMIC_TYPE_FORWARD"
+    outer["modules"]["module_dynamic"] = {"desc": {"text": "我的转发"}}
+    outer["modules"]["module_author"]["face"] = "https://i0.hdslb.com/face.png"
+    original = dynamic(2)
+    original["type"] = "DYNAMIC_TYPE_FORWARD"
+    original["modules"]["module_dynamic"]["desc"]["text"] = "第一层原文"
+    original["modules"]["module_dynamic"]["major"]["draw"]["items"] *= 3
+    original["orig"] = dynamic(1)
+    original["orig"]["modules"]["module_dynamic"]["desc"]["text"] = "更深层不应展示"
+    outer["orig"] = original
+    provider.content_state["dynamic"] = [outer]
+    async with provider.api() as api:
+        await api.use_cookie("SESSDATA=synthetic; DedeUserID=42")
+        before = len(provider.requests)
+        view = await api.read_account_content("dynamic")
+        assert len(provider.requests) == before + 1 and not provider.images
+        item = view.items[0]
+        assert "我的转发" in item.body and "第一层原文" in item.body
+        assert "图片 3 张" in item.body and "更深层不应展示" not in item.body
+        assert item.image_role == "avatar" and item.image.endswith("face.png")
+    async with provider.api() as api:
+        await api.use_cookie("SESSDATA=synthetic; DedeUserID=42")
+        cached = api.account_content.views["dynamic"]
+        assert cached.cached and cached.items[0] == item
+
+
+@pytest.mark.parametrize("visible", [True, False])
+async def test_forward_video_or_unavailable_original_stays_readable(visible):
+    provider = content_provider(1)
+    outer = dynamic(2)
+    outer["type"] = "DYNAMIC_TYPE_FORWARD"
+    outer["orig"] = dynamic(1)
+    outer["orig"]["visible"] = visible
+    outer["orig"]["modules"]["module_dynamic"]["major"] = {
+        "archive": {
+            "title": "原视频标题",
+            "bvid": "BV178411i7AD",
+            "cover": "https://i0.hdslb.com/not-requested.jpg",
+        }
+    }
+    provider.content_state["dynamic"] = [outer]
+    async with provider.api() as api:
+        await api.use_cookie("SESSDATA=synthetic; DedeUserID=42")
+        item = (await api.read_account_content("dynamic")).items[0]
+        assert (
+            ("原视频标题" in item.body and "视频 1 个" in item.body)
+            if visible
+            else "不可见" in item.body
+        )
+        assert not provider.images
+
+
+@pytest.mark.parametrize("forwarded", [False, True])
+@pytest.mark.parametrize("rich_text", [False, True])
+async def test_null_major_variants_keep_opus_text_author_and_picture_count(forwarded, rich_text):
+    provider = content_provider(1)
+    opus = dynamic(1)
+    opus["modules"]["module_author"].update(
+        name="原作者", face="https://i0.hdslb.com/original-avatar.png"
+    )
+    opus["modules"]["module_dynamic"] = {
+        "desc": None,
+        "major": {
+            "archive": None,
+            "draw": None,
+            "article": None,
+            "common": None,
+            "opus": {
+                "summary": (
+                    {"rich_text_nodes": [{"text": "真实结构"}, {"text": "的正文"}]}
+                    if rich_text
+                    else {"text": "真实结构的正文"}
+                ),
+                "pics": [{"url": "https://i0.hdslb.com/not-requested.png"}] * 3,
+            },
+        },
+    }
+    if forwarded:
+        outer = dynamic(2)
+        outer["type"] = "DYNAMIC_TYPE_FORWARD"
+        outer["modules"]["module_author"]["face"] = "https://i0.hdslb.com/forwarder.png"
+        outer["orig"] = opus
+    else:
+        outer = opus
+    provider.content_state["dynamic"] = [outer]
+    async with provider.api() as api:
+        await api.use_cookie("SESSDATA=synthetic; DedeUserID=42")
+        before = len(provider.requests)
+        item = (await api.read_account_content("dynamic")).items[0]
+        assert "原作者" in item.body and "真实结构的正文" in item.body and "图片 3 张" in item.body
+        assert ("转发原文（仅第一层）" in item.body) is forwarded
+        assert item.image_role == "avatar"
+        assert item.image.endswith("forwarder.png" if forwarded else "original-avatar.png")
+        assert len(provider.requests) == before + 1 and not provider.images
+
+
+async def test_video_uses_only_archive_cover_when_other_major_variants_are_null():
+    provider = content_provider(1)
+    video = dynamic(1)
+    video["type"] = "DYNAMIC_TYPE_AV"
+    major = video["modules"]["module_dynamic"]["major"]
+    major.update(
+        draw=None,
+        archive={"title": "视频标题", "cover": "https://i0.hdslb.com/video-cover.png"},
+    )
+    video["modules"]["module_author"]["face"] = "https://i0.hdslb.com/author-avatar.png"
+    provider.content_state["dynamic"] = [video]
+    async with provider.api() as api:
+        await api.use_cookie("SESSDATA=synthetic; DedeUserID=42")
+        item = (await api.read_account_content("dynamic")).items[0]
+        assert item.title == "视频标题" and item.image_role == "cover"
+        assert item.image.endswith("video-cover.png") and not provider.images
+
+
 async def test_dynamic_update_check_skips_body_and_explicit_refresh_rechecks_edits():
     provider = content_provider()
     async with provider.api() as api:

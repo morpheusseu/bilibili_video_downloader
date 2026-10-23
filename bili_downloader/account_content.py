@@ -1,13 +1,16 @@
-"""Read-only account browsing; cursors and views live only for one login."""
+"""Read-only browsing with disposable display projections and bounded cursors."""
 
+import logging
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 
+from .provider_views import feed_page
 from .sources import DownloadError
 
 KINDS = ("dynamic", "followings", "history")
 TITLES = {"dynamic": "关注动态", "followings": "关注的人", "history": "观看历史"}
 PAGE_SIZE = 20
+log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -16,6 +19,7 @@ class ContentItem:
     title: str
     summary: str
     body: str
+    image_role: str
     url: str = ""
     image: str = ""
 
@@ -48,42 +52,87 @@ def _text(value):
     return value if isinstance(value, str) else ""
 
 
+def _description(value):
+    value = _map(value)
+    if isinstance(value.get("text"), str):
+        return value["text"]
+    nodes = value.get("rich_text_nodes")
+    return (
+        "".join(_text(_map(node).get("text")) for node in nodes) if isinstance(nodes, list) else ""
+    )
+
+
+def _forward_excerpt(original):
+    original = _map(original)
+    if not original:
+        return "接口未提供转发原文，可通过“打开原文”查看。"
+    if original.get("visible") is False:
+        return "转发原文当前不可见或已删除。"
+    modules = _map(original.get("modules"))
+    author = _map(modules.get("module_author"))
+    content = _map(modules.get("module_dynamic"))
+    major = _map(content.get("major"))
+    archive = _map(major.get("archive"))
+    opus = _map(major.get("opus"))
+    article = _map(major.get("article")) or _map(major.get("common"))
+    pictures = _map(major.get("draw")).get("items") or opus.get("pics") or []
+    name = _text(author.get("name"))
+    sender = "@" + name if name else "作者信息暂不可用"
+    if author.get("pub_ts"):
+        sender += " · " + local_time(author["pub_ts"])
+    detail = [
+        "转发原文（仅第一层）",
+        sender,
+        _description(content.get("desc")),
+        _text(archive.get("title")) or _text(opus.get("title")) or _text(article.get("title")),
+        _text(archive.get("desc"))
+        or _description(opus.get("summary"))
+        or _text(article.get("desc")),
+    ]
+    if isinstance(pictures, list) and pictures:
+        detail.append(f"图片 {len(pictures)} 张（仅计数，不加载原文图片）")
+    if archive:
+        detail.append("视频 1 个 · " + _text(archive.get("bvid")))
+    if original.get("type") == "DYNAMIC_TYPE_FORWARD":
+        detail.append("更深层的转发不展开，可打开原文查看。")
+    return "\n".join(filter(None, detail))
+
+
 def dynamic_item(item):
     if not item.id_str.isdecimal():
         raise DownloadError("动态标识无效，已保留原列表")
     url = f"https://t.bilibili.com/{item.id_str}"
     if not item.visible:
         return ContentItem(
-            item.id_str, "当前不可见的动态", "不可见", f"动态 {item.id_str} 当前不可见。", url
+            item.id_str,
+            "当前不可见的动态",
+            "不可见",
+            f"动态 {item.id_str} 当前不可见。",
+            image_role="avatar",
+            url=url,
         )
     if not isinstance(item.modules, dict):
         raise DownloadError("动态内容结构不兼容，未把未知格式当作空动态")
     author = _map(item.modules.get("module_author"))
     content = _map(item.modules.get("module_dynamic"))
     major = _map(content.get("major"))
-    desc = _text(_map(content.get("desc")).get("text"))
+    desc = _description(content.get("desc"))
     title, detail, image = "", "", ""
-    if "archive" in major:
-        archive = _map(major["archive"])
+    if archive := _map(major.get("archive")):
         title, detail, image = (_text(archive.get(key)) for key in ("title", "desc", "cover"))
         detail = "\n".join(
             filter(None, (detail, _text(archive.get("bvid")), _text(archive.get("duration_text"))))
         )
-    elif "draw" in major or "opus" in major:
+    elif _map(major.get("draw")) or _map(major.get("opus")):
         draw = _map(major.get("draw"))
         opus = _map(major.get("opus"))
         title = _text(opus.get("title"))
-        detail = _text(_map(opus.get("summary")).get("text"))
-        pictures = draw.get("items", opus.get("pics", []))
+        detail = _description(opus.get("summary"))
+        pictures = draw.get("items") or opus.get("pics") or []
         if isinstance(pictures, list) and pictures:
-            image = _text(_map(pictures[0]).get("src", _map(pictures[0]).get("url")))
             detail += f"\n图片 {len(pictures)} 张（不自动下载原图）"
-    elif "article" in major or "common" in major:
-        card = _map(major.get("article", major.get("common")))
-        title, detail, image = (_text(card.get(key)) for key in ("title", "desc", "cover"))
-        covers = card.get("covers")
-        if not image and isinstance(covers, list) and covers:
-            image = _text(covers[0])
+    elif card := _map(major.get("article")) or _map(major.get("common")):
+        title, detail = (_text(card.get(key)) for key in ("title", "desc"))
     kind = {
         "DYNAMIC_TYPE_AV": "视频",
         "DYNAMIC_TYPE_WORD": "文字",
@@ -102,9 +151,7 @@ def dynamic_item(item):
                 desc,
                 title,
                 detail.strip(),
-                "转发的原动态请通过“打开原文”查看。"
-                if item.type_field == "DYNAMIC_TYPE_FORWARD"
-                else "",
+                _forward_excerpt(item.orig) if item.type_field == "DYNAMIC_TYPE_FORWARD" else "",
                 f"动态 ID {item.id_str}",
                 url,
             ),
@@ -116,8 +163,9 @@ def dynamic_item(item):
         title,
         f"{name} · {kind} · {stamp}",
         body,
-        url,
-        image or _text(author.get("face")),
+        image_role="cover" if image else "avatar",
+        url=url,
+        image=image or _text(author.get("face")),
     )
 
 
@@ -142,8 +190,9 @@ def following_item(user):
         name,
         f"UID {user.mid}",
         body,
-        f"https://space.bilibili.com/{user.mid}",
-        user.face,
+        image_role="avatar",
+        url=f"https://space.bilibili.com/{user.mid}",
+        image=user.face,
     )
 
 
@@ -183,8 +232,9 @@ def history_item(item):
         item.title,
         f"{item.author_name or detail.business} · {stamp}",
         body,
-        url,
-        item.cover or "",
+        image_role="cover",
+        url=url,
+        image=item.cover or "",
     )
 
 
@@ -205,13 +255,14 @@ class AccountContent:
         self.views = {}
         self.frontiers = {}
         if cache is not None:
-            try:
-                for kind in KINDS:
-                    saved = cache.get("content", kind)
-                    if saved is not None:
+            for kind in KINDS:
+                saved = cache.get("content", kind)
+                if saved is not None:
+                    try:
                         rows = tuple(ContentItem(**item) for item in saved["items"])
                         if len(rows) > 200 or any(
                             not all(isinstance(value, str) for value in asdict(row).values())
+                            or row.image_role not in {"avatar", "cover"}
                             for row in rows
                         ):
                             raise ValueError("Invalid content cache")
@@ -226,12 +277,16 @@ class AccountContent:
                                 )
                             ):
                                 raise ValueError("Invalid cached target")
-                        self.views[kind] = ContentView(
+                        view = ContentView(
                             kind, rows, bool(saved["has_more"]), saved["notice"], True
                         )
-                        self.frontiers[kind] = saved["frontier"]
-            except Exception:
-                raise DownloadError("账号内容缓存结构无效，未恢复其分页游标") from None
+                        frontier = saved["frontier"]
+                        self.views[kind], self.frontiers[kind] = view, frontier
+                    except (KeyError, TypeError, ValueError):
+                        # Display strings are not provider truth. A stale projection
+                        # must be rebuilt on demand, never disable valid DM/image caches
+                        # or retain a pagination cursor without its usable pages.
+                        log.info("Content display cache needs refresh kind=%s", kind)
 
     async def read(self, kind, account_id, *, more=False, check=False):
         if kind not in KINDS:
@@ -274,7 +329,7 @@ class AccountContent:
                 ), frontier
             if update.update_num < 0:
                 raise DownloadError("动态更新数量无效，已保留原列表")
-        data = await self.sdk.dynamic.all(**({"offset": frontier["offset"]} if more else {}))
+        data = await feed_page(self.sdk, offset=frontier["offset"] if more else None)
         visited = set(frontier["seen"]) if more else set()
         if data.has_more and (not data.offset or data.offset in visited):
             raise DownloadError("动态分页游标未推进，已保留原列表")

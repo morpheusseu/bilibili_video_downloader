@@ -151,7 +151,7 @@ class Bilibili:
         self.session: Session | None = None
         self.image_transport = image_transport
         self.favorites = FavoriteLibrary(self.sdk.fav)
-        self.inbox = Inbox(self.sdk.message, self.sdk.user)
+        self.inbox = Inbox(self.sdk)
         self.account_content = AccountContent(self.sdk)
         self.broadcast_factory = broadcast_factory
         self._live_task = None
@@ -184,7 +184,7 @@ class Bilibili:
         self.inbox.clear()
         # A login owns its inbox. A late old-account operation cannot repopulate
         # the new account's state, even if it was already awaiting provider I/O.
-        self.inbox = Inbox(self.sdk.message, self.sdk.user)
+        self.inbox = Inbox(self.sdk)
         self.account_content = AccountContent(self.sdk)
 
     async def forget_account_cache(self, account_id):
@@ -217,7 +217,7 @@ class Bilibili:
             if self.cache_root is not None:
                 try:
                     self.cache = AccountCache(self.cache_root, nav.mid)
-                    self.inbox = Inbox(self.sdk.message, self.sdk.user, cache=self.cache)
+                    self.inbox = Inbox(self.sdk, cache=self.cache)
                     self.account_content = AccountContent(self.sdk, cache=self.cache)
                     count = sum(len(view.messages) for view in self.inbox.threads.values())
                     self.cache_notice = (
@@ -233,7 +233,7 @@ class Bilibili:
                     if self.cache is not None:
                         self.cache.close()
                     self.cache = None
-                    self.inbox = Inbox(self.sdk.message, self.sdk.user)
+                    self.inbox = Inbox(self.sdk)
                     self.account_content = AccountContent(self.sdk)
                     self.cache_notice = f"{error}；本次仅使用内存，未覆盖原缓存。"
             avatar = b""
@@ -404,6 +404,7 @@ class Bilibili:
                         "image/jpeg",
                         "image/png",
                         "image/webp",
+                        "image/gif",
                     }:
                         return b""
                     body = bytearray()

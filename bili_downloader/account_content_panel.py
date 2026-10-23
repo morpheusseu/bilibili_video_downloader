@@ -24,10 +24,10 @@ class AccountContentPanel(QFrame):
     tab_changed = pyqtSignal()
     open_requested = pyqtSignal(str)
 
-    def __init__(self, avatars):
+    def __init__(self, avatars, images):
         super().__init__()
         self.setObjectName("card")
-        self.avatars = avatars
+        self.avatars, self.images = avatars, images
         self.views = {}
         self.busy, self.logged_in = False, False
         layout = QVBoxLayout(self)
@@ -60,7 +60,7 @@ class AccountContentPanel(QFrame):
         self.body.setReadOnly(True)
         self.body.setAccessibleName("账号内容详情")
         self.body.setPlaceholderText("选择条目查看正文与信息；不会标记已读或执行写操作。")
-        self.body.setMaximumHeight(120)
+        self.body.setMaximumHeight(180)
         layout.addWidget(self.body)
         actions = QHBoxLayout()
         self.more = QPushButton("加载更多")
@@ -111,7 +111,7 @@ class AccountContentPanel(QFrame):
                 item.setData(0, Qt.UserRole, row)
                 for column in (0, 1):
                     item.setToolTip(column, item.text(column))
-                item.setIcon(0, self.avatars(row.image, row.title))
+                item.setIcon(0, self.icon_for(row))
                 self.items.addTopLevelItem(item)
                 if row.key == key:
                     self.items.setCurrentItem(item)
@@ -129,7 +129,7 @@ class AccountContentPanel(QFrame):
     def set_compact(self, compact):
         self.items.setMinimumHeight(110 if compact else 140)
         self.items.setMaximumHeight(150 if compact else 210)
-        self.body.setMaximumHeight(80 if compact else 120)
+        self.body.setMaximumHeight(120 if compact else 180)
 
     def selection_changed(self):
         item = self.items.currentItem()
@@ -168,11 +168,14 @@ class AccountContentPanel(QFrame):
             if region.intersects(self.items.visualItemRect(item := self.items.topLevelItem(index)))
         ]
 
-    def update_artwork(self, url, pixmap):
+    def icon_for(self, row):
+        if self.kind == "followings" or row.image_role == "avatar":
+            return self.avatars(row.image, row.title)
+        return QIcon(self.images(row.image))
+
+    def update_artwork(self, url):
         for index in range(self.items.topLevelItemCount()):
             item = self.items.topLevelItem(index)
             row = item.data(0, Qt.UserRole)
             if row.image == url:
-                item.setIcon(
-                    0, self.avatars(url, row.title) if self.kind == "followings" else QIcon(pixmap)
-                )
+                item.setIcon(0, self.icon_for(row))

@@ -19,7 +19,13 @@ def dynamic(number):
             "module_author": {"mid": 7, "name": "合成 UP 主", "pub_ts": 1700000000},
             "module_dynamic": {
                 "desc": {"text": f"合成动态 {number} <plain>"},
-                "major": {"draw": {"items": [{"src": "", "width": 800, "height": 600}]}},
+                "major": {
+                    "archive": None,
+                    "article": None,
+                    "common": None,
+                    "opus": None,
+                    "draw": {"items": [{"src": "", "width": 800, "height": 600}]},
+                },
             },
         },
     }

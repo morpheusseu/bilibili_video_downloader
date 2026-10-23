@@ -15,25 +15,13 @@ from bpi.errors import (
 from bpi.message.models import PrivateMessage, Session
 
 from .cache import MAX_MESSAGES, MAX_THREADS
+from .message_content import message_content
+from .provider_views import ReceivedMessage, message_page
 from .sources import DownloadError
 
 
 def message_text(message: PrivateMessage | None) -> str:
-    if message is None:
-        return "暂无消息"
-    # The provider can return withdrawn bodies. Never surface them, even in previews.
-    if message.msg_status == 1 or message.msg_type == 5:
-        return "[消息已撤回]"
-    if message.msg_type == 2:
-        return "[图片]"
-    if message.msg_type != 1:
-        return f"[暂不支持的消息类型 {message.msg_type}]"
-    try:
-        content = json.loads(message.content)
-    except (ValueError, TypeError):
-        return "[无法解析的文本消息]"
-    text = content.get("content") if isinstance(content, dict) else None
-    return text if isinstance(text, str) else "[无法解析的文本消息]"
+    return message_content(message).text
 
 
 @dataclass(frozen=True)
@@ -104,8 +92,8 @@ class SendReceipt:
 
 
 class Inbox:
-    def __init__(self, messages, users, *, cache=None):
-        self.messages, self.users = messages, users
+    def __init__(self, sdk, *, cache=None):
+        self.sdk, self.messages, self.users = sdk, sdk.message, sdk.user
         self.cache = cache
         self._lock = asyncio.Lock()
         self.clear()
@@ -140,7 +128,7 @@ class Inbox:
                 self.view = InboxView(tuple(conversations), True, True, True)
                 self.frontiers = {1: (None, True), 2: (None, True)}
             for peer, record in self.cache.threads():
-                rows = tuple(PrivateMessage.model_validate(row) for row in record["messages"])
+                rows = tuple(ReceivedMessage.model_validate(row) for row in record["messages"])
                 for row in rows:
                     self._validate_message(row, self.cache.account_id, peer)
                 if (
@@ -164,8 +152,9 @@ class Inbox:
     @staticmethod
     def _message_record(message):
         value = message.model_dump(mode="json")
-        if message.msg_status == 1 or message.msg_type == 5:
+        if message.msg_status or message.msg_type == 5:
             value["content"] = ""
+            value.pop("emojis", None)
         return value
 
     def _save_header(self, view):
@@ -386,8 +375,8 @@ class Inbox:
         baseline, end, collected = self.high_water.get(talker_id), None, {}
         data = None
         for _ in range(25):  # Drain at most 500 new messages; never advance across an unfilled gap.
-            data = await self.messages.session_messages(
-                talker_id=talker_id, size=20, begin_seqno=baseline, end_seqno=end
+            data = await message_page(
+                self.sdk, talker_id=talker_id, size=20, begin_seqno=baseline, end_seqno=end
             )
             rows = data.messages or []
             for row in rows:
@@ -423,7 +412,7 @@ class Inbox:
         if not previous and talker_id in self.high_water:
             await self._sync_talker(talker_id, account_id)
         before = min((row.msg_seqno for row in previous), default=None)
-        data = await self.messages.session_messages(talker_id=talker_id, size=20, end_seqno=before)
+        data = await message_page(self.sdk, talker_id=talker_id, size=20, end_seqno=before)
         rows = data.messages or []
         for row in rows:
             self._validate_message(row, account_id, talker_id)

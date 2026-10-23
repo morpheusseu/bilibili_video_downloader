@@ -23,6 +23,8 @@ from PyQt5.QtWidgets import (
 
 from .artwork import avatar_icon
 from .inbox import message_text
+from .message_content import MessageImage, message_content
+from .message_rendering import CONTENT_ROLE, HEADER_ROLE, MessageDelegate
 
 
 class ReplyEditor(QPlainTextEdit):
@@ -49,6 +51,10 @@ class ReplyEditor(QPlainTextEdit):
 
 
 class MessageList(QListWidget):
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.scheduleDelayedItemsLayout()
+
     def keyPressEvent(self, event):
         if event.matches(QKeySequence.Copy):
             QApplication.clipboard().setText(
@@ -68,7 +74,7 @@ class InboxPanel(QFrame):
     reconcile_requested = pyqtSignal()
     reconnect_requested = pyqtSignal()
 
-    def __init__(self, avatars):
+    def __init__(self, avatars, images):
         super().__init__()
         self.setObjectName("card")
         self.thread = None
@@ -124,9 +130,12 @@ class InboxPanel(QFrame):
         self.title.setTextFormat(Qt.PlainText)
         history_layout.addWidget(self.title)
         self.body = MessageList()
+        self.message_delegate = MessageDelegate(self.body, images)
+        self.body.setItemDelegate(self.message_delegate)
         self.body.setIconSize(QSize(32, 32))
         self.body.setWordWrap(True)
         self.body.setTextElideMode(Qt.ElideNone)
+        self.body.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.body.setSpacing(6)
         self.body.setSelectionMode(QListWidget.ExtendedSelection)
         self.body.setAccessibleName("私信消息历史")
@@ -332,10 +341,14 @@ class InboxPanel(QFrame):
             except (ValueError, OverflowError, OSError):
                 stamp = "时间未知"
             sender = "我" if message.sender_uid == self.account_id else name
-            item = QListWidgetItem(f"{stamp} · {sender}\n{message_text(message)}")
+            content = message_content(message)
+            header = f"{stamp} · {sender}"
+            item = QListWidgetItem(f"{header}\n{content.text}")
             item.setData(Qt.UserRole, message.sender_uid)
             item.setData(Qt.UserRole + 1, peer_url if message.sender_uid != self.account_id else "")
             item.setData(Qt.UserRole + 2, sender)
+            item.setData(CONTENT_ROLE, content)
+            item.setData(HEADER_ROLE, header)
             item.setIcon(
                 self.self_icon
                 if message.sender_uid == self.account_id
@@ -356,7 +369,7 @@ class InboxPanel(QFrame):
             if item.data(Qt.UserRole) == account_id:
                 item.setIcon(icon)
 
-    def visible_avatar_urls(self):
+    def visible_artwork_urls(self):
         urls = []
         selected = self.sessions.currentItem()
         if selected and selected.data(0, Qt.UserRole + 1):
@@ -373,9 +386,17 @@ class InboxPanel(QFrame):
                 )
                 if url and region.intersects(tree.visualItemRect(item)) and url not in urls:
                     urls.append(url)
+                if tree is self.body and region.intersects(tree.visualItemRect(item)):
+                    content = item.data(CONTENT_ROLE)
+                    for part in content.parts if content else ():
+                        if isinstance(part, MessageImage) and part.url and part.url not in urls:
+                            urls.append(part.url)
         return urls
 
-    def update_avatar(self, url):
+    def update_artwork(self, url):
+        scrollbar = self.body.verticalScrollBar()
+        at_bottom = scrollbar.value() >= scrollbar.maximum() - 4
+        resized = False
         for index in range(self.sessions.topLevelItemCount()):
             item = self.sessions.topLevelItem(index)
             if item.data(0, Qt.UserRole + 1) == url:
@@ -384,6 +405,17 @@ class InboxPanel(QFrame):
             item = self.body.item(index)
             if item.data(Qt.UserRole + 1) == url:
                 item.setIcon(self.avatars(url, item.data(Qt.UserRole + 2)))
+            content = item.data(CONTENT_ROLE)
+            if content and any(
+                isinstance(part, MessageImage) and part.url == url for part in content.parts
+            ):
+                self.message_delegate.sizeHintChanged.emit(self.body.indexFromItem(item))
+                resized = True
+        if resized:
+            self.body.doItemsLayout()
+            if at_bottom:
+                self.body.scrollToBottom()
+        self.body.viewport().update()
 
     def show_receipt(self, receipt):
         if receipt.request.talker_id != self.selected():

@@ -311,6 +311,7 @@ def inbox_provider(count=2):
             2: [private_session(99, 2000000)],
         },
         "messages": [private_message(i) for i in range(1, 26)],
+        "emojis": [],
         "repeat_sessions": False,
         "repeat_messages": False,
         "risk": False,
@@ -394,6 +395,7 @@ def inbox_provider(count=2):
                     "has_more": int(len(rows) > 20),
                     "min_seqno": min((row["msg_seqno"] for row in page), default=0),
                     "max_seqno": max((row["msg_seqno"] for row in page), default=0),
+                    "e_infos": state["emojis"],
                 }
             )
         raise AssertionError(f"Unexpected private endpoint: {path}")

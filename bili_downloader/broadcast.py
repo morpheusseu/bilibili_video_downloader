@@ -7,6 +7,7 @@ bpi-py; transport ACK is not a private-message read acknowledgement.
 
 import asyncio
 import logging
+import random
 import time
 import uuid
 from dataclasses import dataclass
@@ -21,10 +22,24 @@ URL = "wss://broadcast.chat.bilibili.com:7826/sub"
 BASE = "/bilibili.broadcast.v1.Broadcast"
 WATCH = "/bilibili.broadcast.message.im.Notify/WatchNotify"
 HEARTBEAT_SECONDS = 20
+CHECK_TIMEOUT_SECONDS = 10
+MAX_RECONNECT_ATTEMPTS = 5
+RECONNECT_BASE_SECONDS = 2
+RECONNECT_MAX_SECONDS = 30
+STABLE_CONNECTION_SECONDS = 120
+RECOVERY_COOLDOWN_SECONDS = 30
 
 
 class _ReceiveDeadline(Exception):
     pass
+
+
+class _CheckRequested(Exception):
+    pass
+
+
+class _Reconnectable(DownloadError):
+    """Only transport loss or missing liveness can authorize automatic recovery."""
 
 
 @dataclass(frozen=True)
@@ -159,14 +174,65 @@ class _SingleConnect(connect):
 class BroadcastClient:
     def __init__(self, session, gate, *, connect_factory=_SingleConnect):
         self.session, self.gate, self.connect_factory = session, gate, connect_factory
+        self._check_requested = asyncio.Event()
+        self._failures = self._heartbeats = self._notifications = 0
+
+    def request_check(self, reason):
+        # Called on the owning asyncio loop. It never opens another socket or
+        # interrupts backoff; concurrent foreground/resume hints coalesce.
+        if not self.gate.stopped:
+            log.info("Broadcast health check requested reason=%s", reason)
+            self._check_requested.set()
+
+    def _state(self, callback, kind, detail):
+        callback(BroadcastState(kind, detail, self._heartbeats, self._notifications))
 
     async def run(self, on_wakeup, on_state):
-        """One connection for one login lifetime; any failure requires a manual restart."""
-        ws, sequence, heartbeats, notifications = None, 1, 0, 0
+        """One owner for liveness, bounded recovery and foreground/resume checks."""
+        while True:
+            attempt_started = time.monotonic()
+            try:
+                await self._connection(on_wakeup, on_state)
+            except _Reconnectable as error:
+                if self.gate.stopped:
+                    raise DownloadError("请求已因风控停止，未自动重连") from None
+                self._failures += 1
+                if self._failures > MAX_RECONNECT_ATTEMPTS:
+                    self._state(
+                        on_state,
+                        "stopped",
+                        f"实时私信已断开；{MAX_RECONNECT_ATTEMPTS} 次自动重连未成功，已暂停。"
+                        "切回前台、唤醒或点击恢复可再次检查。",
+                    )
+                    log.warning("Broadcast reconnect budget exhausted")
+                    # Only a *new* external hint starts another bounded episode.
+                    # Old checks during a failing attempt cannot create a retry loop.
+                    self._check_requested.clear()
+                    await self._check_requested.wait()
+                    self._check_requested.clear()
+                    delay = max(0, RECOVERY_COOLDOWN_SECONDS - (time.monotonic() - attempt_started))
+                    self._failures = 0
+                    detail = f"收到恢复检查，{delay:.1f} 秒后尝试重新连接实时私信。"
+                else:
+                    ceiling = min(
+                        RECONNECT_MAX_SECONDS,
+                        RECONNECT_BASE_SECONDS * 2 ** (self._failures - 1),
+                    )
+                    delay = random.uniform(ceiling / 2, ceiling)
+                    detail = (
+                        f"实时私信已断开，{delay:.1f} 秒后重连"
+                        f"（第 {self._failures}/{MAX_RECONNECT_ATTEMPTS} 次）：{error}"
+                    )
+                self._state(on_state, "retry_wait", detail)
+                log.info("Broadcast retry attempt=%s delay_s=%.3f", self._failures, delay)
+                await asyncio.sleep(delay)
+
+    async def _connection(self, on_wakeup, on_state):
+        ws, sequence, subscribed = None, 1, False
         started, pending = time.monotonic(), {}
 
         def state(kind, detail):
-            on_state(BroadcastState(kind, detail, heartbeats, notifications))
+            self._state(on_state, kind, detail)
 
         async def send(suffix, body, type_name):
             nonlocal sequence
@@ -182,12 +248,32 @@ class BroadcastClient:
             await asyncio.wait_for(ws.send(packet), 5)
             return sequence
 
-        async def receive(wait_seconds):
-            nonlocal notifications
-            try:
-                raw = await asyncio.wait_for(ws.recv(), wait_seconds)
-            except TimeoutError:
-                raise _ReceiveDeadline from None
+        async def receive(wait_seconds, *, check=False):
+            if not check:
+                try:
+                    raw = await asyncio.wait_for(ws.recv(), wait_seconds)
+                except TimeoutError:
+                    raise _ReceiveDeadline from None
+            else:
+                reader = asyncio.create_task(ws.recv())
+                checker = asyncio.create_task(self._check_requested.wait())
+                try:
+                    done, _ = await asyncio.wait(
+                        (reader, checker), timeout=wait_seconds, return_when=asyncio.FIRST_COMPLETED
+                    )
+                    # Prioritize a received frame over a simultaneous check, so
+                    # foreground activation can never drop a message notification.
+                    if reader in done:
+                        raw = reader.result()
+                    elif checker in done:
+                        self._check_requested.clear()
+                        raise _CheckRequested
+                    else:
+                        raise _ReceiveDeadline
+                finally:
+                    for task in (reader, checker):
+                        task.cancel()
+                    await asyncio.gather(reader, checker, return_exceptions=True)
             data = _fields(raw)
             options = _fields(_one(data, 1, b""))
             status = _fields(_one(options, 4, b""))
@@ -205,14 +291,15 @@ class BroadcastClient:
             if path == WATCH:
                 envelope = _fields(_one(data, 3, b""))
                 hint = _wakeup(_one(envelope, 2, b""), self.session.mid)
-                notifications += 1
+                self._notifications += 1
                 log.info(
                     "Broadcast notification targets=%s refresh=%s",
                     len(hint.talkers),
                     hint.refresh_sessions,
                 )
                 on_wakeup(hint)
-                state("connected", "已收到私信更新通知")
+                if subscribed:
+                    state("connected", "已收到私信更新通知")
             if _one(options, 3, 0):
                 await send(
                     "/MessageAck",
@@ -258,35 +345,54 @@ class BroadcastClient:
             await confirm("/Auth", await send("/Auth", _blob(1, str(uuid.uuid4())), "AuthReq"))
             await confirm("/Subscribe", await send("/Subscribe", _blob(1, WATCH), "TargetPath"))
             log.info("Broadcast subscribed")
+            subscribed = True
             state("connected", "实时私信已连接")
-            last_received, silent_ticks = time.monotonic(), 0
+            connected_at = last_received = time.monotonic()
+            silent_ticks, probe = 0, None
             while True:
-                timeout = max(
-                    0.01, last_received + (silent_ticks + 1) * HEARTBEAT_SECONDS - time.monotonic()
-                )
+                deadline = last_received + (silent_ticks + 1) * HEARTBEAT_SECONDS
+                if probe is not None:
+                    deadline = min(deadline, probe[1])
+                timeout = max(0.01, deadline - time.monotonic())
                 try:
-                    path, received = await receive(timeout)
+                    path, received = await receive(timeout, check=True)
+                except _CheckRequested:
+                    if probe is None:
+                        sent = await send("/Heartbeat", b"", "HeartbeatResp")
+                        pending[sent] = time.monotonic()
+                        probe = (sent, pending[sent] + CHECK_TIMEOUT_SECONDS)
+                        log.info("Broadcast health probe sent")
+                    continue
                 except _ReceiveDeadline:
+                    if probe is not None and time.monotonic() >= probe[1]:
+                        raise _Reconnectable("连接检查未收到心跳响应") from None
                     sent = await send("/Heartbeat", b"", "HeartbeatResp")
                     pending[sent] = time.monotonic()
                     while len(pending) > 64:
                         pending.pop(next(iter(pending)))
                     silent_ticks += 1
                     if silent_ticks >= 4:
-                        raise DownloadError(
-                            "Broadcast 连续四个心跳周期无响应，已停止；未自动重连"
-                        ) from None
+                        raise _Reconnectable("Broadcast 连续四个心跳周期无响应") from None
                     continue
                 last_received, silent_ticks = time.monotonic(), 0
                 if path == BASE + "/Heartbeat":
                     sent_at = pending.pop(received, None)
                     if sent_at is not None:
-                        heartbeats += 1
+                        self._heartbeats += 1
                         log.info(
                             "Broadcast heartbeat=%s latency_ms=%s",
-                            heartbeats,
+                            self._heartbeats,
                             round((last_received - sent_at) * 1000),
                         )
+                        if probe is not None and received == probe[0]:
+                            probe = None
+                            log.info("Broadcast health probe confirmed")
+                        if (
+                            self._failures
+                            and last_received - connected_at >= STABLE_CONNECTION_SECONDS
+                        ):
+                            self._failures = 0
+                            log.info("Broadcast stable connection reset retry budget")
                         state("connected", "实时私信心跳正常")
         except InvalidStatus as error:
             code = error.response.status_code
@@ -302,17 +408,20 @@ class BroadcastClient:
                 cause,
                 round(time.monotonic() - started),
             )
-            raise DownloadError(f"实时私信连接已断开（{code}），未自动重连；可手动恢复") from None
-        except (TimeoutError, _ReceiveDeadline):
-            raise DownloadError("Broadcast 鉴权/订阅或发送超时，已停止；未自动重试") from None
+            error_type = (
+                _Reconnectable if code in {1000, 1001, 1006, 1011, 1012, 1014} else DownloadError
+            )
+            raise error_type(f"实时私信连接已断开（{code}）") from None
+        except (TimeoutError, _ReceiveDeadline, OSError):
+            raise _Reconnectable("Broadcast 网络连接或响应超时") from None
         except (ValueError, TypeError, UnicodeError):
             raise DownloadError("Broadcast 响应格式不匹配，已停止实时收信；未自动重试") from None
         finally:
             if ws is not None:
                 await ws.close()
             log.info(
-                "Broadcast stopped heartbeats=%s notifications=%s uptime=%s",
-                heartbeats,
-                notifications,
+                "Broadcast connection ended heartbeats=%s notifications=%s uptime=%s",
+                self._heartbeats,
+                self._notifications,
                 round(time.monotonic() - started),
             )

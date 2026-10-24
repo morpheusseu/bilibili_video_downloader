@@ -1,11 +1,13 @@
 import asyncio
 from functools import partial
+from types import SimpleNamespace
 
 import pytest
 from broadcast_peer import BroadcastPeer, notice
 from conftest import inbox_provider, private_message
 from websockets.datastructures import Headers
 from websockets.exceptions import ConnectionClosedError, InvalidStatus
+from websockets.frames import Close
 from websockets.http11 import Response
 
 from bili_downloader.api import RequestGate
@@ -76,8 +78,8 @@ async def test_actual_transport_auth_subscribe_ack_and_heartbeats(monkeypatch):
     assert peer.closed
 
 
-@pytest.mark.parametrize("failure", ["auth", "kickout", "malformed", "disconnect"])
-async def test_transport_failure_closes_once_without_reconnecting(failure):
+@pytest.mark.parametrize("failure", ["auth", "kickout", "malformed", "policy_close"])
+async def test_provider_or_protocol_rejection_closes_once_without_reconnecting(failure):
     peer, gate, states = (
         BroadcastPeer(auth_status=-412 if failure == "auth" else 0),
         RequestGate(0, 0),
@@ -93,7 +95,7 @@ async def test_transport_failure_closes_once_without_reconnecting(failure):
         raw = {
             "kickout": notice(command=2),
             "malformed": b"\x00",
-            "disconnect": ConnectionClosedError(None, None),
+            "policy_close": ConnectionClosedError(Close(1008, "Synthetic policy rejection"), None),
         }[failure]
         await peer.incoming.put(raw)
     with pytest.raises(DownloadError):
@@ -121,8 +123,8 @@ async def test_missed_heartbeat_is_not_an_immediate_failure_but_full_silence_sto
     )
     try:
         if silent:
-            with pytest.raises(DownloadError, match="四个心跳周期"):
-                await task
+            monkeypatch.setattr(module, "MAX_RECONNECT_ATTEMPTS", 0)
+            await until(lambda: states and states[-1].kind == "stopped")
             assert peer.heartbeat_count == 4 and peer.closed
         else:
             await until(lambda: states and states[-1].heartbeats >= 3)
@@ -133,19 +135,22 @@ async def test_missed_heartbeat_is_not_an_immediate_failure_but_full_silence_sto
     assert peer.connections == 1
 
 
-async def test_websocket_http_rejection_latches_gate_without_another_attempt():
+@pytest.mark.parametrize("code", [401, 403, 412, 429])
+async def test_websocket_http_rejection_stops_without_another_attempt(code):
     attempts, gate = [], RequestGate(0, 0)
 
     async def rejected(*args, **kwargs):
         attempts.append(1)
-        raise InvalidStatus(Response(403, "Forbidden", Headers(), b"synthetic"))
+        raise InvalidStatus(Response(code, "Synthetic rejection", Headers(), b"synthetic"))
 
     client = BroadcastClient(
         Session(42, "Synthetic", "synthetic", "browser"), gate, connect_factory=rejected
     )
-    with pytest.raises(DownloadError, match="风控"):
+    with pytest.raises(DownloadError, match="HTTP|风控"):
         await client.run(lambda _: None, lambda _: None)
-    assert attempts == [1] and gate.stopped
+    client.request_check("foreground")
+    client.request_check("resume")
+    assert attempts == [1] and gate.stopped == (code != 401)
 
 
 async def test_notification_coalescing_sdk_increment_and_risk_stop():
@@ -180,6 +185,8 @@ async def test_notification_coalescing_sdk_increment_and_risk_stop():
         await until(lambda: api._live_task.done())
         count = len(provider.requests)
         api.start_inbox_live(lambda *args: None, lambda *args: None)
+        api.check_inbox_live("foreground")
+        api.check_inbox_live("resume")
         await asyncio.sleep(0.05)
         assert len(provider.requests) == count and peer.connections == 1 and peer.closed
         assert statuses[-1][1].kind == "stopped" and api.gate.stopped
@@ -210,16 +217,22 @@ async def test_incremental_backlog_drains_before_committing_cursor_and_preserves
         assert api.inbox.high_water[7] == 70
 
 
-async def test_manual_reconnect_reconciles_gap_and_old_login_cannot_publish():
+async def test_foreground_probe_recovers_half_open_connection_and_gap_without_replaying_writes(
+    monkeypatch,
+):
+    import bili_downloader.broadcast as module
+
+    monkeypatch.setattr(module, "CHECK_TIMEOUT_SECONDS", 0.02)
+    monkeypatch.setattr(module, "RECONNECT_BASE_SECONDS", 0.01)
     provider, state = inbox_provider()
     peers, updates, statuses = [], [], []
 
-    def factory(session, gate):
-        peer = BroadcastPeer()
+    async def connect(*args, **kwargs):
+        peer = BroadcastPeer(drop_heartbeats=range(1, 99) if not peers else ())
         peers.append(peer)
-        return BroadcastClient(session, gate, connect_factory=peer.connect)
+        return await peer.connect(*args, **kwargs)
 
-    provider.broadcast_factory = factory
+    provider.broadcast_factory = partial(BroadcastClient, connect_factory=connect)
     async with provider.api() as api:
         cookie = "SESSDATA=synthetic; DedeUserID=42"
         await api.use_cookie(cookie, user_agent="Synthetic Browser")
@@ -228,20 +241,124 @@ async def test_manual_reconnect_reconciles_gap_and_old_login_cannot_publish():
         )
         await until(lambda: api.inbox.view.conversations)
         await api.inbox.open(7, 42)
-        await peers[0].incoming.put(ConnectionClosedError(None, None))
-        await until(lambda: api._live_task.done())
-        assert len(peers) == 1 and peers[0].closed
         state["messages"].append(private_message(26))
         state["lanes"][1][0].update(max_seqno=26, last_msg=private_message(26))
-        await api.stop_inbox_live()  # Explicit user action, not an automatic retry.
-        api.start_inbox_live(
-            lambda *args: updates.append(args), lambda *args: statuses.append(args)
-        )
+        before = len(provider.requests)
+        api.check_inbox_live("foreground")
         await until(lambda: api.inbox.high_water[7] == 26)
-        assert len(peers) == 2 and api.inbox.thread.messages[-1].msg_seqno == 26
+        assert len(peers) == 2 and peers[0].closed and api.inbox.thread.messages[-1].msg_seqno == 26
+        reads = [r for r in provider.requests[before:] if r.url.path.endswith("fetch_session_msgs")]
+        assert len(reads) == 1 and reads[0].url.params["begin_seqno"] == "25"
+        assert all(request.method == "GET" for request in provider.requests)
         old_owner = api.session
         await api.use_cookie(cookie, user_agent="Synthetic Browser")
         count = len(updates)
         assert peers[-1].closed and not api.inbox.high_water
         await asyncio.sleep(0.05)
         assert len(updates) == count and api.session is not old_owner
+
+
+async def test_healthy_foreground_check_coalesces_without_dropping_simultaneous_notification():
+    provider, state = inbox_provider()
+    peer, statuses = BroadcastPeer(), []
+    provider.broadcast_factory = partial(BroadcastClient, connect_factory=peer.connect)
+    async with provider.api() as api:
+        await api.use_cookie("SESSDATA=synthetic; DedeUserID=42", user_agent="Synthetic Browser")
+        api.start_inbox_live(lambda *args: None, lambda owner, state: statuses.append(state))
+        await until(lambda: api.inbox.view.conversations)
+        await api.inbox.open(7, 42)
+        state["messages"].append(private_message(26))
+        state["lanes"][1][0].update(max_seqno=26, last_msg=private_message(26))
+        await peer.incoming.put(notice())
+        for _ in range(10):
+            api.check_inbox_live("foreground")
+        await until(lambda: api.inbox.high_water[7] == 26 and peer.heartbeat_count == 1)
+        assert peer.connections == 1 and not peer.closed
+        assert [message.msg_seqno for message in api.inbox.thread.messages].count(26) == 1
+        assert any(state.notifications == 1 for state in statuses)
+        assert all(request.method == "GET" for request in provider.requests)
+
+
+async def test_reconnect_jitter_is_capped_and_foreground_never_bypasses_backoff(monkeypatch):
+    import bili_downloader.broadcast as module
+
+    monkeypatch.setattr(module, "RECONNECT_BASE_SECONDS", 0.04)
+    monkeypatch.setattr(module, "RECONNECT_MAX_SECONDS", 0.06)
+    monkeypatch.setattr(module, "RECOVERY_COOLDOWN_SECONDS", 0.02)
+    bounds, attempts, states = [], [], []
+
+    def jitter(low, high):
+        bounds.append((low, high))
+        return high
+
+    monkeypatch.setattr(module, "random", SimpleNamespace(uniform=jitter))
+
+    async def offline(*args, **kwargs):
+        attempts.append(1)
+        raise OSError("Synthetic network unavailable")
+
+    client = BroadcastClient(
+        Session(42, "Synthetic", "synthetic", "browser"),
+        RequestGate(0, 0),
+        connect_factory=offline,
+    )
+    task = asyncio.create_task(client.run(lambda _: None, states.append))
+    try:
+        await until(lambda: states and states[-1].kind == "retry_wait")
+        for _ in range(10):
+            client.request_check("foreground")
+        await asyncio.sleep(0.01)
+        assert len(attempts) == 1
+        await until(lambda: states[-1].kind == "stopped")
+        assert len(attempts) == 6 and len(bounds) == 5
+        assert bounds == [(0.02, 0.04)] + [(0.03, 0.06)] * 4
+        await asyncio.sleep(0.07)
+        assert len(attempts) == 6  # Old foreground hints cannot reset an exhausted budget.
+        client.request_check("resume")
+        await until(lambda: len(attempts) >= 7)
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    count = len(attempts)
+    client.request_check("foreground")
+    await asyncio.sleep(0.07)
+    assert len(attempts) == count
+
+
+@pytest.mark.parametrize("stable", [False, True])
+async def test_only_healthy_stability_not_auth_handshake_resets_retry_budget(monkeypatch, stable):
+    import bili_downloader.broadcast as module
+
+    monkeypatch.setattr(module, "HEARTBEAT_SECONDS", 0.005)
+    monkeypatch.setattr(module, "STABLE_CONNECTION_SECONDS", 0.02 if stable else 1000)
+    monkeypatch.setattr(module, "MAX_RECONNECT_ATTEMPTS", 1)
+    monkeypatch.setattr(module, "RECONNECT_BASE_SECONDS", 0.002)
+    peers, states = [], []
+
+    async def connect(*args, **kwargs):
+        peer = BroadcastPeer()
+        peers.append(peer)
+        return await peer.connect(*args, **kwargs)
+
+    client = BroadcastClient(
+        Session(42, "Synthetic", "synthetic", "browser"),
+        RequestGate(0, 0),
+        connect_factory=connect,
+    )
+    task = asyncio.create_task(client.run(lambda _: None, states.append))
+    try:
+        for number in (1, 2):
+            await until(
+                lambda number=number: len(peers) == number and states[-1].kind == "connected"
+            )
+            if stable:
+                await until(lambda: peers[-1].heartbeat_count >= 5)
+            await peers[-1].incoming.put(ConnectionClosedError(None, None))
+        if stable:
+            await until(lambda: len(peers) == 3 and states[-1].kind == "connected")
+        else:
+            await until(lambda: states[-1].kind == "stopped")
+            assert len(peers) == 2
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)

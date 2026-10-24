@@ -25,6 +25,7 @@ from .artwork import avatar_icon
 from .inbox import message_text
 from .message_content import MessageImage, message_content
 from .message_rendering import CONTENT_ROLE, HEADER_ROLE, MessageDelegate
+from .theme import COLORS
 
 
 class ReplyEditor(QPlainTextEdit):
@@ -94,6 +95,10 @@ class InboxPanel(QFrame):
         title = QLabel("私信")
         title.setObjectName("sectionTitle")
         heading.addWidget(title)
+        self.connection_dot = QLabel()
+        self.connection_dot.setFixedSize(10, 10)
+        self.set_connection_indicator("idle", "未连接实时私信")
+        heading.addWidget(self.connection_dot)
         heading.addStretch()
         self.refresh = QPushButton("刷新会话")
         self.more = QPushButton("更多会话")
@@ -102,7 +107,7 @@ class InboxPanel(QFrame):
         heading.addWidget(self.more)
         heading.addWidget(self.reconnect)
         layout.addLayout(heading)
-        self.live_status = QLabel("登录后连接实时私信；断线或拒绝时停止，可手动恢复。")
+        self.live_status = QLabel("登录后连接实时私信；网络断线有界恢复，鉴权拒绝或风控停止。")
         self.live_status.setTextFormat(Qt.PlainText)
         self.live_status.setWordWrap(True)
         self.live_status.setObjectName("hint")
@@ -246,11 +251,19 @@ class InboxPanel(QFrame):
         self.title.setText("选择会话以读取消息")
         self.hint.setText("通知驱动更新，不标记已读、不定时轮询。文字回复仍需确认收件人。")
         self.live_kind = "idle"
-        self.live_status.setText("登录后连接实时私信；断线或拒绝时停止，可手动恢复。")
+        self.live_status.setText("登录后连接实时私信；网络断线有界恢复，鉴权拒绝或风控停止。")
+        self.set_connection_indicator("idle", "未连接实时私信")
         self.set_busy(False, False)
+
+    def set_connection_indicator(self, kind, detail):
+        color = "green" if kind == "connected" else "yellow" if kind == "connecting" else "red"
+        self.connection_dot.setStyleSheet(f"background: {COLORS[color]}; border-radius: 5px;")
+        self.connection_dot.setToolTip(detail)
+        self.connection_dot.setAccessibleName("实时私信连接状态：" + detail)
 
     def show_live_status(self, state):
         self.live_kind = state.kind
+        self.set_connection_indicator(state.kind, state.detail)
         counts = (
             f" · 心跳 {state.heartbeats} 次 · 通知 {state.notifications} 次"
             if state.kind == "connected"

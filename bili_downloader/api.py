@@ -156,6 +156,7 @@ class Bilibili:
         self.broadcast_factory = broadcast_factory
         self._live_task = None
         self._live_owner = None
+        self._live_client = None
         self.cache_root = cache_root
         self.cache = None
         self.cache_notice = ""
@@ -270,9 +271,19 @@ class Bilibili:
     async def stop_inbox_live(self):
         task, self._live_task = self._live_task, None
         self._live_owner = None
+        self._live_client = None
         if task and task is not asyncio.current_task():
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
+
+    def check_inbox_live(self, reason):
+        if (
+            self.session is not None
+            and self._live_owner is self.session
+            and self._live_client is not None
+            and not self.gate.stopped
+        ):
+            self._live_client.request_check(reason)
 
     async def _run_inbox_live(self, session, inbox, on_update, on_status):
         pending, talkers, refresh = asyncio.Event(), set(), False
@@ -288,6 +299,8 @@ class Bilibili:
                 if value.kind == "connected" and not bootstrapped:
                     bootstrapped = True
                     hint(Wakeup(refresh_sessions=True))
+                elif value.kind == "connecting":
+                    bootstrapped = False
 
         def hint(value):
             nonlocal refresh
@@ -347,9 +360,10 @@ class Bilibili:
                     await inbox.refresh_heads(session.mid)
                     publish()
 
-        tasks = []
+        tasks, client = [], None
         try:
             client = self.broadcast_factory(session, self.gate)
+            self._live_client = client
             tasks = [asyncio.create_task(client.run(hint, status)), asyncio.create_task(consume())]
             done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
             for task in done:
@@ -362,6 +376,8 @@ class Bilibili:
             if current():
                 on_status(session, BroadcastState("stopped", text))
         finally:
+            if self._live_client is client:
+                self._live_client = None
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)

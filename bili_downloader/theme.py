@@ -16,6 +16,8 @@ COLORS = {
     "disabled": "#7a7a7a",
     "pink": "#cf2f73",
     "red": "#c62828",
+    "yellow": "#d99a00",
+    "green": "#248a3d",
     "down": Path(__file__).with_name("chevron-down.svg").as_posix(),
     "up": Path(__file__).with_name("chevron-up.svg").as_posix(),
 }

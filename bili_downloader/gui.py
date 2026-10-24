@@ -4,6 +4,7 @@ import asyncio
 import logging
 import sys
 import threading
+import time
 from collections import OrderedDict
 from collections.abc import Callable
 from logging.handlers import RotatingFileHandler
@@ -145,6 +146,10 @@ class Engine(QThread):
     def request_artwork(self, url):
         if not self.closing and self.ready.is_set():
             asyncio.run_coroutine_threadsafe(self.load_artwork(url), self.loop)
+
+    def check_inbox_connection(self, reason):
+        if not self.closing and self.ready.is_set() and not self.loop.is_closed():
+            self.loop.call_soon_threadsafe(self.api.check_inbox_live, reason)
 
     async def load_artwork(self, url):
         session = self.api.session
@@ -546,7 +551,14 @@ class MainWindow(QMainWindow):
             lambda: self.artwork_timer.start()
         )
         self.scroll.verticalScrollBar().valueChanged.connect(lambda: self.artwork_timer.start())
-        QApplication.instance().applicationStateChanged.connect(self.schedule_artwork)
+        QApplication.instance().applicationStateChanged.connect(self.application_state_changed)
+        # A local timer detects a long scheduling gap across system sleep even
+        # when this app remains foreground. Normal ticks perform no network I/O.
+        self._last_activity_check = time.time()
+        self.activity_timer = QTimer(self)
+        self.activity_timer.setInterval(5000)
+        self.activity_timer.timeout.connect(self.check_after_resume)
+        self.activity_timer.start()
         self.library_timer = QTimer(self)
         self.library_timer.setInterval(60000)
         self.library_timer.timeout.connect(self.check_library)
@@ -919,8 +931,20 @@ class MainWindow(QMainWindow):
     def pixmap_for(self, url):
         return self._artwork.get(url, QPixmap())
 
-    def schedule_artwork(self, state):
+    def application_state_changed(self, state):
+        if self.engine.closing:
+            return
         self.artwork_timer.start()
+        if state == Qt.ApplicationActive:
+            self._last_activity_check = time.time()
+            self.engine.check_inbox_connection("foreground")
+
+    def check_after_resume(self):
+        now = time.time()
+        gap = now - self._last_activity_check
+        self._last_activity_check = now
+        if gap > 15 and not self.engine.closing:
+            self.engine.check_inbox_connection("resume")
 
     def load_visible_artwork(self):
         if (
@@ -1414,6 +1438,7 @@ class MainWindow(QMainWindow):
         self.artwork_timer.stop()
         self.library_timer.stop()
         self.content_timer.stop()
+        self.activity_timer.stop()
         self.account_dialog.hide()
         if self.engine.shutdown():
             event.accept()

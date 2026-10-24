@@ -20,6 +20,7 @@ from PyQt5.QtCore import QSize, Qt, QTimer
 from PyQt5.QtGui import QInputMethodEvent, QPalette, QPixmap
 from PyQt5.QtTest import QTest
 from PyQt5.QtWidgets import QApplication, QMessageBox
+from websockets.exceptions import ConnectionClosedError
 
 from bili_downloader import gui
 from bili_downloader.account_content import ContentItem, ContentView
@@ -741,6 +742,87 @@ def live_inbox_provider():
         BroadcastClient, connect_factory=provider.broadcast_peer.connect
     )
     return provider
+
+
+def paused_live_inbox_provider():
+    provider = live_inbox_provider()
+    provider.allow_connect = asyncio.Event()
+
+    async def connect(*args, **kwargs):
+        await provider.allow_connect.wait()
+        return await provider.broadcast_peer.connect(*args, **kwargs)
+
+    provider.broadcast_factory = partial(BroadcastClient, connect_factory=connect)
+    return provider
+
+
+@pytest.mark.parametrize("window", [paused_live_inbox_provider], indirect=True)
+def test_foreground_resume_retry_indicator_and_gap_recovery_through_real_worker(
+    app, window, monkeypatch
+):
+    import bili_downloader.broadcast as module
+
+    monkeypatch.setattr(module, "RECONNECT_BASE_SECONDS", 0.6)
+    widget, provider = window
+    panel, peer = widget.inbox_panel, provider.broadcast_peer
+    widget.launch(
+        lambda api: api.use_cookie(
+            "SESSDATA=synthetic; DedeUserID=42", user_agent="Synthetic Browser"
+        )
+    )
+    wait_for(app, lambda: not widget.busy and widget._live_kind == "connecting")
+    widget.inbox_toggle.click()
+
+    def dot():
+        return panel.connection_dot.grab().toImage().pixelColor(5, 5).name()
+
+    assert dot() == COLORS["yellow"]
+    widget.engine.loop.call_soon_threadsafe(provider.allow_connect.set)
+    wait_for(
+        app,
+        lambda: not widget.busy
+        and panel.sessions.topLevelItemCount()
+        and widget._live_kind == "connected",
+    )
+    panel.sessions.setCurrentItem(panel.sessions.topLevelItem(0))
+    wait_for(app, lambda: not widget.busy and panel.thread is not None)
+    panel.reply.setPlainText("重连后保留的草稿")
+    assert dot() == COLORS["green"]
+    heartbeat = peer.heartbeat_count
+    app.applicationStateChanged.emit(Qt.ApplicationInactive)
+    app.applicationStateChanged.emit(Qt.ApplicationActive)
+    wait_for(app, lambda: peer.heartbeat_count == heartbeat + 1)
+    assert peer.connections == 1
+    widget._last_activity_check = time.time() - 60
+    widget.activity_timer.timeout.emit()
+    wait_for(app, lambda: peer.heartbeat_count == heartbeat + 2)
+    widget.activity_timer.timeout.emit()
+    QTest.qWait(30)
+    assert peer.heartbeat_count == heartbeat + 2  # Ordinary local timer ticks send nothing.
+    new = private_message(26)
+    provider.inbox_state["messages"].append(new)
+    provider.inbox_state["lanes"][1][0].update(max_seqno=26, last_msg=new)
+    widget.engine.loop.call_soon_threadsafe(
+        peer.incoming.put_nowait, ConnectionClosedError(None, None)
+    )
+    wait_for(app, lambda: widget._live_kind == "retry_wait")
+    assert dot() == COLORS["red"] and "断开" in panel.connection_dot.toolTip()
+    wait_for(
+        app,
+        lambda: peer.connections == 2
+        and widget._live_kind == "connected"
+        and "合成私信 26" in history_text(panel),
+    )
+    assert dot() == COLORS["green"] and panel.reply.toPlainText() == "重连后保留的草稿"
+    assert panel.selected() == 7 and all(request.method == "GET" for request in provider.requests)
+    widget.logout()
+    wait_for(app, lambda: not widget.busy and widget._session is None and peer.closed)
+    assert dot() == COLORS["red"]
+    app.applicationStateChanged.emit(Qt.ApplicationActive)
+    widget._last_activity_check = time.time() - 60
+    widget.activity_timer.timeout.emit()
+    QTest.qWait(30)
+    assert peer.connections == 2
 
 
 @pytest.mark.parametrize("window", [live_inbox_provider], indirect=True)

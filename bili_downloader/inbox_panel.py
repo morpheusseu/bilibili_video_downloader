@@ -6,6 +6,7 @@ from PyQt5.QtCore import QSize, Qt, pyqtSignal
 from PyQt5.QtGui import QKeySequence, QPixmap
 from PyQt5.QtWidgets import (
     QApplication,
+    QCheckBox,
     QFrame,
     QHBoxLayout,
     QHeaderView,
@@ -116,6 +117,13 @@ class InboxPanel(QFrame):
         self.hint.setWordWrap(True)
         self.hint.setObjectName("hint")
         layout.addWidget(self.hint)
+        self.participated = QCheckBox("仅最近 20 条有我发言")
+        self.participated.setToolTip(
+            "只判断已读取的最近页，不扫描完整聊天。未读取或尚待补增量的会话为“未判断”，"
+            "开启筛选后暂不显示；取消筛选可查看并按需打开。"
+        )
+        self.participated.toggled.connect(self.filter_changed)
+        layout.addWidget(self.participated)
         splitter = QSplitter(Qt.Horizontal)
         self.splitter = splitter
         self.sessions = QTreeWidget()
@@ -186,8 +194,8 @@ class InboxPanel(QFrame):
 
     def set_compact(self, compact):
         # QSplitter derives its cross-axis maximum from its children.
-        self.message_pane.setMaximumHeight(330 if compact else 440)
-        self.splitter.setMinimumHeight(300 if compact else 340)
+        self.message_pane.setMaximumHeight(300 if compact else 440)
+        self.splitter.setMinimumHeight(270 if compact else 340)
 
     def selected(self):
         item = self.sessions.currentItem()
@@ -226,6 +234,7 @@ class InboxPanel(QFrame):
         ready = self.logged_in and not self.busy
         editable = ready and not self.pending
         self.sessions.setEnabled(editable)
+        self.participated.setEnabled(editable)
         self.refresh.setEnabled(editable)
         self.more.setEnabled(editable and self.view is not None and self.view.has_more)
         self.reconnect.setEnabled(ready and self.live_kind in {"idle", "stopped"})
@@ -238,6 +247,9 @@ class InboxPanel(QFrame):
         self.check_send.setEnabled(ready and self.pending)
 
     def clear(self):
+        self.participated.blockSignals(True)
+        self.participated.setChecked(False)
+        self.participated.blockSignals(False)
         self.sessions.blockSignals(True)
         self.sessions.clear()
         self.sessions.blockSignals(False)
@@ -278,7 +290,10 @@ class InboxPanel(QFrame):
         self.sessions.blockSignals(True)
         self.sessions.clear()
         kept = False
+        shown = 0
         for row in view.conversations:
+            if self.participated.isChecked() and row.recent_participation is not True:
+                continue
             session = row.session
             item = QTreeWidgetItem(
                 [
@@ -287,13 +302,23 @@ class InboxPanel(QFrame):
                     str(session.unread_count) if session.unread_count else "",
                 ]
             )
-            item.setToolTip(0, f"UID {session.talker_id} · 会话类型 {session.session_type}")
+            participation = (
+                "最近 20 条有我发言"
+                if row.recent_participation is True
+                else "最近 20 条未见我发言"
+                if row.recent_participation is False
+                else "最近页参与情况未判断"
+            )
+            item.setToolTip(
+                0, f"UID {session.talker_id} · 会话类型 {session.session_type} · {participation}"
+            )
             item.setData(0, Qt.UserRole + 1, row.avatar_url)
             item.setData(0, Qt.UserRole + 2, row.name)
             item.setIcon(0, self.avatars(row.avatar_url, row.name))
             if session.session_type == 1:
                 item.setData(0, Qt.UserRole, session.talker_id)
             self.sessions.addTopLevelItem(item)
+            shown += 1
             if session.session_type == 1 and session.talker_id == selected:
                 self.sessions.setCurrentItem(item)
                 kept = True
@@ -313,6 +338,18 @@ class InboxPanel(QFrame):
             + " 查看不标记已读；未读数量为服务端值。"
             + (" 昵称暂不可用，部分会话显示 UID。" if not view.names_available else "")
         )
+        if self.participated.isChecked():
+            unknown = sum(row.recent_participation is None for row in view.conversations)
+            self.hint.setText(
+                f"已读取 {len(view.conversations)} 个会话 · 筛选显示 {shown} 个"
+                f" · {unknown} 个未判断。\n"
+                "只判断最近 20 条，不扫描完整历史；取消筛选可查看其他会话。"
+            )
+        self.update_controls()
+
+    def filter_changed(self):
+        if self.view is not None:
+            self.show_inbox(self.view, self.account_id)
 
     def select_cached_thread(self, thread):
         self.sessions.blockSignals(True)

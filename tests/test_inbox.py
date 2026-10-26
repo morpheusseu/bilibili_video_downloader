@@ -38,6 +38,68 @@ async def test_read_only_inbox_categories_pagination_and_selected_history():
         assert not api.inbox.view.conversations and api.inbox.thread is None
 
 
+async def test_participation_uses_only_the_recent_page_and_marks_unfetched_or_stale_heads_unknown(
+    tmp_path,
+):
+    provider, state = inbox_provider()
+    provider.cache_root = tmp_path
+    # An old authored message must not count after loading older history.
+    state["sent"][7] = [private_message(1, sender_uid=42, receiver_id=7)]
+    state["sent"][8] = [private_message(24, sender_uid=42, receiver_id=8)]
+    async with provider.api() as api:
+        await api.use_cookie("SESSDATA=synthetic; DedeUserID=42")
+        view = await api.inbox.refresh(42)
+        assert all(row.recent_participation is None for row in view.conversations)
+        await api.inbox.open(7, 42)
+        await api.inbox.older(42)
+        assert (
+            next(
+                r for r in api.inbox.view.conversations if r.session.talker_id == 7
+            ).recent_participation
+            is False
+        )
+        assert any(row.sender_uid == 42 for row in api.inbox.thread.messages)
+        await api.inbox.open(8, 42)
+        assert (
+            next(
+                r for r in api.inbox.view.conversations if r.session.talker_id == 8
+            ).recent_participation
+            is True
+        )
+        assert not state["posts"]
+    async with provider.api() as api:
+        await api.use_cookie("SESSDATA=synthetic; DedeUserID=42")
+        assert [r.recent_participation for r in api.inbox.view.conversations] == [False, True, None]
+        state["lanes"][1][1]["max_seqno"] = 26
+        state["lanes"][1][1]["last_msg"] = private_message(26, talker=8)
+        await api.inbox.refresh_heads(42)
+        # Don't infer a current first page from an older, saved cursor.
+        assert (
+            next(
+                r for r in api.inbox.view.conversations if r.session.talker_id == 8
+            ).recent_participation
+            is None
+        )
+        assert not state["posts"]
+
+
+async def test_provider_video_push_is_not_treated_as_my_participation():
+    provider, state = inbox_provider()
+    push = private_message(24, sender_uid=42, receiver_id=7, msg_type=11, content='{"rid":42}')
+    state["sent"][7] = [push]
+    state["messages"] = [row for row in state["messages"] if row["msg_seqno"] != 24]
+    async with provider.api() as api:
+        await api.use_cookie("SESSDATA=synthetic; DedeUserID=42")
+        await api.inbox.refresh(42)
+        await api.inbox.open(7, 42)
+        assert api.inbox.view.conversations[0].recent_participation is False
+        state["lanes"][1][0]["last_msg"] = private_message(26, sender_uid=42, receiver_id=7)
+        state["lanes"][1][0]["max_seqno"] = 26
+        await api.inbox.refresh_heads(42)
+        # The latest authored message itself is enough even without a fetched page.
+        assert api.inbox.view.conversations[0].recent_participation is True
+
+
 async def test_nonadvancing_pages_keep_last_successful_private_state():
     provider, state = inbox_provider(21)
     async with provider.api() as api:
@@ -62,6 +124,7 @@ async def test_names_are_optional_but_wrong_thread_and_risk_fail_closed():
         view = await api.inbox.refresh(42)
         assert not view.names_available and view.conversations[0].name == "UID 7"
         thread = await api.inbox.open(7, 42)
+        view = api.inbox.view  # Opening a page also updates its participation summary.
         state["messages"][-1]["receiver_id"] = 123456
         with pytest.raises(DownloadError, match="身份"):
             await api.inbox.open(7, 42, refresh=True)

@@ -80,6 +80,7 @@ class Engine(QThread):
     artwork_ready = pyqtSignal(object, str, object, str)
     inbox_updated = pyqtSignal(object, object, object, int)
     inbox_status = pyqtSignal(object, object)
+    library_updated = pyqtSignal(object, object)
 
     def __init__(self, parent=None, api_factory: Callable | None = None):
         super().__init__(parent)
@@ -133,7 +134,9 @@ class Engine(QThread):
         finally:
             self.active = None
             self.session_changed.emit(self.api.session)
-            if self.api.session is not None and self.api.inbox.view.cached:
+            if self.api.session is not None and (
+                self.api.inbox.view.cached or self.api.inbox.view.conversations
+            ):
                 self.inbox_updated.emit(
                     self.api.session, self.api.inbox.view, self.api.inbox.thread, 0
                 )
@@ -223,6 +226,7 @@ class MainWindow(QMainWindow):
         self.engine.artwork_ready.connect(self.show_artwork)
         self.engine.inbox_updated.connect(self.show_live_inbox)
         self.engine.inbox_status.connect(self.show_live_status)
+        self.engine.library_updated.connect(self.show_cached_library)
         self.engine.start()
         self.busy = False
         self._session_mid = None
@@ -831,6 +835,7 @@ class MainWindow(QMainWindow):
         async def operation(api):
             if api.session is None:
                 raise DownloadError("请先登录当前账号")
+            self.engine.library_updated.emit(api.session, api.favorites.cached_view())
             return await api.favorites.refresh(api.session.mid, force=force)
 
         self.launch(
@@ -844,7 +849,16 @@ class MainWindow(QMainWindow):
         folder_id = self.folders.currentData()
         if self.busy or folder_id is None:
             return
-        self.launch(lambda api: api.favorites.open(folder_id), "正在读取收藏夹", kind="library")
+
+        async def operation(api):
+            self.engine.library_updated.emit(api.session, api.favorites.cached_view(folder_id))
+            return await api.favorites.open(folder_id)
+
+        self.launch(operation, "正在检查收藏夹", kind="library")
+
+    def show_cached_library(self, owner, view):
+        if owner is self._session and self._job == "library":
+            self.show_library(view)
 
     def load_more_favorites(self):
         if not self.busy and self._library_view.has_more:
@@ -893,13 +907,19 @@ class MainWindow(QMainWindow):
         if previous.folder_id != view.folder_id or previous.items is not view.items:
             self.render_favorites(view.items, preserve=previous.folder_id == view.folder_id)
         if not view.folders:
-            text = "当前账号没有创建的收藏夹。"
+            text = "正在读取收藏夹列表…" if view.cached else "当前账号没有创建的收藏夹。"
         else:
-            change = "已更新条目" if view.refreshed else "标识未变化，复用缓存"
+            change = (
+                "本地缓存 · 正在后台检查变化"
+                if view.cached
+                else "已更新条目"
+                if view.refreshed
+                else "标识未变化，复用缓存"
+            )
             text = f"{change} · 当前显示 {len(view.items)} 项" + (
                 "，可加载下一页" if view.has_more else "，已到列表末尾"
             )
-            if not view.digest:
+            if not view.digest and not view.cached:
                 text += "；标识与条目暂不一致，下次检查不会跳过读取"
         self.library_hint.setText(text)
         self.library_hint.setToolTip(

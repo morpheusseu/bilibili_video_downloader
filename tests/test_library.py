@@ -6,6 +6,8 @@ from conftest import PNG, favorite_item, library_provider, response
 from bili_downloader import local_store
 from bili_downloader.api import Bilibili, RequestGate
 from bili_downloader.auth import load_session, save_session
+from bili_downloader.cache import AccountCache
+from bili_downloader.library import FavoriteLibrary
 from bili_downloader.sources import DownloadError
 
 
@@ -189,6 +191,124 @@ async def test_inconsistent_identifiers_never_certify_unchanged_content():
         assert len(detail_calls(provider)) == 2
         del state["ids_override"]
         assert (await api.favorites.refresh(42)).digest
+
+
+async def test_restart_restores_each_folder_and_resumes_only_the_next_page(tmp_path):
+    provider, state = library_provider(51)
+    provider.cache_root = tmp_path
+    state["folders"].append(dict(state["folders"][0], id=11, fid=11, title="另一个收藏夹"))
+    async with provider.api() as api:
+        await api.use_cookie("SESSDATA=synthetic; DedeUserID=42")
+        await api.favorites.refresh(42)
+        await api.favorites.more()
+        await api.favorites.open(11)
+        assert len(api.favorites.view.items) == 20
+    before = len(provider.requests)
+    async with provider.api() as api:
+        await api.use_cookie("SESSDATA=synthetic; DedeUserID=42")
+        assert len(provider.requests) == before + 1  # Nav only; restore does not fetch folders.
+        assert api.favorites.cached_view().folder_id == 11
+        cached = api.favorites.cached_view(10)
+        assert cached.cached and len(cached.items) == 40 and cached.has_more
+        assert len(provider.requests) == before + 1
+        await api.favorites.open(10)
+        complete = await api.favorites.more()
+        assert len(complete.items) == 51 and not complete.has_more
+        assert [r.url.params["pn"] for r in detail_calls(provider)] == ["1", "2", "1", "3"]
+        await api.favorites.open(11)
+        assert len(api.favorites.view.items) == 20
+        other = AccountCache(tmp_path, 43)
+        try:
+            assert not FavoriteLibrary(api.sdk.fav, cache=other).cached_view().folders
+        finally:
+            other.close()
+
+
+async def test_favorite_pages_do_not_expire_with_messages_and_forget_is_account_scoped(tmp_path):
+    provider, _ = library_provider(41)
+    now = [0.0]
+    cache = AccountCache(tmp_path, 42, clock=lambda: now[0])
+    other = AccountCache(tmp_path, 43, clock=lambda: now[0])
+    try:
+        async with provider.api() as api:
+            library = FavoriteLibrary(api.sdk.fav, cache=cache, clock=lambda: now[0])
+            await library.refresh(42)
+            await library.more()
+            cache.put_many({("thread", "synthetic"): {"sample": True}})
+            other.put_many({("favorites", "sentinel"): "other account"})
+            now[0] = 31 * 86400
+            assert cache.get("thread", "synthetic") is None
+            restored = FavoriteLibrary(api.sdk.fav, cache=cache, clock=lambda: now[0])
+            assert len(restored.cached_view().items) == 40
+            cache.close()
+            AccountCache.forget(tmp_path, 42)
+            assert other.get("favorites", "sentinel", max_age=None) == "other account"
+            empty = AccountCache(tmp_path, 42)
+            try:
+                assert not FavoriteLibrary(api.sdk.fav, cache=empty).view.folders
+            finally:
+                empty.close()
+    finally:
+        cache.close()
+        other.close()
+
+
+async def test_favorite_commit_failure_and_missing_page_never_advance_a_saved_cursor(tmp_path):
+    provider, _ = library_provider(61)
+    provider.cache_root = tmp_path
+    async with provider.api() as api:
+        await api.use_cookie("SESSDATA=synthetic; DedeUserID=42")
+        await api.favorites.refresh(42)
+        previous = await api.favorites.more()
+        api.cache.connection.execute(
+            "CREATE TRIGGER fail_page BEFORE INSERT ON records "
+            "WHEN NEW.kind='favorite_page' BEGIN SELECT RAISE(ABORT,'synthetic'); END"
+        )
+        with pytest.raises(DownloadError, match="写入失败"):
+            await api.favorites.more()
+        assert api.favorites.view is previous
+        assert api.cache.get("favorite_folder", "10")["page_count"] == 2
+        assert api.cache.get("favorite_page", "10:3") is None
+        api.cache.connection.execute("DROP TRIGGER fail_page")
+        api.cache.put_many({}, remove=(("favorite_page", "10:2"),))
+    async with provider.api() as api:
+        await api.use_cookie("SESSDATA=synthetic; DedeUserID=42")
+        # A manifest cannot resume past a missing/expired/corrupt page.
+        assert not api.favorites.cached_view().items
+        assert not api.favorites.view.has_more
+        await api.favorites.refresh(42)
+        await api.favorites.more()
+        assert [r.url.params["pn"] for r in detail_calls(provider)][-2:] == ["1", "2"]
+        assert len(api.favorites.view.items) == 40
+
+
+async def test_metadata_check_retains_loaded_pages_but_membership_change_discards_old_pages(
+    tmp_path,
+):
+    provider, state = library_provider(61)
+    provider.cache_root = tmp_path
+    async with provider.api() as api:
+        await api.use_cookie("SESSDATA=synthetic; DedeUserID=42")
+        now = [0.0]
+        api.favorites.clock = lambda: now[0]
+        await api.favorites.refresh(42)
+        await api.favorites.more()
+        state["items"][0]["title"] = "最新标题"
+        now[0] = 600
+        view = await api.favorites.refresh(42)
+        assert len(view.items) == 40 and view.items[0].title == "最新标题"
+        await api.favorites.more()
+        assert len(api.favorites.view.items) == 60
+        state["items"][-1] = favorite_item("BV0000000070", 70)
+        changed = await api.favorites.refresh(42)
+        assert len(changed.items) == 20 and changed.has_more
+        assert api.cache.get("favorite_folder", "10")["page_count"] == 1
+        assert api.cache.get("favorite_page", "10:2") is None
+        assert api.cache.get("favorite_page", "10:3") is None
+        state["deny"] = True
+        with pytest.raises(DownloadError, match="风控"):
+            await api.favorites.more()
+        assert api.favorites.view is changed
 
 
 @pytest.mark.parametrize("image_status", [200, 302, 404])

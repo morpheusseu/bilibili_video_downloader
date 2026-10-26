@@ -241,7 +241,7 @@ class Bilibili:
             self.cache.close()
             self.cache = None
         self.cache_notice = ""
-        self.favorites.clear()
+        self.favorites = FavoriteLibrary(self.sdk.fav)
         self.inbox.clear()
         # A login owns its inbox. A late old-account operation cannot repopulate
         # the new account's state, even if it was already awaiting provider I/O.
@@ -278,6 +278,7 @@ class Bilibili:
             if self.cache_root is not None:
                 try:
                     self.cache = AccountCache(self.cache_root, nav.mid)
+                    self.favorites = FavoriteLibrary(self.sdk.fav, cache=self.cache)
                     self.inbox = Inbox(self.sdk, cache=self.cache)
                     self.account_content = AccountContent(self.sdk, cache=self.cache)
                     count = sum(len(view.messages) for view in self.inbox.threads.values())
@@ -294,6 +295,7 @@ class Bilibili:
                     if self.cache is not None:
                         self.cache.close()
                     self.cache = None
+                    self.favorites = FavoriteLibrary(self.sdk.fav)
                     self.inbox = Inbox(self.sdk)
                     self.account_content = AccountContent(self.sdk)
                     self.cache_notice = f"{error}；本次仅使用内存，未覆盖原缓存。"

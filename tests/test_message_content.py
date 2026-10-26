@@ -78,3 +78,60 @@ def test_inline_emoji_preserves_plain_text_and_does_not_guess_missing_images():
     assert content.text == text
     assert len([part for part in content.parts if isinstance(part, MessageImage)]) == 1
     assert content.parts[-1] == "<b>不是 HTML</b>[未知表情]"
+
+
+def test_video_push_card_keeps_title_cover_creator_note_and_canonical_video_reference():
+    message = ReceivedMessage.model_validate(
+        private_message(
+            1,
+            msg_type=11,
+            content=json.dumps(
+                {
+                    "title": "<b>合成视频</b>",
+                    "desc": "视频简介",
+                    "bvid": "BV178411i7AD",
+                    "rid": 42,
+                    "times": 125,
+                    "cover": "https://i0.hdslb.com/video.png",
+                    "attach_msg": {"id": 1, "content": "UP 主的话"},
+                    "jump_uri": "javascript:unsafe()",
+                }
+            ),
+        )
+    )
+    content = message_content(message)
+    assert content.text == (
+        "[视频推送]\n<b>合成视频</b>\n视频简介\n时长 2:05\n"
+        "https://www.bilibili.com/video/BV178411i7AD\nUP 主赠言：UP 主的话"
+    )
+    assert isinstance(content.parts[-1], MessageImage)
+    assert content.parts[-1].url == "https://i0.hdslb.com/video.png"
+    assert "unsafe" not in content.text
+    withdrawn = message.model_copy(update={"msg_status": 1})
+    assert message_content(withdrawn).parts == ("[消息已撤回]",)
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        (
+            {"rid": 42, "type": 11, "attach_msg": None},
+            "[视频推送]\nhttps://www.bilibili.com/video/av42",
+        ),
+        (
+            {
+                "title": [],
+                "times": True,
+                "bvid": "../../x",
+                "cover": {},
+                "attach_msg": {"content": []},
+            },
+            "[视频推送]",
+        ),
+    ],
+)
+def test_minimal_or_partial_video_push_does_not_guess_or_fetch_missing_metadata(body, expected):
+    message = ReceivedMessage.model_validate(
+        private_message(1, msg_type=11, content=json.dumps(body))
+    )
+    assert message_content(message).parts == (expected,)

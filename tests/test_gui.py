@@ -122,6 +122,93 @@ def test_profile_renders_from_login_memory_without_fetching_again(app, window):
     assert widget.account_dialog.isVisible() and not provider.requests
 
 
+def test_favorite_cache_is_visible_while_background_validation_is_still_blocked(
+    app, tmp_path, monkeypatch
+):
+    settings = gui.QSettings
+    monkeypatch.setattr(
+        gui, "QSettings", lambda *args: settings(str(tmp_path / "ui.ini"), settings.IniFormat)
+    )
+    provider, _ = library_provider(51)
+    provider.cache_root = tmp_path
+
+    async def seed():
+        async with provider.api() as api:
+            await api.use_cookie("SESSDATA=synthetic; DedeUserID=42")
+            await api.favorites.refresh(42)
+            await api.favorites.more()
+
+    asyncio.run(seed())
+    original = provider.handler
+    checking, release = threading.Event(), threading.Event()
+
+    def handler(request):
+        if request.url.path.endswith("resource/ids"):
+            checking.set()
+            assert release.wait(5)
+        return original(request)
+
+    provider.handler = handler
+    widget = gui.MainWindow(api_factory=provider.api)
+    widget.show()
+    try:
+        widget.launch(
+            lambda api: api.use_cookie("SESSDATA=synthetic; DedeUserID=42"), "登录", kind="login"
+        )
+        wait_for(app, lambda: checking.is_set() and widget.favorite_items.topLevelItemCount() == 40)
+        assert widget.busy
+        assert "本地缓存" in widget.library_hint.text()
+        # A late event belonging to a different login cannot replace this view.
+        widget.show_cached_library(Session(43, "other", "synthetic"), gui.FavoriteView())
+        assert widget.favorite_items.topLevelItemCount() == 40
+        release.set()
+        wait_for(app, lambda: not widget.busy)
+        assert "复用缓存" in widget.library_hint.text()
+        assert [
+            r.url.params["pn"] for r in provider.requests if r.url.path.endswith("resource/list")
+        ] == ["1", "2"]
+    finally:
+        release.set()
+        assert widget.engine.shutdown()
+        widget.busy = False
+        widget.close()
+
+
+@pytest.mark.parametrize("window", [lambda: inbox_provider()[0]], indirect=True)
+def test_inbox_recent_participation_filter_never_fetches_other_threads_and_preserves_drafts(
+    app, window
+):
+    widget, provider = window
+    state = provider.inbox_state
+    state["sent"][7] = [private_message(24, sender_uid=42, receiver_id=7)]
+    open_test_inbox(widget, app)
+    panel = widget.inbox_panel
+    wait_for(app, lambda: not widget.busy and panel.thread is not None)
+    before = len(provider.requests)
+    panel.reply.setPlainText("未发送草稿")
+    panel.participated.setChecked(True)
+    app.processEvents()
+    assert panel.sessions.topLevelItemCount() == 1
+    assert panel.selected() == 7 and panel.reply.toPlainText() == "未发送草稿"
+    assert "未判断" in panel.hint.text()
+    assert len(provider.requests) == before and state["posts"] == 0
+    panel.participated.setChecked(False)
+    app.processEvents()
+    assert panel.sessions.topLevelItemCount() == 3
+    panel.sessions.setCurrentItem(panel.sessions.topLevelItem(1))
+    wait_for(
+        app, lambda: not widget.busy and panel.thread is not None and panel.thread.talker_id == 8
+    )
+    panel.reply.setPlainText("另一个草稿")
+    before = len(provider.requests)
+    panel.participated.setChecked(True)
+    app.processEvents()
+    assert panel.selected() is None and panel.body.count() == 0
+    assert panel.drafts[8] == "另一个草稿" and not panel.send.isEnabled()
+    assert len(provider.requests) == before and state["posts"] == 0
+    assert panel.reply.visibleRegion().contains(panel.reply.rect().center())
+
+
 def test_byte_progress_preserves_video_and_audio_stream_labels(app, window):
     widget, provider = window
     for label in ("视频流（画面）", "音频流（声音）", "音视频片段 1/2（同一视频）"):

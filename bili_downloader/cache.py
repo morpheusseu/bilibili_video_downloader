@@ -109,7 +109,7 @@ class AccountCache:
     def _prune_images(self):
         self._db().execute("DELETE FROM images WHERE touched<=?", (self.clock() - IMAGE_AGE,))
 
-    def get(self, kind, key):
+    def get(self, kind, key, *, max_age=MESSAGE_AGE):
         db = self._db()
         try:
             row = db.execute(
@@ -118,7 +118,7 @@ class AccountCache:
             ).fetchone()
             if row is None:
                 return None
-            if self.clock() - row[1] > MESSAGE_AGE:
+            if max_age is not None and self.clock() - row[1] > max_age:
                 with db:
                     db.execute("DELETE FROM records WHERE kind=? AND key=?", (kind, self._key(key)))
                 return None
@@ -135,7 +135,7 @@ class AccountCache:
         except (sqlite3.Error, ValueError, TypeError, KeyError):
             raise DownloadError("持久缓存校验失败，未使用损坏数据或推进消息游标") from None
 
-    def put_many(self, values):
+    def put_many(self, values, *, remove=()):
         db = self._db()
         encoded = []
         for (kind, key), value in values.items():
@@ -152,6 +152,10 @@ class AccountCache:
             encoded.append((kind, self._key(key), raw, self.clock()))
         try:
             with db:
+                db.executemany(
+                    "DELETE FROM records WHERE kind=? AND key=?",
+                    [(kind, self._key(key)) for kind, key in remove],
+                )
                 db.executemany(
                     "INSERT INTO records VALUES (?,?,?,?) ON CONFLICT(kind,key) DO UPDATE SET "
                     "value=excluded.value, touched=excluded.touched",

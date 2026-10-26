@@ -72,6 +72,28 @@ def message_content(message):
         except (ValueError, TypeError):
             text = ""
         return _plain(text or "[系统提示]")
+    if kind == 11:
+        # Provider video-push cards (not msg_source=11). Some contain only a
+        # video ID and an optional creator note; never fetch missing details.
+        fields = ["[视频推送]", _text(body.get("title")), _text(body.get("desc"))]
+        seconds = body.get("times")
+        if type(seconds) is int and seconds >= 0:
+            fields.append(f"时长 {seconds // 60}:{seconds % 60:02d}")
+        bvid, aid = body.get("bvid"), body.get("rid")
+        if isinstance(bvid, str) and re.fullmatch(r"BV[0-9A-Za-z]{10}", bvid):
+            fields.append(f"https://www.bilibili.com/video/{bvid}")
+        elif type(aid) is int and aid > 0:
+            fields.append(f"https://www.bilibili.com/video/av{aid}")
+        note = body.get("attach_msg")
+        if isinstance(note, dict) and _text(note.get("content")):
+            fields.append("UP 主赠言：" + note["content"])
+        text = "\n".join(filter(None, fields))
+        url = _text(body.get("cover"))
+        return (
+            MessageContent(text, (text + "\n", MessageImage(url, "[视频封面]", 240, 180)))
+            if url
+            else _plain(text)
+        )
     if kind in {2, 6, 7, 13, 14}:
         if kind in {2, 6}:
             text = "[图片]" if kind == 2 else "[表情包]"

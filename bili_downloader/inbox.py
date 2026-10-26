@@ -29,6 +29,7 @@ class Conversation:
     session: Session
     name: str
     avatar_url: str = ""
+    recent_participation: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -101,6 +102,7 @@ class Inbox:
             self._restore()
 
     def clear(self):
+        self.account_id = self.cache.account_id if self.cache else None
         self.view = InboxView()
         self.thread = None
         self.profiles = {}
@@ -144,6 +146,7 @@ class Inbox:
                 row.session.talker_id for row in conversations if row.session.session_type == 1
             }:
                 self.thread = self.threads.get(selected)
+            self._update_participation()
         except DownloadError:
             raise
         except Exception:
@@ -191,6 +194,41 @@ class Inbox:
             self.high_water.pop(peer, None)
         if select or (self.thread and self.thread.talker_id == view.talker_id):
             self.thread = view
+        self._update_participation()
+
+    def _update_participation(self):
+        account_id = self.account_id
+        if account_id is None:
+            return
+        rows = tuple(
+            replace(row, recent_participation=self._participated(row, account_id))
+            for row in self.view.conversations
+        )
+        if rows != self.view.conversations:
+            self.view = replace(self.view, conversations=rows)
+
+    @staticmethod
+    def _authored(message, account_id):
+        return (
+            message is not None
+            and message.sender_uid == account_id
+            and not message.msg_status
+            and message.msg_type not in {5, 10, 11, 18, 52}
+        )
+
+    def _participated(self, row, account_id):
+        session = row.session
+        if session.session_type != 1:
+            return None
+        if self._authored(session.last_msg, account_id):
+            return True
+        thread = self.threads.get(session.talker_id)
+        if thread is None or self.high_water.get(session.talker_id, 0) < session.max_seqno:
+            return None
+        sample = thread.messages[-20:]
+        if any(self._authored(message, account_id) for message in sample):
+            return True
+        return False if len(sample) == 20 or not thread.has_more else None
 
     async def refresh(self, account_id):
         async with self._lock:
@@ -276,7 +314,9 @@ class Inbox:
             conversations, any(more for _, more in next_frontiers.values()), names_available
         )
         self._save_header(view)
+        self.account_id = account_id
         self.profiles, self.frontiers, self.view = profiles, next_frontiers, view
+        self._update_participation()
         return self.view
 
     async def open(self, talker_id, account_id, *, refresh=False):

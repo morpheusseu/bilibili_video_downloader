@@ -1,4 +1,5 @@
 import asyncio
+import sqlite3
 import threading
 import time
 from dataclasses import replace
@@ -26,6 +27,7 @@ from bili_downloader import gui
 from bili_downloader.account_content import ContentItem, ContentView
 from bili_downloader.auth import Session
 from bili_downloader.broadcast import BroadcastClient, BroadcastState
+from bili_downloader.cache import AccountCache, account_folder
 from bili_downloader.download import Progress, Result
 from bili_downloader.inbox_panel import ReplyEditor
 from bili_downloader.message_rendering import CONTENT_ROLE
@@ -1103,6 +1105,7 @@ def test_image_memory_cache_uses_bytes_not_entry_count_and_resets_on_logout(
     app, window, monkeypatch
 ):
     widget, provider = window
+    assert gui.ARTWORK_BYTES == 256 * 1024 * 1024
     widget.show_session(Session(42, "Synthetic", "synthetic"))
     pixmap = QPixmap(2, 2)
     pixmap.fill(Qt.blue)
@@ -1119,6 +1122,52 @@ def test_image_memory_cache_uses_bytes_not_entry_count_and_resets_on_logout(
     widget.show_session(None)
     assert not widget._artwork and widget._artwork_bytes == 0
     assert not provider.requests
+
+
+@pytest.mark.parametrize("window", [lambda: cover_provider(1)], indirect=True)
+def test_memory_image_hits_renew_disk_expiry_on_worker_without_http(app, window, tmp_path):
+    widget, provider = window
+    assert widget.engine.ready.wait(5)
+    widget.engine.api.cache_root = tmp_path
+    now = [time.time()]
+
+    async def login(api):
+        session = await api.use_cookie("SESSDATA=synthetic; DedeUserID=42")
+        api.cache.clock = lambda: now[0]
+        await api.cdn_image("https://i0.hdslb.com/bfs/archive/cover1.png")
+        return session
+
+    widget.launch(login)
+    wait_for(app, lambda: not widget.busy and bool(widget._library_view.items))
+    url = "http://i0.hdslb.com/bfs/archive/cover1.png"
+    pixmap = QPixmap(2, 2)
+    pixmap.fill(Qt.blue)
+    widget._cache_artwork(url, pixmap)
+    before = len(provider.requests), len(provider.images)
+    path = account_folder(tmp_path, 42) / "cache.sqlite3"
+
+    def last_hit():
+        with sqlite3.connect(path.as_uri() + "?mode=ro", uri=True) as db:
+            return db.execute("SELECT touched FROM images").fetchone()[0]
+
+    now[0] += 20 * 86400
+    assert not widget.pixmap_for(url).isNull()
+    widget._flush_artwork_hits()
+    wait_for(app, lambda: last_hit() == now[0])
+    widget.artwork_timer.stop()
+    now[0] += 86400
+    widget.engine.touch_artwork(replace(widget._session), [url])
+    asyncio.run_coroutine_threadsafe(asyncio.sleep(0), widget.engine.loop).result(timeout=5)
+    assert last_hit() == now[0] - 86400
+    assert (len(provider.requests), len(provider.images)) == before
+    assert not widget.pixmap_for(url).isNull()
+    widget.close()
+    now[0] += 29 * 86400
+    restored = AccountCache(tmp_path, 42, clock=lambda: now[0])
+    try:
+        assert restored.image(url.replace("http:", "https:")) == PNG
+    finally:
+        restored.close()
 
 
 def test_cover_and_avatar_shapes_stay_consistent_after_load_and_rerender(app, window):

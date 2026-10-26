@@ -19,10 +19,10 @@ from .sources import DownloadError
 log = logging.getLogger(__name__)
 MAX_MESSAGES = 500
 MAX_THREADS = 50
-IMAGE_BYTES = 32 * 1024 * 1024
+MAX_IMAGE_BYTES = 20 * 1024 * 1024
 THREAD_BYTES = 16 * 1024 * 1024
 MAX_RECORD = 2 * 1024 * 1024
-IMAGE_AGE = 7 * 86400
+IMAGE_AGE = 30 * 86400
 MESSAGE_AGE = 30 * 86400
 
 
@@ -50,7 +50,15 @@ class AccountCache:
                 "CREATE TABLE IF NOT EXISTS records (kind TEXT NOT NULL, key TEXT NOT NULL, "
                 "value BLOB NOT NULL, touched REAL NOT NULL, PRIMARY KEY(kind, key))"
             )
-            self.connection.commit()
+            self.connection.execute(
+                "CREATE TABLE IF NOT EXISTS images (key TEXT PRIMARY KEY, "
+                "account_id INTEGER NOT NULL, "
+                "body BLOB NOT NULL, touched REAL NOT NULL)"
+            )
+            self.connection.execute("CREATE INDEX IF NOT EXISTS images_touched ON images(touched)")
+            with self.connection:
+                self._import_base64_images()
+                self._prune_images()
         except Exception:
             self.close()
             raise DownloadError("本机持久缓存无法打开，请检查数据目录权限") from None
@@ -64,6 +72,43 @@ class AccountCache:
     def _key(key):
         return hashlib.sha256(str(key).encode()).hexdigest()
 
+    def _import_base64_images(self):
+        # One atomic conversion, not an alternate read path: after commit the
+        # old representation is removed and only the BLOB table owns images.
+        db = self._db()
+        imported = 0
+        for key, raw, touched in db.execute(
+            "SELECT key, CASE WHEN length(value)<=? THEN value END, touched "
+            "FROM records WHERE kind='image'",
+            (MAX_RECORD,),
+        ).fetchall():
+            try:
+                item = json.loads(raw)
+                if (
+                    item["account_id"] != self.account_id
+                    or item["kind"] != "image"
+                    or not isinstance(item["key"], str)
+                    or self._key(item["key"]) != key
+                ):
+                    raise ValueError("Invalid image identity")
+                body = base64.b64decode(item["value"], validate=True)
+                if not body or len(body) > MAX_IMAGE_BYTES:
+                    raise ValueError("Invalid image size")
+            except (ValueError, TypeError, KeyError):
+                log.warning("Discarded invalid former image cache entry")
+                continue
+            inserted = db.execute(
+                "INSERT OR IGNORE INTO images VALUES (?,?,?,?)",
+                (key, self.account_id, body, touched),
+            )
+            imported += inserted.rowcount
+        db.execute("DELETE FROM records WHERE kind='image'")
+        if imported:
+            log.info("Image cache converted entries=%s", imported)
+
+    def _prune_images(self):
+        self._db().execute("DELETE FROM images WHERE touched<=?", (self.clock() - IMAGE_AGE,))
+
     def get(self, kind, key):
         db = self._db()
         try:
@@ -73,8 +118,7 @@ class AccountCache:
             ).fetchone()
             if row is None:
                 return None
-            age = IMAGE_AGE if kind == "image" else MESSAGE_AGE
-            if self.clock() - row[1] > age:
+            if self.clock() - row[1] > MESSAGE_AGE:
                 with db:
                     db.execute("DELETE FROM records WHERE kind=? AND key=?", (kind, self._key(key)))
                 return None
@@ -95,6 +139,8 @@ class AccountCache:
         db = self._db()
         encoded = []
         for (kind, key), value in values.items():
+            if kind == "image":
+                raise DownloadError("图片只允许通过二进制图片缓存写入")
             raw = json.dumps(
                 {"account_id": self.account_id, "kind": kind, "key": str(key), "value": value},
                 ensure_ascii=False,
@@ -111,20 +157,15 @@ class AccountCache:
                     "value=excluded.value, touched=excluded.touched",
                     encoded,
                 )
-                for kind, budget in (
-                    ("image", IMAGE_BYTES),
-                    ("thread", THREAD_BYTES),
-                ):
-                    rows = db.execute(
-                        "SELECT key, length(value) FROM records WHERE kind=? "
-                        "ORDER BY touched DESC, rowid DESC",
-                        (kind,),
-                    ).fetchall()
-                    size = 0
-                    for index, (key, length) in enumerate(rows):
-                        size += length
-                        if size > budget or (kind == "thread" and index >= MAX_THREADS):
-                            db.execute("DELETE FROM records WHERE kind=? AND key=?", (kind, key))
+                rows = db.execute(
+                    "SELECT key, length(value) FROM records WHERE kind='thread' "
+                    "ORDER BY touched DESC, rowid DESC"
+                ).fetchall()
+                size = 0
+                for index, (key, length) in enumerate(rows):
+                    size += length
+                    if size > THREAD_BYTES or index >= MAX_THREADS:
+                        db.execute("DELETE FROM records WHERE kind='thread' AND key=?", (key,))
         except sqlite3.Error:
             raise DownloadError("持久缓存写入失败，未提交本次消息或推进游标") from None
 
@@ -153,21 +194,59 @@ class AccountCache:
             raise DownloadError("持久消息缓存校验失败，未加载其游标") from None
 
     def image(self, url):
-        value = self.get("image", url)
-        if value is None:
-            return None
+        db = self._db()
+        key, now = self._key(url), self.clock()
         try:
-            body = base64.b64decode(value, validate=True)
-            if len(body) > 1024 * 1024:
-                raise ValueError
+            with db:
+                row = db.execute(
+                    "SELECT account_id, CASE WHEN length(body)<=? THEN body END, touched "
+                    "FROM images WHERE key=?",
+                    (MAX_IMAGE_BYTES, key),
+                ).fetchone()
+                if row is None:
+                    return None
+                if row[0] != self.account_id:
+                    raise ValueError("Invalid image account")
+                if now - row[2] >= IMAGE_AGE:
+                    db.execute("DELETE FROM images WHERE key=?", (key,))
+                    return None
+                body = row[1]
+                if not isinstance(body, bytes) or not body:
+                    raise ValueError("Invalid image body")
+                db.execute("UPDATE images SET touched=? WHERE key=?", (now, key))
             log.info("Image cache reused bytes=%s", len(body))
             return body
-        except (ValueError, TypeError):
+        except (sqlite3.Error, ValueError, TypeError):
             raise DownloadError("图片缓存校验失败，未使用该缓存") from None
 
     def put_image(self, url, body):
-        if body:
-            self.put_many({("image", url): base64.b64encode(body).decode("ascii")})
+        db = self._db()
+        if not isinstance(body, bytes) or len(body) > MAX_IMAGE_BYTES:
+            raise DownloadError("图片缓存超过 20 MiB 或不是二进制内容，未保存")
+        if not body:
+            return
+        try:
+            with db:
+                db.execute(
+                    "INSERT INTO images VALUES (?,?,?,?) ON CONFLICT(key) DO UPDATE SET "
+                    "account_id=excluded.account_id, body=excluded.body, touched=excluded.touched",
+                    (self._key(url), self.account_id, body, self.clock()),
+                )
+                self._prune_images()
+        except sqlite3.Error:
+            raise DownloadError("图片缓存写入失败，未保存本次图片") from None
+
+    def touch_images(self, urls):
+        db = self._db()
+        try:
+            with db:
+                db.executemany(
+                    "UPDATE images SET touched=? WHERE key=? AND account_id=?",
+                    [(self.clock(), self._key(url), self.account_id) for url in urls],
+                )
+                self._prune_images()
+        except sqlite3.Error:
+            raise DownloadError("图片缓存使用时间更新失败") from None
 
     def close(self):
         self.closed = True

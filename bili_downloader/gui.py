@@ -66,7 +66,7 @@ from .library import FavoriteView
 from .sources import DownloadError, parse_source
 from .theme import STYLE
 
-ARTWORK_BYTES = 32 * 1024 * 1024
+ARTWORK_BYTES = 256 * 1024 * 1024
 
 
 class Engine(QThread):
@@ -149,6 +149,17 @@ class Engine(QThread):
         if not self.closing and self.ready.is_set():
             asyncio.run_coroutine_threadsafe(self.load_artwork(url), self.loop)
 
+    def touch_artwork(self, owner, urls):
+        if not self.closing and self.ready.is_set() and not self.loop.is_closed():
+            self.loop.call_soon_threadsafe(self._touch_artwork, owner, tuple(urls))
+
+    def _touch_artwork(self, owner, urls):
+        if self.api.session is owner:
+            try:
+                self.api.touch_images(urls)
+            except DownloadError:
+                logging.getLogger(__name__).warning("Image cache access update failed")
+
     def check_inbox_connection(self, reason):
         if not self.closing and self.ready.is_set() and not self.loop.is_closed():
             self.loop.call_soon_threadsafe(self.api.check_inbox_live, reason)
@@ -221,6 +232,7 @@ class MainWindow(QMainWindow):
         self._job = None
         self._artwork = OrderedDict()
         self._artwork_bytes = 0
+        self._artwork_hits = set()
         self._artwork_pending = None
         self._artwork_paused = False
         self._library_view = FavoriteView()
@@ -920,7 +932,7 @@ class MainWindow(QMainWindow):
             )
             item.setData(0, Qt.UserRole, (media.bvid or media.bv_id) if available else "")
             item.setData(0, Qt.UserRole + 1, media.cover)
-            pixmap = self._artwork.get(media.cover)
+            pixmap = self.pixmap_for(media.cover)
             item.setIcon(
                 0,
                 QIcon(pixmap)
@@ -938,7 +950,17 @@ class MainWindow(QMainWindow):
         return avatar_icon(self.pixmap_for(url), name)
 
     def pixmap_for(self, url):
-        return self._artwork.get(url, QPixmap())
+        pixmap = self._artwork.get(url, QPixmap())
+        if self._session is not None and not pixmap.isNull():
+            self._artwork_hits.add(url)
+            if not self.artwork_timer.isActive():
+                self.artwork_timer.start()
+        return pixmap
+
+    def _flush_artwork_hits(self):
+        if self._artwork_hits:
+            self.engine.touch_artwork(self._session, self._artwork_hits)
+            self._artwork_hits.clear()
 
     def application_state_changed(self, state):
         if self.engine.closing:
@@ -964,6 +986,7 @@ class MainWindow(QMainWindow):
             or self.isMinimized()
             or QApplication.applicationState() != Qt.ApplicationActive
         ):
+            self._flush_artwork_hits()
             return
         urls = self.inbox_panel.visible_artwork_urls() if self.inbox_panel.isVisible() else []
         if self.content_panel.isVisible():
@@ -974,6 +997,10 @@ class MainWindow(QMainWindow):
                 item = self.favorite_items.topLevelItem(index)
                 if visible.intersects(self.favorite_items.visualItemRect(item)):
                     urls.append(item.data(0, Qt.UserRole + 1))
+        self._artwork_hits.update(
+            url for url in urls if url in self._artwork and not self._artwork[url].isNull()
+        )
+        self._flush_artwork_hits()
         for url in urls:
             if url and url not in self._artwork:
                 self._artwork_pending = (self._session, url)
@@ -1175,6 +1202,7 @@ class MainWindow(QMainWindow):
             self.favorite_items.clear()
             self._artwork.clear()
             self._artwork_bytes = 0
+            self._artwork_hits.clear()
             self._artwork_pending = None
             self._artwork_paused = False
             self.inbox_panel.clear()
@@ -1452,6 +1480,7 @@ class MainWindow(QMainWindow):
             event.ignore()
             return
         self._pending_library = False
+        self._flush_artwork_hits()
         self.artwork_timer.stop()
         self.library_timer.stop()
         self.content_timer.stop()

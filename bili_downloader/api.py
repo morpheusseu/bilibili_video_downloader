@@ -23,7 +23,7 @@ from bpi.session import parse_cookie
 from .account_content import AccountContent
 from .auth import Session, normalized_cookie
 from .broadcast import BroadcastClient, BroadcastState, Wakeup
-from .cache import AccountCache
+from .cache import MAX_IMAGE_BYTES, AccountCache
 from .inbox import Inbox
 from .library import FavoriteLibrary
 from .sources import DownloadError, Source, VideoPart
@@ -52,6 +52,20 @@ LOGGED_API_PATHS = frozenset(
         "/web_im/v1/web_im/send_msg",
     }
 )
+
+
+def canonical_image_url(value):
+    url = urlparse(value)
+    host = url.hostname or ""
+    if (
+        url.scheme not in {"http", "https"}
+        or url.username
+        or url.password
+        or url.netloc != host
+        or not (host == "hdslb.com" or host.endswith(".hdslb.com"))
+    ):
+        return ""
+    return url._replace(scheme="https").geturl()
 
 
 class RequestGate:
@@ -429,17 +443,9 @@ class Bilibili:
             await asyncio.gather(*tasks, return_exceptions=True)
 
     async def cdn_image(self, value: str) -> bytes:
-        url = urlparse(value)
-        host = url.hostname or ""
-        if (
-            url.scheme not in {"http", "https"}
-            or url.username
-            or url.password
-            or url.netloc != host
-            or not (host == "hdslb.com" or host.endswith(".hdslb.com"))
-        ):
+        value = canonical_image_url(value)
+        if not value:
             return b""
-        value = url._replace(scheme="https").geturl()
         cache = self.cache
         if cache is not None:
             body = cache.image(value)
@@ -478,7 +484,7 @@ class Bilibili:
                         body = bytearray()
                         async for chunk in response.aiter_bytes(chunk_size=64 * 1024):
                             size += len(chunk)
-                            if size > 1024 * 1024:
+                            if size > MAX_IMAGE_BYTES:
                                 outcome = "too_large"
                                 return b""
                             body.extend(chunk)
@@ -501,6 +507,12 @@ class Bilibili:
                         round((self.gate.last_gap or 0) * 1000),
                         size,
                     )
+
+    def touch_images(self, urls):
+        if self.cache is not None:
+            self.cache.touch_images(
+                {canonical for url in urls if (canonical := canonical_image_url(url))}
+            )
 
     async def send_message(self, talker_id, text):
         if self.session is None:

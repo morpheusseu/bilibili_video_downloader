@@ -65,7 +65,7 @@ async def test_received_messages_images_and_selection_restore_without_refetch(tm
         assert message_text(api.inbox.threads[7].messages[-1]) == "合成私信 26"
     raw = (account_folder(tmp_path, 42) / "cache.sqlite3").read_bytes()
     # This is deliberately local plaintext storage, not a credential vault.
-    assert url.encode() in raw
+    assert PNG in raw
     assert b"SESSDATA" not in raw
 
 
@@ -237,7 +237,7 @@ async def test_over_content_cache_cap_does_not_save_cursor_past_missing_pages(tm
         assert len(view.items) == 220 and provider.requests[-1].url.params["offset"] == "200"
 
 
-def test_account_isolation_limits_expiry_and_precise_forget(tmp_path, monkeypatch):
+def test_account_image_idle_expiry_isolation_and_precise_forget(tmp_path):
     clock = [100000.0]
     one = AccountCache(tmp_path, 42, clock=lambda: clock[0])
     two = AccountCache(tmp_path, 43, clock=lambda: clock[0])
@@ -245,20 +245,20 @@ def test_account_isolation_limits_expiry_and_precise_forget(tmp_path, monkeypatc
         assert stat.S_IMODE(tmp_path.stat().st_mode) == 0o700
         assert stat.S_IMODE(one.folder.stat().st_mode) == 0o700
         assert stat.S_IMODE((one.folder / "cache.sqlite3").stat().st_mode) == 0o600
-    one.put_image("image-0", PNG)
-    record_bytes = one.connection.execute("SELECT length(value) FROM records").fetchone()[0]
-    monkeypatch.setattr(storage, "IMAGE_BYTES", record_bytes * 2)
-    for i in range(1, 3):
-        clock[0] += 1
+    for i in range(3):
         one.put_image(f"image-{i}", PNG)
-    assert one.image("image-0") is None and one.image("image-2") == PNG
-    assert one.connection.execute("SELECT SUM(length(value)) FROM records").fetchone()[0] <= (
-        storage.IMAGE_BYTES
-    )
+    one.put_many({("inbox", "head"): []})
+    clock[0] += 20 * 86400
+    assert one.image("image-0") == PNG
+    assert one.get("inbox", "head") == []
+    clock[0] += 15 * 86400
+    assert one.image("image-0") == PNG
+    assert one.image("image-2") is None
+    assert one.get("inbox", "head") is None
     assert two.image("image-2") is None
     two.put_image("image-2", b"another account")
-    clock[0] += storage.IMAGE_AGE + 1
-    assert one.image("image-2") is None
+    clock[0] += storage.IMAGE_AGE
+    assert one.image("image-0") is None
     one.close()
     AccountCache.forget(tmp_path, 42)
     assert not account_folder(tmp_path, 42).exists()
@@ -272,13 +272,121 @@ def test_account_isolation_limits_expiry_and_precise_forget(tmp_path, monkeypatc
 def test_image_cache_has_no_entry_limit_and_survives_restart(tmp_path):
     urls = [f"https://i0.hdslb.com/cache/{index}.png" for index in range(200)]
     cache = AccountCache(tmp_path, 42)
-    cache.put_many({("image", url): base64.b64encode(PNG).decode("ascii") for url in urls})
+    for url in urls:
+        cache.put_image(url, PNG)
     cache.close()
     restored = AccountCache(tmp_path, 42)
     try:
         assert all(restored.image(url) == PNG for url in urls)
     finally:
         restored.close()
+
+
+def test_image_blobs_have_no_total_disk_budget_and_keep_their_own_size_limit(tmp_path):
+    body = b"x" * (20 * 1024 * 1024)
+    cache = AccountCache(tmp_path, 42)
+    try:
+        cache.put_image("first", body)
+        cache.put_image("second", body)
+        rows = cache.connection.execute("SELECT typeof(body), length(body) FROM images").fetchall()
+        assert rows == [("blob", len(body)), ("blob", len(body))]
+        assert (
+            cache.connection.execute("SELECT COUNT(*) FROM records WHERE kind='image'").fetchone()[
+                0
+            ]
+            == 0
+        )
+        with pytest.raises(DownloadError, match="20 MiB"):
+            cache.put_image("oversized", body + b"x")
+    finally:
+        cache.close()
+    restored = AccountCache(tmp_path, 42)
+    try:
+        assert restored.image("first") == body and restored.image("second") == body
+    finally:
+        restored.close()
+
+
+def test_former_base64_images_convert_without_changing_messages(tmp_path, caplog):
+    cache = AccountCache(tmp_path, 42)
+    cache.put_many({("inbox", "head"): ["preserved"]})
+    for account_id, url in ((42, "valid"), (43, "wrong-account")):
+        raw = json.dumps(
+            {
+                "account_id": account_id,
+                "kind": "image",
+                "key": url,
+                "value": base64.b64encode(PNG).decode("ascii"),
+            }
+        ).encode()
+        cache.connection.execute(
+            "INSERT INTO records VALUES (?,?,?,?)",
+            ("image", cache._key(url), raw, cache.clock()),
+        )
+    cache.connection.commit()
+    cache.close()
+    restored = AccountCache(tmp_path, 42)
+    try:
+        assert restored.image("valid") == PNG and restored.image("wrong-account") is None
+        assert restored.get("inbox", "head") == ["preserved"]
+        assert (
+            restored.connection.execute(
+                "SELECT COUNT(*) FROM records WHERE kind='image'"
+            ).fetchone()[0]
+            == 0
+        )
+        assert restored.connection.execute("SELECT typeof(body), body FROM images").fetchone() == (
+            "blob",
+            PNG,
+        )
+        assert "wrong-account" not in caplog.text
+        with pytest.raises(DownloadError, match="二进制"):
+            restored.put_many({("image", "new"): "not-an-image"})
+    finally:
+        restored.close()
+
+
+def test_open_prunes_idle_images_but_hits_survive_a_month_after_original_write(tmp_path):
+    now = [100000.0]
+    cache = AccountCache(tmp_path, 42, clock=lambda: now[0])
+    cache.put_image("used", PNG)
+    cache.put_image("idle", PNG)
+    now[0] += 20 * 86400
+    assert cache.image("used") == PNG
+    cache.close()
+    now[0] += 15 * 86400
+    restored = AccountCache(tmp_path, 42, clock=lambda: now[0])
+    try:
+        assert restored.image("used") == PNG and restored.image("idle") is None
+        assert restored.connection.execute("SELECT COUNT(*) FROM images").fetchone()[0] == 1
+    finally:
+        restored.close()
+
+
+@pytest.mark.parametrize("size", [20 * 1024 * 1024, 20 * 1024 * 1024 + 1])
+async def test_cdn_image_limit_is_twenty_mib_and_logs_only_sizes(tmp_path, caplog, size):
+    provider, _ = inbox_provider()
+    persistent(provider, tmp_path)
+    body = b"x" * size
+    provider.image_handler = lambda request: httpx.Response(
+        200, content=body, headers={"content-type": "image/png"}
+    )
+    url = "https://i0.hdslb.com/PATH_SECRET.png?token=QUERY_SECRET"
+    caplog.set_level("INFO", logger="bili_downloader")
+    async with provider.api() as api:
+        await api.use_cookie("SESSDATA=synthetic; DedeUserID=42")
+        result = await api.cdn_image(url)
+        if size == 20 * 1024 * 1024:
+            assert result == body
+            assert await api.cdn_image(url) == body
+        else:
+            assert result == b"" and api.cache.image(url) is None
+        assert len(provider.images) == 1
+    own_logs = "\n".join(
+        r.getMessage() for r in caplog.records if r.name.startswith("bili_downloader.")
+    )
+    assert "endpoint=cdn.image" in own_logs
+    assert "SECRET" not in own_logs and "SESSDATA" not in own_logs
 
 
 async def test_corrupt_cache_falls_back_to_memory_without_overwriting(tmp_path):

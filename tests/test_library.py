@@ -1,5 +1,6 @@
 import httpx
 import pytest
+from bpi.errors import HttpStatusError
 from conftest import PNG, favorite_item, library_provider, response
 
 from bili_downloader import local_store
@@ -10,6 +11,86 @@ from bili_downloader.sources import DownloadError
 
 def detail_calls(provider):
     return [r for r in provider.requests if r.url.path.endswith("resource/list")]
+
+
+async def test_minute_checks_refresh_directory_only_every_ten_minutes_and_force_is_immediate():
+    provider, _ = library_provider(1)
+    now = [0.0]
+    async with provider.api() as api:
+        api.favorites.clock = lambda: now[0]
+        for minute in range(61):
+            now[0] = minute * 60.0
+            await api.favorites.refresh(42)
+            assert (
+                sum(r.url.path.endswith("list-all") for r in provider.requests) == 1 + minute // 10
+            )
+        assert sum(r.url.path.endswith("resource/ids") for r in provider.requests) == 61
+        assert len(detail_calls(provider)) == 7
+        before = len(provider.requests)
+        now[0] += 1
+        await api.favorites.refresh(42, force=True)
+        assert len(provider.requests) - before == 3
+
+
+async def test_empty_directory_is_cached_but_new_and_removed_folders_are_discovered():
+    provider, state = library_provider(1)
+    folders, state["folders"] = state["folders"], []
+    now = [0.0]
+    async with provider.api() as api:
+        api.favorites.clock = lambda: now[0]
+        assert not (await api.favorites.refresh(42)).folders
+        state["folders"] = folders
+        now[0] = 599
+        assert not (await api.favorites.refresh(42)).folders
+        assert len(provider.requests) == 1
+        now[0] = 600
+        assert (await api.favorites.refresh(42)).folder_id == 10
+        state["folders"] = []
+        now[0] = 1200
+        empty = await api.favorites.refresh(42)
+        assert not empty.folders and not empty.items and empty.folder_id is None
+        before = len(provider.requests)
+        now[0] += 60
+        await api.favorites.refresh(42)
+        assert len(provider.requests) == before
+
+
+async def test_directory_refresh_keeps_selection_or_selects_a_remaining_folder():
+    provider, state = library_provider(1)
+    state["folders"].append(dict(state["folders"][0], id=11, fid=11, title="另一个收藏夹"))
+    now = [0.0]
+    async with provider.api() as api:
+        api.favorites.clock = lambda: now[0]
+        await api.favorites.refresh(42)
+        await api.favorites.open(11)
+        now[0] = 600
+        assert (await api.favorites.refresh(42)).folder_id == 11
+        state["folders"].pop()
+        now[0] = 1200
+        assert (await api.favorites.refresh(42)).folder_id == 10
+
+
+async def test_failed_content_check_does_not_commit_directory_freshness():
+    provider, _ = library_provider(1)
+    original, fail = provider.handler, [False]
+
+    def handler(request):
+        if fail[0] and request.url.path.endswith("resource/ids"):
+            return httpx.Response(500)
+        return original(request)
+
+    provider.handler = handler
+    now = [0.0]
+    async with provider.api() as api:
+        api.favorites.clock = lambda: now[0]
+        first = await api.favorites.refresh(42)
+        now[0], fail[0] = 600, True
+        with pytest.raises(HttpStatusError):
+            await api.favorites.refresh(42)
+        assert api.favorites.view is first
+        now[0], fail[0] = 601, False
+        await api.favorites.refresh(42)
+        assert sum(r.url.path.endswith("list-all") for r in provider.requests) == 3
 
 
 async def test_favorites_cache_reuses_body_and_loads_pages_only_on_demand():

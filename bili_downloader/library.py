@@ -30,19 +30,31 @@ class FavoriteLibrary:
         self.next_page = 1
         self.body_at = 0.0
         self.mtime = None
+        self.folders_at = None
 
     async def refresh(self, mid: int, *, force=False) -> FavoriteView:
-        data = await self.fav.created_list(up_mid=mid)
-        folders = tuple(data.list)
+        # The GUI checks the selected folder every minute. The folder directory
+        # has its own ten-minute lifetime, including a successfully empty list.
+        read_folders = force or self.folders_at is None or self.clock() - self.folders_at >= 600
+        folders = (
+            tuple((await self.fav.created_list(up_mid=mid)).list)
+            if read_folders
+            else self.view.folders
+        )
         ids = {folder.id for folder in folders}
         selected = self.view.folder_id if self.view.folder_id in ids else None
         if selected is None and folders:
             selected = folders[0].id
         if selected is None:
-            self.clear()
             self.view = FavoriteView(folders=folders, refreshed=True)
-            return self.view
-        return await self.open(selected, force=force, folders=folders)
+            self.next_page, self.body_at, self.mtime = 1, 0.0, None
+        else:
+            await self.open(selected, force=force, folders=folders)
+        # Do not make a new directory fresh if its selected-folder check failed
+        # or was cancelled; the last successful view remains authoritative.
+        if read_folders:
+            self.folders_at = self.clock()
+        return self.view
 
     async def identifiers(self, folder_id):
         data = await self.fav.resource_ids(media_id=folder_id)

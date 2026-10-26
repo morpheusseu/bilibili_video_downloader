@@ -300,6 +300,9 @@ class MainWindow(QMainWindow):
         self.folders = QComboBox()
         self.folders.setAccessibleName("我的收藏夹")
         self.refresh_library = QPushButton("强制刷新")
+        self.refresh_library.setToolTip(
+            "立即刷新收藏夹列表、当前夹标识和首屏内容，不等待定时检查。"
+        )
         folders_row.addWidget(self.folders, 1)
         folders_row.addWidget(self.refresh_library)
         library_layout.addLayout(folders_row)
@@ -329,6 +332,9 @@ class MainWindow(QMainWindow):
         library_actions.addStretch()
         library_layout.addLayout(library_actions)
         self.auto_library = QCheckBox("每 60 秒检查当前收藏夹变化（仅应用前台、空闲时）")
+        self.auto_library.setToolTip(
+            "收藏夹列表每 10 分钟更新；当前夹每 60 秒检查，强制刷新立即执行。"
+        )
         self.auto_library.setChecked(True)
         library_layout.addWidget(self.auto_library)
         self.library_panel.hide()

@@ -218,6 +218,17 @@ def media(tmp_path_factory):
 def library_provider(count=21):
     state = {
         "items": [favorite_item(f"BV{i:010}", i) for i in range(1, count + 1)],
+        "folders": [
+            {
+                "id": 10,
+                "fid": 10,
+                "mid": 42,
+                "attr": 0,
+                "title": "我的收藏",
+                "fav_state": 0,
+                "media_count": 0,  # Count is a hint, not a pagination frontier.
+            }
+        ],
         "mtime": 1,
         "repeat": False,
         "deny": False,
@@ -228,22 +239,7 @@ def library_provider(count=21):
             return httpx.Response(429)
         path = request.url.path
         if path.endswith("list-all"):
-            return response(
-                {
-                    "count": 1,
-                    "list": [
-                        {
-                            "id": 10,
-                            "fid": 10,
-                            "mid": 42,
-                            "attr": 0,
-                            "title": "我的收藏",
-                            "fav_state": 0,
-                            "media_count": 0,  # Count is a hint, not a pagination frontier.
-                        }
-                    ],
-                }
-            )
+            return response({"count": len(state["folders"]), "list": state["folders"]})
         if path.endswith("resource/ids"):
             items = state.get("ids_override", state["items"])
             return response([{"id": item["id"], "type": item["type"]} for item in items])
@@ -253,6 +249,7 @@ def library_provider(count=21):
             if state["repeat"] and page > 1:
                 start = 0
             info = folder_info(len(state["items"]))
+            info["id"] = int(request.url.params["media_id"])
             info["mtime"] = state["mtime"]
             return response(
                 {

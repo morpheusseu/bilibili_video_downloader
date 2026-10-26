@@ -547,6 +547,11 @@ def test_login_favorites_browse_cache_and_fill_download_source(app, window, monk
     wait_for(app, lambda: not widget.busy)
     assert widget.favorite_items.currentItem() is first_item
     assert sum(r.url.path.endswith("resource/list") for r in provider.requests) == body_count
+    assert sum(r.url.path.endswith("list-all") for r in provider.requests) == 1
+    widget.refresh_library.click()
+    wait_for(app, lambda: not widget.busy)
+    assert sum(r.url.path.endswith("list-all") for r in provider.requests) == 2
+    assert sum(r.url.path.endswith("resource/list") for r in provider.requests) == body_count + 1
     count = len(provider.requests)
     widget.set_busy(True)
     widget.check_library()

@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 import os
 import sqlite3
@@ -238,17 +239,22 @@ async def test_over_content_cache_cap_does_not_save_cursor_past_missing_pages(tm
 
 def test_account_isolation_limits_expiry_and_precise_forget(tmp_path, monkeypatch):
     clock = [100000.0]
-    monkeypatch.setattr(storage, "MAX_IMAGES", 2)
     one = AccountCache(tmp_path, 42, clock=lambda: clock[0])
     two = AccountCache(tmp_path, 43, clock=lambda: clock[0])
     if os.name == "posix":
         assert stat.S_IMODE(tmp_path.stat().st_mode) == 0o700
         assert stat.S_IMODE(one.folder.stat().st_mode) == 0o700
         assert stat.S_IMODE((one.folder / "cache.sqlite3").stat().st_mode) == 0o600
-    for i in range(3):
-        one.put_image(f"image-{i}", PNG)
+    one.put_image("image-0", PNG)
+    record_bytes = one.connection.execute("SELECT length(value) FROM records").fetchone()[0]
+    monkeypatch.setattr(storage, "IMAGE_BYTES", record_bytes * 2)
+    for i in range(1, 3):
         clock[0] += 1
+        one.put_image(f"image-{i}", PNG)
     assert one.image("image-0") is None and one.image("image-2") == PNG
+    assert one.connection.execute("SELECT SUM(length(value)) FROM records").fetchone()[0] <= (
+        storage.IMAGE_BYTES
+    )
     assert two.image("image-2") is None
     two.put_image("image-2", b"another account")
     clock[0] += storage.IMAGE_AGE + 1
@@ -261,6 +267,18 @@ def test_account_isolation_limits_expiry_and_precise_forget(tmp_path, monkeypatc
         one.put_many({("inbox", "head"): []})
     assert not account_folder(tmp_path, 42).exists()
     two.close()
+
+
+def test_image_cache_has_no_entry_limit_and_survives_restart(tmp_path):
+    urls = [f"https://i0.hdslb.com/cache/{index}.png" for index in range(200)]
+    cache = AccountCache(tmp_path, 42)
+    cache.put_many({("image", url): base64.b64encode(PNG).decode("ascii") for url in urls})
+    cache.close()
+    restored = AccountCache(tmp_path, 42)
+    try:
+        assert all(restored.image(url) == PNG for url in urls)
+    finally:
+        restored.close()
 
 
 async def test_corrupt_cache_falls_back_to_memory_without_overwriting(tmp_path):

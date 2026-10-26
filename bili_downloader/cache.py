@@ -19,7 +19,6 @@ from .sources import DownloadError
 log = logging.getLogger(__name__)
 MAX_MESSAGES = 500
 MAX_THREADS = 50
-MAX_IMAGES = 128
 IMAGE_BYTES = 32 * 1024 * 1024
 THREAD_BYTES = 16 * 1024 * 1024
 MAX_RECORD = 2 * 1024 * 1024
@@ -112,9 +111,9 @@ class AccountCache:
                     "value=excluded.value, touched=excluded.touched",
                     encoded,
                 )
-                for kind, count, budget in (
-                    ("image", MAX_IMAGES, IMAGE_BYTES),
-                    ("thread", MAX_THREADS, THREAD_BYTES),
+                for kind, budget in (
+                    ("image", IMAGE_BYTES),
+                    ("thread", THREAD_BYTES),
                 ):
                     rows = db.execute(
                         "SELECT key, length(value) FROM records WHERE kind=? "
@@ -124,7 +123,7 @@ class AccountCache:
                     size = 0
                     for index, (key, length) in enumerate(rows):
                         size += length
-                        if index >= count or size > budget:
+                        if size > budget or (kind == "thread" and index >= MAX_THREADS):
                             db.execute("DELETE FROM records WHERE kind=? AND key=?", (kind, key))
         except sqlite3.Error:
             raise DownloadError("持久缓存写入失败，未提交本次消息或推进游标") from None

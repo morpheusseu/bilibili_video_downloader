@@ -66,6 +66,8 @@ from .library import FavoriteView
 from .sources import DownloadError, parse_source
 from .theme import STYLE
 
+ARTWORK_BYTES = 32 * 1024 * 1024
+
 
 class Engine(QThread):
     result = pyqtSignal(object)
@@ -218,6 +220,7 @@ class MainWindow(QMainWindow):
         self._pending_library = False
         self._job = None
         self._artwork = OrderedDict()
+        self._artwork_bytes = 0
         self._artwork_pending = None
         self._artwork_paused = False
         self._library_view = FavoriteView()
@@ -991,10 +994,7 @@ class MainWindow(QMainWindow):
                 self.content_panel.hint.setText(f"图片读取已暂停，条目仍可用：{error}")
         elif body is not None:
             pixmap = decode_image(body, QSize(320, 240))
-            self._artwork[url] = pixmap
-            self._artwork.move_to_end(url)
-            while len(self._artwork) > 128:
-                self._artwork.popitem(last=False)
+            self._cache_artwork(url, pixmap)
             for index in range(self.favorite_items.topLevelItemCount()):
                 item = self.favorite_items.topLevelItem(index)
                 if item.data(0, Qt.UserRole + 1) == url and not pixmap.isNull():
@@ -1003,6 +1003,16 @@ class MainWindow(QMainWindow):
             if not pixmap.isNull():
                 self.content_panel.update_artwork(url)
         self.artwork_timer.start()
+
+    def _cache_artwork(self, url, pixmap):
+        previous = self._artwork.pop(url, None)
+        if previous is not None:
+            self._artwork_bytes -= previous.toImage().sizeInBytes()
+        self._artwork[url] = pixmap
+        self._artwork_bytes += pixmap.toImage().sizeInBytes()
+        while self._artwork_bytes > ARTWORK_BYTES:
+            _, evicted = self._artwork.popitem(last=False)
+            self._artwork_bytes -= evicted.toImage().sizeInBytes()
 
     def mode_changed(self):
         self.clear_preview()
@@ -1164,6 +1174,7 @@ class MainWindow(QMainWindow):
             self.folders.blockSignals(False)
             self.favorite_items.clear()
             self._artwork.clear()
+            self._artwork_bytes = 0
             self._artwork_pending = None
             self._artwork_paused = False
             self.inbox_panel.clear()

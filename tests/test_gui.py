@@ -1099,6 +1099,28 @@ def test_late_image_from_same_uid_previous_login_cannot_refill_current_cache(app
     assert url in widget._artwork and widget._artwork_pending is None
 
 
+def test_image_memory_cache_uses_bytes_not_entry_count_and_resets_on_logout(
+    app, window, monkeypatch
+):
+    widget, provider = window
+    widget.show_session(Session(42, "Synthetic", "synthetic"))
+    pixmap = QPixmap(2, 2)
+    pixmap.fill(Qt.blue)
+    size = pixmap.toImage().sizeInBytes()
+    for index in range(200):
+        widget._cache_artwork(f"image-{index}", pixmap)
+    assert len(widget._artwork) == 200
+    assert widget._artwork_bytes == 200 * size
+    monkeypatch.setattr(gui, "ARTWORK_BYTES", 2 * size)
+    widget._cache_artwork("image-200", pixmap)
+    assert set(widget._artwork) == {"image-199", "image-200"}
+    widget._cache_artwork("image-200", pixmap)
+    assert widget._artwork_bytes == 2 * size
+    widget.show_session(None)
+    assert not widget._artwork and widget._artwork_bytes == 0
+    assert not provider.requests
+
+
 def test_cover_and_avatar_shapes_stay_consistent_after_load_and_rerender(app, window):
     widget, _ = window
     url = "https://i0.hdslb.com/shared-cover-avatar.png"
@@ -1109,7 +1131,7 @@ def test_cover_and_avatar_shapes_stay_consistent_after_load_and_rerender(app, wi
     panel = widget.content_panel
     view = ContentView("dynamic", (cover, avatar), False, "")
     panel.show_view(view)
-    widget._artwork[url] = pixmap
+    widget._cache_artwork(url, pixmap)
 
     def shapes():
         cover_size = panel.items.topLevelItem(0).icon(0).pixmap(QSize(48, 40)).size()
@@ -1157,7 +1179,7 @@ def test_message_emoji_http_to_qt_renders_safe_image_and_retains_copyable_text(a
     # full 72px image must remain visible inside the row at the bottom of the list.
     pixmap = QPixmap(72, 72)
     pixmap.fill(Qt.magenta)
-    widget._artwork[url] = pixmap
+    widget._cache_artwork(url, pixmap)
     panel.update_artwork(url)
     panel.body.scrollToBottom()
     app.processEvents()

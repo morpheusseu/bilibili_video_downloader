@@ -30,6 +30,29 @@ from .sources import DownloadError, Source, VideoPart
 
 log = logging.getLogger(__name__)
 
+# Only fixed endpoint names belong in diagnostics. Never log a URL, query,
+# provider-controlled path segment, headers, payload or exception text here.
+LOGGED_API_PATHS = frozenset(
+    {
+        "/x/web-interface/nav",
+        "/x/web-interface/view",
+        "/x/player/wbi/playurl",
+        "/pgc/view/web/season",
+        "/pgc/player/web/playurl",
+        "/x/v3/fav/folder/created/list-all",
+        "/x/v3/fav/resource/ids",
+        "/x/v3/fav/resource/list",
+        "/x/polymer/web-dynamic/v1/feed/all",
+        "/x/polymer/web-dynamic/v1/feed/all/update",
+        "/x/relation/followings",
+        "/x/web-interface/history/cursor",
+        "/session_svr/v1/session_svr/get_sessions",
+        "/svr_sync/v1/svr_sync/fetch_session_msgs",
+        "/account/v1/user/cards",
+        "/web_im/v1/web_im/send_msg",
+    }
+)
+
 
 class RequestGate:
     """Shared by API and media transfers; completion-to-next-start spacing."""
@@ -106,17 +129,40 @@ class ApiHttpClient(httpx.AsyncClient):
         ):
             raise DownloadError("拒绝未获支持或非受信 API 请求；写操作仅允许显式私信发送")
         async with self.gate.request():
-            if self.user_agent:
-                request.headers["User-Agent"] = self.user_agent
-            response = await super().send(request, **kwargs)
-            self.gate.check(response.status_code)
+            started = time.monotonic()
+            status, code, size, outcome = 0, None, 0, "error"
             try:
-                payload = response.json()
-            except ValueError:
-                payload = None
-            if isinstance(payload, dict):
-                self.gate.check(response.status_code, payload.get("code"))
-            return response
+                if self.user_agent:
+                    request.headers["User-Agent"] = self.user_agent
+                response = await super().send(request, **kwargs)
+                status, size = response.status_code, len(response.content)
+                self.gate.check(status)
+                try:
+                    payload = response.json()
+                except ValueError:
+                    payload = None
+                if isinstance(payload, dict):
+                    code = payload.get("code")
+                    self.gate.check(status, code)
+                outcome = "complete"
+                return response
+            except asyncio.CancelledError:
+                outcome = "cancelled"
+                raise
+            finally:
+                log.info(
+                    "HTTP request=%s endpoint=%s method=%s status=%s api_code=%s "
+                    "outcome=%s duration_ms=%s gap_ms=%s body_bytes=%s",
+                    self.gate.count,
+                    request.url.path if request.url.path in LOGGED_API_PATHS else "other_api",
+                    request.method,
+                    status,
+                    code if type(code) is int else "none",
+                    outcome,
+                    round((time.monotonic() - started) * 1000),
+                    round((self.gate.last_gap or 0) * 1000),
+                    size,
+                )
 
 
 def safe_error(error: Exception) -> str:
@@ -404,34 +450,57 @@ class Bilibili:
             transport=self.image_transport, timeout=10, trust_env=False
         ) as images:
             async with self.gate.request():
-                async with images.stream(
-                    "GET",
-                    value,
-                    follow_redirects=False,
-                    headers={
-                        "User-Agent": self.http.user_agent or "Mozilla/5.0",
-                        "Referer": "https://www.bilibili.com/",
-                    },
-                ) as response:
-                    self.gate.check(response.status_code)
-                    if response.status_code != 200:
-                        return b""
-                    if response.headers.get("content-type", "").split(";")[0] not in {
-                        "image/jpeg",
-                        "image/png",
-                        "image/webp",
-                        "image/gif",
-                    }:
-                        return b""
-                    body = bytearray()
-                    async for chunk in response.aiter_bytes(chunk_size=64 * 1024):
-                        if len(body) + len(chunk) > 1024 * 1024:
+                started = time.monotonic()
+                status, size, outcome = 0, 0, "error"
+                try:
+                    async with images.stream(
+                        "GET",
+                        value,
+                        follow_redirects=False,
+                        headers={
+                            "User-Agent": self.http.user_agent or "Mozilla/5.0",
+                            "Referer": "https://www.bilibili.com/",
+                        },
+                    ) as response:
+                        status = response.status_code
+                        self.gate.check(status)
+                        outcome = "rejected"
+                        if status != 200:
                             return b""
-                        body.extend(chunk)
-                    result = bytes(body)
-                    if cache is not None:
-                        cache.put_image(value, result)
-                    return result
+                        if response.headers.get("content-type", "").split(";")[0] not in {
+                            "image/jpeg",
+                            "image/png",
+                            "image/webp",
+                            "image/gif",
+                        }:
+                            return b""
+                        outcome = "error"
+                        body = bytearray()
+                        async for chunk in response.aiter_bytes(chunk_size=64 * 1024):
+                            size += len(chunk)
+                            if size > 1024 * 1024:
+                                outcome = "too_large"
+                                return b""
+                            body.extend(chunk)
+                        result = bytes(body)
+                        if cache is not None:
+                            cache.put_image(value, result)
+                        outcome = "complete"
+                        return result
+                except asyncio.CancelledError:
+                    outcome = "cancelled"
+                    raise
+                finally:
+                    log.info(
+                        "HTTP request=%s endpoint=cdn.image method=GET status=%s "
+                        "outcome=%s duration_ms=%s gap_ms=%s body_bytes=%s",
+                        self.gate.count,
+                        status,
+                        outcome,
+                        round((time.monotonic() - started) * 1000),
+                        round((self.gate.last_gap or 0) * 1000),
+                        size,
+                    )
 
     async def send_message(self, talker_id, text):
         if self.session is None:

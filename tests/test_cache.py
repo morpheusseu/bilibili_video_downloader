@@ -21,10 +21,11 @@ def persistent(provider, root):
     return provider
 
 
-async def test_received_messages_images_and_selection_restore_without_refetch(tmp_path):
+async def test_received_messages_images_and_selection_restore_without_refetch(tmp_path, caplog):
+    caplog.set_level("INFO", logger="bili_downloader")
     provider, state = inbox_provider()
     persistent(provider, tmp_path)
-    url = "https://i0.hdslb.com/bfs/face/synthetic.png"
+    url = "https://i0.hdslb.com/bfs/face/PATH_SECRET.png?token=QUERY_SECRET"
     provider.image_handler = lambda request: httpx.Response(
         200, content=PNG, headers={"content-type": "image/png"}
     )
@@ -45,6 +46,12 @@ async def test_received_messages_images_and_selection_restore_without_refetch(tm
         assert (await api.inbox.open(8, 42)).cached
         assert await api.cdn_image(url) == PNG
         assert len(provider.requests) == before and len(provider.images) == images
+        own_logs = "\n".join(
+            r.getMessage() for r in caplog.records if r.name.startswith("bili_downloader.")
+        )
+        assert own_logs.count("endpoint=cdn.image") == 1
+        assert "Image cache reused bytes=" in own_logs
+        assert not any(secret in own_logs for secret in ("SECRET", "SESSDATA", "合成私信"))
         # A notification for a nonselected peer must retain bodies, not only a cursor.
         state["messages"].append(private_message(26))
         assert await api.inbox.sync_talker(7, 42) == 1

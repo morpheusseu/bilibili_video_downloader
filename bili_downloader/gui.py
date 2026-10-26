@@ -1461,7 +1461,9 @@ def main():
     try:
         folder.mkdir(parents=True, exist_ok=True)
         handler = RotatingFileHandler(folder / "broadcast.log", maxBytes=1024 * 1024, backupCount=2)
-        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        handler.setFormatter(
+            logging.Formatter("%(asctime)s %(levelname)s pid=%(process)d %(message)s")
+        )
         logger = logging.getLogger("bili_downloader")
         logger.setLevel(logging.INFO)
         logger.addHandler(handler)

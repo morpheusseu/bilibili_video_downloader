@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from types import SimpleNamespace
 
 import httpx
@@ -131,6 +132,56 @@ async def test_spacing_and_risk_latch():
             with pytest.raises(DownloadError):
                 await api.sdk.video.view(bvid=BV)
     assert len(calls) == 1
+
+
+@pytest.mark.parametrize("mode", ["read", "send", "unknown", "risk", "timeout", "cancel"])
+async def test_http_diagnostics_never_log_credentials_payloads_or_arbitrary_paths(caplog, mode):
+    caplog.set_level(logging.INFO, logger="bili_downloader")
+
+    def handler(request):
+        if mode == "timeout":
+            raise httpx.ReadTimeout("EXCEPTION_SECRET SESSDATA=COOKIE_SECRET", request=request)
+        if mode == "cancel":
+            raise asyncio.CancelledError
+        return httpx.Response(
+            429 if mode == "risk" else 200,
+            json={"code": "CODE_SECRET", "data": "PRIVATE_BODY_SECRET"},
+        )
+
+    async with Bilibili(gate=RequestGate(0, 0), transport=httpx.MockTransport(handler)) as api:
+        path = (
+            "/web_im/v1/web_im/send_msg"
+            if mode == "send"
+            else "/PATH_SECRET"
+            if mode == "unknown"
+            else "/x/v3/fav/resource/ids"
+        )
+        request = api.http.build_request(
+            "POST" if mode == "send" else "GET",
+            ("https://api.vc.bilibili.com" if mode == "send" else "https://api.bilibili.com")
+            + path,
+            params={"secret": "QUERY_SECRET"},
+            headers={"Cookie": "SESSDATA=COOKIE_SECRET", "Authorization": "HEADER_SECRET"},
+            content=b"PRIVATE_BODY_SECRET CSRF_SECRET",
+        )
+        if mode in {"risk", "timeout", "cancel"}:
+            error = {
+                "risk": DownloadError,
+                "timeout": httpx.ReadTimeout,
+                "cancel": asyncio.CancelledError,
+            }[mode]
+            with pytest.raises(error):
+                await api.http.send(request)
+        else:
+            await api.http.send(request)
+    records = [r.getMessage() for r in caplog.records if r.name == "bili_downloader.api"]
+    assert len(records) == 1
+    text = records[0]
+    assert "HTTP request=1 endpoint=" in text and "gap_ms=" in text and "duration_ms=" in text
+    assert "status=429" in text if mode == "risk" else "api_code=none" in text
+    if mode == "unknown":
+        assert "endpoint=other_api" in text
+    assert not any(value in text for value in ("SECRET", "SESSDATA", "Cookie", "Authorization"))
 
 
 class Browser:

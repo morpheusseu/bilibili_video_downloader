@@ -145,6 +145,11 @@ DASH 音频输出只读取音频流；普通音视频分段则在下载后提取
   诊断日志保留连接、心跳、前台/唤醒探测、重连退避、通知及定向读取的数量和停止原因，
   不记录 Cookie、通知原始包或私信正文。
   macOS 日志位于 `~/Library/Application Support/Bilibili Downloader/logs/broadcast.log`，单文件 1 MiB、最多两份轮换。
+  同一日志还记录 API/图片请求的进程号、共享队列序号、固定白名单接口名、方法、状态码、数值 API code、
+  耗时、距上一请求完成的间隔及响应字节数。未知 API 路径只记作 `other_api`，所有图片统一记作 `cdn.image`。
+  不记录 URL、查询参数、headers、Cookie、请求/响应正文、用户/收藏夹 ID 或异常原文；`status=0` 表示未取得响应。
+  收藏日志区分列表/正文的 `fetched` 与 `reused`，图片磁盘命中只记录字节数，不发 HTTP 请求。
+  自动刷新受前台、空闲和 60 秒调度约束：列表满 10 分钟后在下一次检查读取，并非精确的独立 10 分钟定时器。
 - 按 SDK 的[私信接口说明](https://github.com/Yuelioi/bpi-py/blob/main/docs/private-message-api.md)，
   `ALL=4` 在真实服务上可能忽略历史游标；因此分别读取普通/系统与未关注两类，每类每页 20 个，
   合并去重并验证时间游标前进。未读取的下一页明确显示“更多会话”，不假称首屏完整。

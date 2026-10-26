@@ -13,7 +13,10 @@ def detail_calls(provider):
     return [r for r in provider.requests if r.url.path.endswith("resource/list")]
 
 
-async def test_minute_checks_refresh_directory_only_every_ten_minutes_and_force_is_immediate():
+async def test_minute_checks_refresh_directory_only_every_ten_minutes_and_force_is_immediate(
+    caplog,
+):
+    caplog.set_level("INFO", logger="bili_downloader.library")
     provider, _ = library_provider(1)
     now = [0.0]
     async with provider.api() as api:
@@ -26,6 +29,11 @@ async def test_minute_checks_refresh_directory_only_every_ten_minutes_and_force_
             )
         assert sum(r.url.path.endswith("resource/ids") for r in provider.requests) == 61
         assert len(detail_calls(provider)) == 7
+        text = "\n".join(r.getMessage() for r in caplog.records)
+        assert text.count("Favorites directory=fetched") == 7
+        assert text.count("Favorites directory=reused") == 54
+        assert text.count("Favorites body=fetched") == 7
+        assert text.count("Favorites body=reused") == 54
         before = len(provider.requests)
         now[0] += 1
         await api.favorites.refresh(42, force=True)

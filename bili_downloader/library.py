@@ -2,12 +2,15 @@
 
 import hashlib
 import json
+import logging
 import time
 from dataclasses import dataclass, replace
 
 from bpi.fav.models import CreatedFolderItem, FavListMedia
 
 from .sources import DownloadError
+
+log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -54,6 +57,12 @@ class FavoriteLibrary:
         # or was cancelled; the last successful view remains authoritative.
         if read_folders:
             self.folders_at = self.clock()
+        log.info(
+            "Favorites directory=%s folders=%s force=%s",
+            "fetched" if read_folders else "reused",
+            len(folders),
+            bool(force),
+        )
         return self.view
 
     async def identifiers(self, folder_id):
@@ -78,6 +87,7 @@ class FavoriteLibrary:
             and self.clock() - self.body_at < 600
         ):
             self.view = replace(self.view, folders=folders, refreshed=False)
+            log.info("Favorites body=reused items=%s", len(self.view.items))
             return self.view
         return await self.first_page(folder_id, folders, keys, digest)
 
@@ -93,6 +103,7 @@ class FavoriteLibrary:
             digest = ""
         self.view = FavoriteView(folders, folder_id, items, data.has_more, digest, True)
         self.next_page, self.body_at, self.mtime = 2, self.clock(), data.info.mtime
+        log.info("Favorites body=fetched items=%s", len(items))
         return self.view
 
     async def more(self) -> FavoriteView:

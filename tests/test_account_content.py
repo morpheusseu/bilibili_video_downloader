@@ -14,7 +14,7 @@ async def test_three_read_only_surfaces_paginate_through_real_sdk_and_shared_gat
             await api.read_account_content("dynamic")
         assert not provider.requests
         await api.use_cookie("SESSDATA=synthetic; DedeUserID=42")
-        for kind in ("dynamic", "followings", "history"):
+        for kind in ("dynamic", "history"):
             first = await api.read_account_content(kind)
             assert len(first.items) == 20 and first.has_more
             full = await api.read_account_content(kind, more=True)
@@ -26,7 +26,6 @@ async def test_three_read_only_surfaces_paginate_through_real_sdk_and_shared_gat
             assert len(provider.requests) == before
         assert "图片 1 张" in api.account_content.views["dynamic"].items[0].body
         assert "<plain>" in api.account_content.views["dynamic"].items[0].body
-        assert "合成签名" in api.account_content.views["followings"].items[0].body
         assert "播放进度 12 秒" in api.account_content.views["history"].items[0].body
         cursor_request = provider.requests[-1]
         assert cursor_request.url.params["max"] == "2"
@@ -176,8 +175,10 @@ async def test_dynamic_update_check_skips_body_and_explicit_refresh_rechecks_edi
 
 
 @pytest.mark.parametrize("kind", ["dynamic", "followings", "history"])
-async def test_nonadvancing_pagination_and_http_failures_preserve_view_and_frontier(kind):
-    provider = content_provider()
+async def test_nonadvancing_pagination_and_http_failures_preserve_view_and_frontier(
+    kind,
+):
+    provider = content_provider(51 if kind == "followings" else 21)
     async with provider.api() as api:
         await api.use_cookie("SESSDATA=synthetic; DedeUserID=42")
         first = await api.read_account_content(kind)
@@ -192,7 +193,7 @@ async def test_nonadvancing_pagination_and_http_failures_preserve_view_and_front
         assert api.account_content.views[kind] is first
         provider.content_state["fail"] = False
         final = await api.read_account_content(kind, more=True)
-        assert len(final.items) == 21 and not final.has_more
+        assert len(final.items) == (51 if kind == "followings" else 21) and not final.has_more
 
 
 @pytest.mark.parametrize("risk", [403, 412, 429, -352, -412])

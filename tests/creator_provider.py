@@ -64,8 +64,7 @@ def creator_provider(count=23):
         if state["risk"]:
             return httpx.Response(state["risk"])
         if scoped:
-            assert params["host_mid"] == "7"
-            rows = state["dynamics"]
+            rows = state["dynamics"] if params["host_mid"] == "7" else []
             start = 0
             if "offset" in params and not state["repeat"]:
                 start = next(
@@ -83,14 +82,15 @@ def creator_provider(count=23):
                 }
             )
         if path.endswith("/arc/search"):
-            assert params["mid"] == "7" and params["ps"] == "20"
+            assert params["ps"] == "20"
+            videos = state["videos"] if params["mid"] == "7" else []
             assert "w_rid" in params and "wts" in params
             page = int(params["pn"])
             start = (page - 1) * 20 if not state["repeat"] else 0
             return response(
                 {
-                    "list": {"vlist": state["videos"][start : start + 20], "tlist": None},
-                    "page": {"count": len(state["videos"]), "pn": page, "ps": 20},
+                    "list": {"vlist": videos[start : start + 20], "tlist": None},
+                    "page": {"count": len(videos), "pn": page, "ps": 20},
                     "is_risk": state["risk_flag"],
                 }
             )

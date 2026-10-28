@@ -73,7 +73,7 @@ def favorite_item(bvid=BV, id=1):
         "id": id,
         "type": 2,
         "title": "Synthetic video",
-        "cover": "",
+        "cover": "https://i0.hdslb.com/bfs/archive/synthetic.jpg",
         "intro": "",
         "duration": 1,
         "upper": {"mid": 42, "name": "Synthetic", "face": ""},

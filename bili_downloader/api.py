@@ -25,6 +25,7 @@ from .auth import Session, normalized_cookie
 from .broadcast import BroadcastClient, BroadcastState, Wakeup
 from .cache import MAX_IMAGE_BYTES, AccountCache
 from .creator_content import CreatorContent
+from .following_collection import FollowingCollection
 from .inbox import Inbox
 from .library import FavoriteLibrary
 from .sources import DownloadError, Source, VideoPart
@@ -43,6 +44,7 @@ LOGGED_API_PATHS = frozenset(
         "/x/v3/fav/folder/created/list-all",
         "/x/v3/fav/resource/ids",
         "/x/v3/fav/resource/list",
+        "/x/v3/fav/resource/infos",
         "/x/polymer/web-dynamic/v1/feed/all",
         "/x/polymer/web-dynamic/v1/feed/all/update",
         "/x/relation/followings",
@@ -224,6 +226,7 @@ class Bilibili:
         self.inbox = Inbox(self.sdk)
         self.account_content = AccountContent(self.sdk)
         self.creator_content = CreatorContent(self.sdk)
+        self.following_collection = FollowingCollection(self.account_content, self.creator_content)
         self.broadcast_factory = broadcast_factory
         self._live_task = None
         self._live_owner = None
@@ -259,6 +262,7 @@ class Bilibili:
         self.inbox = Inbox(self.sdk)
         self.account_content = AccountContent(self.sdk)
         self.creator_content = CreatorContent(self.sdk)
+        self.following_collection = FollowingCollection(self.account_content, self.creator_content)
 
     async def forget_account_cache(self, account_id):
         await self.stop_inbox_live()
@@ -298,6 +302,21 @@ class Bilibili:
             raise DownloadError("账号已变化，未发布旧账号的关注者内容")
         return view
 
+    async def collect_followings(self, *, restart=False, on_update=None):
+        owner, collection = self.session, self.following_collection
+        if owner is None:
+            raise DownloadError("请先登录当前账号")
+
+        def publish(progress):
+            if self.session is not owner or self.following_collection is not collection:
+                raise DownloadError("账号已变化，已停止旧账号的关注采集")
+            if on_update:
+                on_update(owner, progress)
+
+        progress = await collection.run_round(owner.mid, restart=restart, on_update=publish)
+        publish(progress)
+        return progress
+
     async def use_cookie(self, cookie: str, *, user_agent: str = "") -> Session:
         await self.stop_inbox_live()
         self.clear_session()
@@ -317,6 +336,9 @@ class Bilibili:
                     self.inbox = Inbox(self.sdk, cache=self.cache)
                     self.account_content = AccountContent(self.sdk, cache=self.cache)
                     self.creator_content = CreatorContent(self.sdk, cache=self.cache)
+                    self.following_collection = FollowingCollection(
+                        self.account_content, self.creator_content, cache=self.cache
+                    )
                     count = sum(len(view.messages) for view in self.inbox.threads.values())
                     self.cache_notice = (
                         f"已恢复 {len(self.inbox.threads)} 个会话、{count} 条本地消息；"
@@ -335,6 +357,9 @@ class Bilibili:
                     self.inbox = Inbox(self.sdk)
                     self.account_content = AccountContent(self.sdk)
                     self.creator_content = CreatorContent(self.sdk)
+                    self.following_collection = FollowingCollection(
+                        self.account_content, self.creator_content
+                    )
                     self.cache_notice = f"{error}；本次仅使用内存，未覆盖原缓存。"
             avatar = b""
             if nav.face:
@@ -343,7 +368,11 @@ class Bilibili:
                 except (DownloadError, httpx.HTTPError):
                     pass  # A missing avatar must not turn valid authentication into failure.
             self.session = Session(
-                nav.mid, nav.uname or str(nav.mid), normalized_cookie(cookie), user_agent, avatar
+                nav.mid,
+                nav.uname or str(nav.mid),
+                normalized_cookie(cookie),
+                user_agent,
+                avatar,
             )
             return self.session
         except BaseException:

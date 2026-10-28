@@ -10,6 +10,7 @@ from .sources import DownloadError
 KINDS = ("dynamic", "followings", "history")
 TITLES = {"dynamic": "关注动态", "followings": "关注的人", "history": "观看历史"}
 PAGE_SIZE = 20
+FOLLOWING_PAGE_SIZE = 50
 log = logging.getLogger(__name__)
 
 
@@ -304,14 +305,26 @@ class AccountContent:
                 if saved is not None:
                     try:
                         rows = tuple(ContentItem.from_record(item) for item in saved["items"])
-                        if len(rows) > 200 or (
+                        if (kind != "followings" and len(rows) > 200) or (
                             kind == "followings" and any(not row.key.isdecimal() for row in rows)
                         ):
                             raise ValueError("Invalid content cache")
                         view = ContentView(
                             kind, rows, bool(saved["has_more"]), saved["notice"], True
                         )
-                        frontier = saved["frontier"]
+                        frontier = dict(saved["frontier"])
+                        if kind == "followings":
+                            # Existing saved pages were fetched with ps=20. Keep
+                            # that size until this traversal ends; changing it
+                            # midway would skip people at the next pn boundary.
+                            frontier.setdefault("page_size", 20)
+                            if (
+                                frontier["page_size"] not in (20, FOLLOWING_PAGE_SIZE)
+                                or type(frontier.get("next_page")) is not int
+                                or frontier["next_page"] < 2
+                                or len({row.key for row in rows}) != len(rows)
+                            ):
+                                raise ValueError("Invalid following frontier")
                         self.views[kind], self.frontiers[kind] = view, frontier
                     except (KeyError, TypeError, ValueError):
                         # Display strings are not provider truth. A stale projection
@@ -335,7 +348,7 @@ class AccountContent:
         # Never store a farther pagination cursor without all pages preceding it.
         # Larger explicitly loaded views stay in RAM; restart resumes the last
         # complete <=200-item cache instead of skipping uncached pages.
-        if self.cache is not None and len(view.items) <= 200:
+        if self.cache is not None and (kind == "followings" or len(view.items) <= 200):
             self.cache.put_many(
                 {
                     ("content", kind): {
@@ -384,20 +397,25 @@ class AccountContent:
 
     async def _followings(self, current, account_id, more, frontier):
         page = frontier["next_page"] if more else 1
-        data = await self.sdk.user.followings(mid=account_id, page=page, page_size=PAGE_SIZE)
+        size = frontier["page_size"] if more else FOLLOWING_PAGE_SIZE
+        data = await self.sdk.user.followings(mid=account_id, page=page, page_size=size)
         items = merged(
-            current.items if more else (), (following_item(user) for user in data.list), False
+            current.items if more else (),
+            (following_item(user) for user in data.list),
+            False,
         )
         has_more = len(items) < data.total
         if data.total < 0 or (has_more and len(items) == (len(current.items) if more else 0)):
             raise DownloadError("关注分页不完整或未推进，已保留原列表；请手动刷新")
+        if has_more and len(data.list) != size:
+            raise DownloadError("关注分页数量与请求不符，已停止；未跳过未读取的关注者")
         return ContentView(
             "followings",
             items,
             has_more,
             f"平台报告关注 {data.total} 人；分页期间可能变化，不据此自动判定取关。",
             current.cached if more else False,
-        ), {"next_page": page + 1}
+        ), {"next_page": page + 1, "page_size": size}
 
     async def _history(self, current, more, frontier):
         params = {"page_size": PAGE_SIZE}

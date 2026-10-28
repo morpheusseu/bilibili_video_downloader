@@ -8,7 +8,7 @@ import time
 from dataclasses import dataclass, replace
 from functools import cached_property
 
-from bpi.fav.models import CreatedFolderItem, FavListMedia
+from bpi.fav.models import CreatedFolderItem, FavListMedia, ResourceInfoItem
 
 from .sources import DownloadError
 
@@ -54,6 +54,7 @@ class FavoriteLibrary:
         self.fav, self.cache, self.clock = fav, cache, clock
         self.view = FavoriteView()
         self.states = {}
+        self.metadata = {}
         self.folders_at = None
         if cache is not None:
             self._restore_directory()
@@ -227,6 +228,61 @@ class FavoriteLibrary:
         ).hexdigest()
         return keys, digest
 
+    async def complete_metadata(self, items):
+        """Batch only genuinely missing public fields; retain folder-specific facts."""
+        missing = {(row.type_name, row.id) for row in items if not row.title or not row.cover}
+        now = self.clock()
+        infos = {}
+        for key in missing:
+            saved = self.metadata.get(key)
+            if saved is None and self.cache is not None:
+                record = self.cache.get("favorite_metadata", f"{key[0]}:{key[1]}", max_age=None)
+                if record is not None:
+                    try:
+                        saved = (
+                            record["checked_at"],
+                            ResourceInfoItem.model_validate(record["info"]),
+                        )
+                        if (saved[1].type_name, saved[1].id) != key:
+                            raise ValueError("Mismatched resource metadata")
+                    except (ValueError, KeyError, TypeError):
+                        saved = None
+            if saved is not None and self._valid_time(saved[0]) and 0 <= now - saved[0] < 600:
+                infos[key] = saved[1]
+        pending = sorted(missing - infos.keys())
+        for start in range(0, len(pending), 20):
+            batch = pending[start : start + 20]
+            rows = await self.fav.resource_infos(
+                resources=",".join(f"{rid}:{kind}" for kind, rid in batch)
+            )
+            keys = [(row.type_name, row.id) for row in rows]
+            if len(set(keys)) != len(keys) or not set(keys) <= set(batch):
+                raise DownloadError("批量资源信息包含重复或不匹配的标识，已保留原缓存")
+            values = {}
+            for row in rows:
+                key = (row.type_name, row.id)
+                infos[key] = row
+                values[("favorite_metadata", f"{key[0]}:{key[1]}")] = {
+                    "checked_at": now,
+                    "info": row.model_dump(mode="json"),
+                }
+            if self.cache is not None:
+                self.cache.put_many(values)
+            self.metadata.update({key: (now, infos[key]) for key in keys})
+        # Missing results can be removed/private videos. Keep their placeholders;
+        # do not infer membership, ordering or fav_time from this aggregate API.
+        return tuple(
+            row.model_copy(
+                update={
+                    "title": row.title or infos[key].title,
+                    "cover": row.cover or infos[key].cover,
+                }
+            )
+            if (key := (row.type_name, row.id)) in infos
+            else row
+            for row in items
+        )
+
     async def open(
         self, folder_id: int, *, force=False, folders=None, folders_at=None
     ) -> FavoriteView:
@@ -258,7 +314,7 @@ class FavoriteLibrary:
         data = await self.fav.list_detail(media_id=folder_id, page=1, page_size=20)
         if data.info.id != folder_id:
             raise DownloadError("收藏夹返回了不同的 ID，未替换已有缓存")
-        page = tuple(data.medias)
+        page = await self.complete_metadata(data.medias)
         unique_items((), page, data.has_more)
         previous = self._state(folder_id)
         keep = (
@@ -314,9 +370,10 @@ class FavoriteLibrary:
                 folders_at=self.folders_at,
             )
         unique_items(state.items, data.medias, data.has_more)
+        page = await self.complete_metadata(data.medias)
         state = replace(
             state,
-            pages=(*state.pages, tuple(data.medias)),
+            pages=(*state.pages, page),
             has_more=data.has_more,
             digest=digest,
         )

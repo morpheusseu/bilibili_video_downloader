@@ -187,6 +187,9 @@ async def test_content_resumes_saved_pages_and_never_scans_on_login(tmp_path):
         assert len(provider.requests) == before + 1
         for kind in ("dynamic", "followings", "history"):
             cached = api.account_content.views[kind]
+            if kind == "followings":
+                assert len(cached.items) == 21 and cached.cached and not cached.has_more
+                continue
             assert len(cached.items) == 20 and cached.cached
             start = len(provider.requests)
             view = await api.read_account_content(kind, more=True)

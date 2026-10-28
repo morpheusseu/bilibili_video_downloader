@@ -15,6 +15,84 @@ def detail_calls(provider):
     return [r for r in provider.requests if r.url.path.endswith("resource/list")]
 
 
+async def test_missing_favorite_metadata_is_batched_and_shared_across_folders_and_restart(tmp_path):
+    provider, state = library_provider(21)
+    provider.cache_root = tmp_path
+    state["folders"].append(dict(state["folders"][0], id=11, fid=11))
+    originals = {row["id"]: dict(row) for row in state["items"]}
+    for row in state["items"]:
+        row.update(cover="", fav_time=1700000000)
+    state["items"][0]["title"] = ""
+    original = provider.handler
+
+    def handler(request):
+        if request.url.path.endswith("resource/infos"):
+            rows = []
+            for resource in request.url.params["resources"].split(","):
+                aid, kind = map(int, resource.split(":"))
+                assert kind == 2
+                rows.append(
+                    {
+                        **originals[aid],
+                        "fav_time": 1,
+                        "cnt_info": {"collect": 0, "play": 0, "danmaku": 0},
+                    }
+                )
+            return response(rows)
+        return original(request)
+
+    provider.handler = handler
+    async with provider.api() as api:
+        await api.use_cookie("SESSDATA=synthetic; DedeUserID=42")
+        first = await api.favorites.refresh(42)
+        assert first.items[0].title == "Synthetic video"
+        assert all(row.cover and row.fav_time == 1700000000 for row in first.items)
+        complete = await api.favorites.more()
+        assert len(complete.items) == 21
+        calls = [r for r in provider.requests if r.url.path.endswith("resource/infos")]
+        assert [len(r.url.params["resources"].split(",")) for r in calls] == [20, 1]
+        await api.favorites.open(11)
+        assert len([r for r in provider.requests if r.url.path.endswith("resource/infos")]) == 2
+    async with provider.api() as api:
+        await api.use_cookie("SESSDATA=synthetic; DedeUserID=42")
+        await api.favorites.refresh(42, force=True)
+        assert len([r for r in provider.requests if r.url.path.endswith("resource/infos")]) == 2
+        assert all(row.cover for row in api.favorites.view.items)
+
+
+@pytest.mark.parametrize("bad", ["mismatch", "refusal", "missing"])
+async def test_batch_metadata_failure_never_replaces_membership_or_retries_per_video(bad):
+    provider, state = library_provider(2)
+    original = provider.handler
+
+    def handler(request):
+        if request.url.path.endswith("resource/infos"):
+            if bad == "refusal":
+                return httpx.Response(412)
+            if bad == "missing":
+                return response([])
+            return response(
+                [{**favorite_item(id=999), "cnt_info": {"collect": 0, "play": 0, "danmaku": 0}}]
+            )
+        return original(request)
+
+    provider.handler = handler
+    async with provider.api() as api:
+        first = await api.favorites.refresh(42)
+        state["items"][0]["cover"] = ""
+        if bad == "missing":
+            updated = await api.favorites.refresh(42, force=True)
+            assert not updated.items[0].cover and updated.items[0].id == first.items[0].id
+        else:
+            with pytest.raises(DownloadError):
+                await api.favorites.refresh(42, force=True)
+            assert api.favorites.view is first
+        assert len([r for r in provider.requests if r.url.path.endswith("resource/infos")]) == 1
+        assert not any(r.url.path.endswith("/view") for r in provider.requests)
+        if bad == "refusal":
+            assert api.gate.stopped
+
+
 async def test_minute_checks_refresh_directory_only_every_ten_minutes_and_force_is_immediate(
     caplog,
 ):

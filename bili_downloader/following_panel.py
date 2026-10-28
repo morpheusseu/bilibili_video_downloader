@@ -1,4 +1,4 @@
-"""Following directory and one explicitly selected creator's cached pages."""
+"""Following directory, collection progress and the selected creator's pages."""
 
 from PyQt5.QtCore import QSize, Qt, pyqtSignal
 from PyQt5.QtGui import QIcon
@@ -32,6 +32,8 @@ class FollowingPanel(QFrame):
     list_requested = pyqtSignal(bool)
     creator_requested = pyqtSignal(object, str, int, bool, bool)
     open_requested = pyqtSignal(str)
+    collect_requested = pyqtSignal()
+    pause_requested = pyqtSignal()
 
     def __init__(self, avatars, images):
         super().__init__()
@@ -39,6 +41,7 @@ class FollowingPanel(QFrame):
         self.avatars, self.images = avatars, images
         self.view, self.creator_view = None, None
         self.busy, self.logged_in, self.page = False, False, 1
+        self.collection, self.collecting = None, False
         layout = QVBoxLayout(self)
         layout.setContentsMargins(24, 20, 24, 20)
         heading = QHBoxLayout()
@@ -51,11 +54,26 @@ class FollowingPanel(QFrame):
         heading.addWidget(self.refresh)
         heading.addWidget(self.more)
         layout.addLayout(heading)
-        self.hint = QLabel("先读取关注名单；选择一位 UP 主才读取其最新一页，不扫描所有关注者。")
+        self.hint = QLabel("关注名单每页 50 人；可分轮收齐所有关注者的最新动态页与投稿页。")
         self.hint.setTextFormat(Qt.PlainText)
         self.hint.setWordWrap(True)
         self.hint.setObjectName("hint")
         layout.addWidget(self.hint)
+        collection_controls = QHBoxLayout()
+        self.collect = QPushButton("采集全部最新页")
+        self.collect.setToolTip(
+            "先收齐关注名单和每人的最新动态/投稿页，再分轮补齐视频互动；不回溯历史。"
+        )
+        self.pause = QPushButton("暂停采集")
+        collection_controls.addWidget(self.collect)
+        collection_controls.addWidget(self.pause)
+        collection_controls.addStretch()
+        layout.addLayout(collection_controls)
+        self.collection_status = QLabel("尚未开始全部采集；随时可暂停，重启后可从保存的进度继续。")
+        self.collection_status.setTextFormat(Qt.PlainText)
+        self.collection_status.setWordWrap(True)
+        self.collection_status.setObjectName("hint")
+        layout.addWidget(self.collection_status)
         self.special_only = QCheckBox("只看特别关注（当前已加载名单）")
         layout.addWidget(self.special_only)
         self.splitter = QSplitter(Qt.Horizontal)
@@ -128,6 +146,8 @@ class FollowingPanel(QFrame):
         layout.addWidget(self.splitter)
         self.refresh.clicked.connect(lambda: self.list_requested.emit(False))
         self.more.clicked.connect(lambda: self.list_requested.emit(True))
+        self.collect.clicked.connect(self.collect_requested.emit)
+        self.pause.clicked.connect(self.pause_requested.emit)
         self.special_only.toggled.connect(self.render_people)
         self.people.itemSelectionChanged.connect(self.select_person)
         self.tabs.currentChanged.connect(self.select_person)
@@ -174,7 +194,7 @@ class FollowingPanel(QFrame):
             self.items.clear()
             self.body.clear()
             self.author.setText("选择一位关注的 UP 主")
-            self.stats.setText("只统计所选 UP 主的当前页；不会批量读取所有关注者。")
+            self.stats.setText("选择 UP 主查看当前页统计；全部采集进度显示在上方。")
         if self.view:
             special = sum(row.special is True for row in self.view.items)
             unknown = sum(row.special is None for row in self.view.items)
@@ -254,8 +274,25 @@ class FollowingPanel(QFrame):
         self.busy, self.logged_in = busy, logged_in
         self.update_controls()
 
+    def show_collection(self, progress, *, running=False):
+        self.collection, self.collecting = progress, running
+        if progress is not None:
+            self.collection_status.setText(
+                progress.notice + (" · 已暂停" if not running and not progress.done else "")
+            )
+        self.collect.setText(
+            "重新采集全部最新页"
+            if progress and progress.done
+            else "继续分轮采集"
+            if progress
+            else "采集全部最新页"
+        )
+        self.update_controls()
+
     def update_controls(self):
         ready = self.logged_in and not self.busy
+        self.collect.setEnabled(ready and not self.collecting)
+        self.pause.setEnabled(self.logged_in and self.collecting)
         target = ready and self.selected() is not None
         self.people.setEnabled(ready)
         self.special_only.setEnabled(ready)
@@ -273,6 +310,8 @@ class FollowingPanel(QFrame):
     def clear(self):
         self.view, self.creator_view, self.page = None, None, 1
         self.special_only.setChecked(False)
+        self.show_collection(None)
+        self.collection_status.setText("尚未开始全部采集；随时可暂停，重启后可从保存的进度继续。")
         self.render_people()
         self.hint.setText("登录后按需读取关注名单。")
         self.set_busy(False, False)

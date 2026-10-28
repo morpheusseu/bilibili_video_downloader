@@ -94,7 +94,8 @@ def content_provider(count=21):
                 }
             )
         if path.endswith("/followings"):
-            assert params["vmid"] == "42" and params["ps"] == "20"
+            size = int(params["ps"])
+            assert params["vmid"] == "42" and size in (20, 50)
             start = (int(params["pn"]) - 1) * size if not state["repeat"] else 0
             return response(
                 {

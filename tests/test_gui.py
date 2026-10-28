@@ -182,6 +182,51 @@ def test_message_avatar_is_at_the_first_line_for_a_tall_message_row(app, window)
     assert red_rows and max(red_rows) < 45
 
 
+@pytest.mark.parametrize("window", [lambda: creator_provider(3)], indirect=True)
+def test_following_collection_rounds_can_pause_resume_and_publish_complete_views(
+    app, window, monkeypatch, tmp_path
+):
+    widget, provider = window
+    widget.engine.api.cache_root = tmp_path
+    monkeypatch.setattr(gui.QApplication, "applicationState", lambda: Qt.ApplicationActive)
+    widget.following_timer.setInterval(1)
+    widget.launch(lambda api: api.use_cookie("SESSDATA=synthetic; DedeUserID=42"))
+    wait_for(app, lambda: not widget.busy and bool(widget._library_view.items))
+    widget.following_toggle.click()
+    panel = widget.following_panel
+    wait_for(app, lambda: not widget.busy and panel.view is not None)
+    panel.special_only.setChecked(True)
+    panel.people.setCurrentItem(panel.people.topLevelItem(0))
+    wait_for(app, lambda: not widget.busy and panel.creator_view is not None)
+    panel.tabs.setCurrentIndex(1)
+    wait_for(app, lambda: not widget.busy and panel.creator_view.kind == "videos")
+    provider.creator_state["videos"].insert(
+        0, dict(provider.creator_state["videos"][0], aid=4, bvid="BV0000000004")
+    )
+    provider.creator_state["states"][4] = {"like": True, "coin": 1}
+    panel.collect.click()
+    wait_for(app, lambda: panel.collection is not None and panel.collection.content_done >= 2)
+    panel.pause.click()
+    wait_for(app, lambda: not widget.busy)
+    paused = panel.collection
+    assert paused is not None and not paused.done and not widget._following_collecting
+    before = len(provider.requests)
+    QTest.qWait(30)
+    app.processEvents()
+    assert len(provider.requests) == before
+    panel.collect.click()
+    wait_for(app, lambda: not widget.busy and panel.collection.done)
+    panel.special_only.setChecked(False)
+    assert panel.people.topLevelItemCount() == 21
+    assert panel.collection.content_done == 42
+    assert panel.collection.interactions_done == 4
+    assert len(panel.creator_view.entries) == 4
+    assert panel.creator_view.entries[0].liked and panel.creator_view.entries[0].coined
+    assert "采集完成" in panel.collection_status.text() and not panel.pause.isEnabled()
+    assert not widget._following_collecting
+    assert all(r.method == "GET" for r in provider.requests)
+
+
 @pytest.mark.parametrize("window", [creator_provider], indirect=True)
 def test_following_directory_special_filter_creator_pages_and_stats_use_the_real_worker(
     app, window
@@ -192,7 +237,7 @@ def test_following_directory_special_filter_creator_pages_and_stats_use_the_real
     assert widget.following_toggle.isEnabled() and not widget.following_toggle.icon().isNull()
     widget.following_toggle.click()
     panel = widget.following_panel
-    wait_for(app, lambda: not widget.busy and panel.people.topLevelItemCount() == 20)
+    wait_for(app, lambda: not widget.busy and panel.people.topLevelItemCount() == 21)
     assert panel.isVisible() and widget.content_panel.isHidden()
     assert not any("host_mid" in r.url.params for r in provider.requests)
     assert not any(r.url.path.endswith("/archive/relation") for r in provider.requests)
@@ -210,7 +255,8 @@ def test_following_directory_special_filter_creator_pages_and_stats_use_the_real
     assert "合成投稿" in panel.body.toPlainText()
     panel.next.click()
     wait_for(
-        app, lambda: not widget.busy and panel.page == 2 and panel.items.topLevelItemCount() == 11
+        app,
+        lambda: not widget.busy and panel.page == 2 and panel.items.topLevelItemCount() == 11,
     )
     assert not panel.next.isEnabled() and panel.previous.isEnabled()
     before = len(provider.requests)

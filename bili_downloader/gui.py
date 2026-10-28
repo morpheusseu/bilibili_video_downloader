@@ -62,6 +62,7 @@ from .browser_login import chrome_login
 from .creator_content import CreatorView
 from .download import Progress, download_source
 from .download_button import DownloadButton
+from .following_collection import FollowingProgress
 from .following_panel import FollowingPanel
 from .inbox import InboxView, MessageView, SendReceipt, validate_reply
 from .inbox_panel import InboxPanel
@@ -85,6 +86,7 @@ class Engine(QThread):
     inbox_status = pyqtSignal(object, object)
     library_updated = pyqtSignal(object, object)
     creator_updated = pyqtSignal(object, object)
+    collection_updated = pyqtSignal(object, object, object, object)
 
     def __init__(self, parent=None, api_factory: Callable | None = None):
         super().__init__(parent)
@@ -232,8 +234,10 @@ class MainWindow(QMainWindow):
         self.engine.inbox_status.connect(self.show_live_status)
         self.engine.library_updated.connect(self.show_cached_library)
         self.engine.creator_updated.connect(self.show_creator)
+        self.engine.collection_updated.connect(self.show_collection)
         self.engine.start()
         self.busy = False
+        self._following_collecting = False
         self._session_mid = None
         self._session = None
         self._live_kind = None
@@ -376,7 +380,10 @@ class MainWindow(QMainWindow):
         self.inbox_panel = InboxPanel(self.avatar_for, self.pixmap_for)
         self.inbox_panel.hide()
         body_layout.addWidget(self.inbox_panel)
-        self.inbox_host, self.inbox_slot = body_layout, body_layout.indexOf(self.inbox_panel)
+        self.inbox_host, self.inbox_slot = (
+            body_layout,
+            body_layout.indexOf(self.inbox_panel),
+        )
         self.inbox_dialog = QDialog(self, Qt.Window)
         self.inbox_dialog.setWindowTitle("私信 · Bilibili")
         self.inbox_dialog.setMinimumSize(820, 600)
@@ -394,6 +401,8 @@ class MainWindow(QMainWindow):
         self.following_panel.list_requested.connect(self.load_followings)
         self.following_panel.creator_requested.connect(self.load_creator)
         self.following_panel.open_requested.connect(lambda url: QDesktopServices.openUrl(QUrl(url)))
+        self.following_panel.collect_requested.connect(self.start_following_collection)
+        self.following_panel.pause_requested.connect(self.pause_following_collection)
 
         source_box, source_layout = self.section("内容来源", "01")
         form = QFormLayout()
@@ -622,6 +631,10 @@ class MainWindow(QMainWindow):
         self.content_timer.setInterval(60000)
         self.content_timer.timeout.connect(self.check_account_content)
         self.content_timer.start()
+        self.following_timer = QTimer(self)
+        self.following_timer.setSingleShot(True)
+        self.following_timer.setInterval(1500)
+        self.following_timer.timeout.connect(self.run_following_round)
         self.mode_changed()
 
     @staticmethod
@@ -736,7 +749,7 @@ class MainWindow(QMainWindow):
         self.launch(
             lambda api: api.read_account_content("followings", more=more),
             "正在读取关注名单",
-            "只读当前页，特别关注使用平台字段，不扫描全部关注者。",
+            "每页最多 50 人，特别关注使用平台字段；可分轮采集全部关注者的最新页。",
             kind="following",
         )
 
@@ -761,6 +774,74 @@ class MainWindow(QMainWindow):
         if owner is self._session:
             self.following_panel.show_creator(view)
             self.artwork_timer.start()
+
+    def start_following_collection(self):
+        if self.busy or self._session is None:
+            return
+        self._following_collecting = True
+        progress = self.following_panel.collection
+        self.following_panel.show_collection(progress, running=True)
+        self.run_following_round()
+
+    def pause_following_collection(self):
+        self._following_collecting = False
+        self.following_timer.stop()
+        self.following_panel.show_collection(self.following_panel.collection)
+        if self._job == "following_collection":
+            self.engine.cancel()
+
+    def run_following_round(self):
+        if not self._following_collecting or self._session is None or self.engine.closing:
+            return
+        if (
+            self.busy
+            or not self.following_panel.isVisible()
+            or self.isMinimized()
+            or QApplication.applicationState() != Qt.ApplicationActive
+        ):
+            self.following_timer.start()
+            return
+        progress = self.following_panel.collection
+        restart = bool(progress and progress.done)
+        mid, kind, page = (
+            self.following_panel.selected(),
+            self.following_panel.kind,
+            self.following_panel.page,
+        )
+
+        async def operation(api):
+            def publish(owner, progress):
+                # Resolve lazy SQLite-backed views in their owning worker,
+                # then send immutable presentation values to Qt's UI thread.
+                view = api.creator_content.cached_view(mid, kind, page) if mid is not None else None
+                self.engine.collection_updated.emit(
+                    owner,
+                    progress,
+                    api.account_content.views.get("followings"),
+                    view,
+                )
+
+            return await api.collect_followings(restart=restart, on_update=publish)
+
+        self.launch(
+            operation,
+            "正在分轮采集关注内容",
+            "每轮最多 6 项；先收齐最新内容，再补视频互动，已完成部分保存，可暂停。",
+            kind="following_collection",
+        )
+
+    def show_collection(self, owner, progress, directory=None, creator=None):
+        if owner is not self._session:
+            return
+        if progress.done:
+            self._following_collecting = False
+        panel = self.following_panel
+        panel.show_collection(progress, running=self._following_collecting)
+        if directory is not None and panel.view is not directory:
+            panel.show_followings(directory)
+        if creator is not None:
+            panel.show_creator(creator)
+        self.status.setText(progress.notice)
 
     def toggle_account_content(self, visible):
         self.content_panel.setVisible(visible)
@@ -1257,7 +1338,7 @@ class MainWindow(QMainWindow):
         if kind == "login":
             self.account_dialog.status.setText(note)
         self.details.set_progress(kind == "download")
-        if kind not in {"library", "content", "following"}:
+        if kind not in {"library", "content", "following", "following_collection"}:
             self.details.setChecked(True)
         self.task_title.setText(title)
         self.status.setText(note)
@@ -1279,8 +1360,13 @@ class MainWindow(QMainWindow):
             self._pending_library = False
             QTimer.singleShot(0, self.load_library)
         self.artwork_timer.start()
+        if self._following_collecting:
+            self.following_timer.start()
 
     def show_error(self, text):
+        if self._job == "following_collection":
+            self.pause_following_collection()
+            self.following_panel.collection_status.setText(text + "；采集已暂停，已完成部分保存。")
         self.details.setChecked(True)
         if self._job == "login":
             self.account_dialog.status.setText(text)
@@ -1302,6 +1388,8 @@ class MainWindow(QMainWindow):
         self.log.appendPlainText(text)
 
     def show_cancelled(self):
+        if self._job == "following_collection":
+            self.pause_following_collection()
         self.details.setChecked(True)
         if self._job == "login":
             self.account_dialog.status.setText("登录已取消；没有保存新的凭证。")
@@ -1346,6 +1434,7 @@ class MainWindow(QMainWindow):
     def show_session(self, session):
         mid = session.mid if session else None
         if session is not self._session:
+            self.pause_following_collection()
             self._library_view = FavoriteView()
             self.folders.blockSignals(True)
             self.folders.clear()
@@ -1363,6 +1452,9 @@ class MainWindow(QMainWindow):
                 self.inbox_dialog.hide()
                 self.embed_inbox(show=False)
             if session is not None:
+                self.following_panel.show_collection(
+                    self.engine.api.following_collection.progress()
+                )
                 for view in tuple(self.engine.api.account_content.views.values()):
                     if view.kind == "followings":
                         self.following_panel.show_followings(view)
@@ -1449,6 +1541,8 @@ class MainWindow(QMainWindow):
             self.status.setText(
                 f"已读取第 {result.page} 页 · {len(result.entries)} 条；" + result.notice
             )
+        elif isinstance(result, FollowingProgress):
+            self.show_collection(self._session, result)
         elif isinstance(result, InboxView):
             self.task_title.setText("私信会话已读取")
             self.inbox_panel.show_inbox(result, self._session_mid)

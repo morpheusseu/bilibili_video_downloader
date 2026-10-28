@@ -1,4 +1,4 @@
-"""One plain-text, read-only browser for account feed, followings and history."""
+"""Plain-text, read-only unified feed and history; followings have their own panel."""
 
 from PyQt5.QtCore import QSize, Qt, pyqtSignal
 from PyQt5.QtGui import QIcon
@@ -16,7 +16,7 @@ from PyQt5.QtWidgets import (
     QVBoxLayout,
 )
 
-from .account_content import KINDS, TITLES
+from .account_content import TITLES
 
 
 class AccountContentPanel(QFrame):
@@ -28,6 +28,7 @@ class AccountContentPanel(QFrame):
         super().__init__()
         self.setObjectName("card")
         self.avatars, self.images = avatars, images
+        self.kinds = ("dynamic", "history")
         self.views = {}
         self.busy, self.logged_in = False, False
         layout = QVBoxLayout(self)
@@ -35,7 +36,7 @@ class AccountContentPanel(QFrame):
         heading = QHBoxLayout()
         self.tabs = QTabBar()
         self.tabs.setAccessibleName("账号内容类别")
-        for kind in KINDS:
+        for kind in self.kinds:
             self.tabs.addTab(TITLES[kind])
         heading.addWidget(self.tabs, 1)
         self.refresh = QPushButton("刷新")
@@ -81,7 +82,7 @@ class AccountContentPanel(QFrame):
 
     @property
     def kind(self):
-        return KINDS[self.tabs.currentIndex()]
+        return self.kinds[self.tabs.currentIndex()]
 
     def change_tab(self):
         self.render()

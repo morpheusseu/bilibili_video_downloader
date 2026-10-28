@@ -22,6 +22,42 @@ class ContentItem:
     image_role: str
     url: str = ""
     image: str = ""
+    special: bool | None = None
+
+    @classmethod
+    def from_record(cls, record):
+        # Earlier saved display rows have no special-follow field: unknown,
+        # never silently reclassify them as ordinary follows.
+        row = cls(**record)
+        if (
+            any(
+                not isinstance(getattr(row, key), str)
+                for key in (
+                    "key",
+                    "title",
+                    "summary",
+                    "body",
+                    "image_role",
+                    "url",
+                    "image",
+                )
+            )
+            or row.image_role not in {"avatar", "cover"}
+            or (row.special is not None and type(row.special) is not bool)
+            or (
+                row.url
+                and not row.url.startswith(
+                    (
+                        "https://t.bilibili.com/",
+                        "https://space.bilibili.com/",
+                        "https://www.bilibili.com/",
+                        "https://live.bilibili.com/",
+                    )
+                )
+            )
+        ):
+            raise ValueError("Invalid saved display row")
+        return row
 
 
 @dataclass(frozen=True)
@@ -173,6 +209,12 @@ def following_item(user):
     if user.mid <= 0:
         raise DownloadError("关注列表返回无效 UID，已保留原列表")
     name = user.name or f"UID {user.mid}"
+    special = (
+        user.special == 1 or -10 in (user.tag or ())
+        if {"special", "tag"} & user.model_fields_set
+        else None
+    )
+    relation = "特别关注" if special else "普通关注" if special is False else "特别关注状态未核验"
     body = "\n\n".join(
         filter(
             None,
@@ -181,6 +223,7 @@ def following_item(user):
                 user.sign,
                 user.official_verify.desc if user.official_verify else "",
                 "关注关系修改时间：" + local_time(user.mtime),
+                relation,
                 "仅展示平台返回的关注关系；不据此推断私信权限或全局联系人。",
             ),
         )
@@ -188,11 +231,12 @@ def following_item(user):
     return ContentItem(
         str(user.mid),
         name,
-        f"UID {user.mid}",
+        f"{relation} · UID {user.mid}",
         body,
         image_role="avatar",
         url=f"https://space.bilibili.com/{user.mid}",
         image=user.face,
+        special=special,
     )
 
 
@@ -259,24 +303,11 @@ class AccountContent:
                 saved = cache.get("content", kind)
                 if saved is not None:
                     try:
-                        rows = tuple(ContentItem(**item) for item in saved["items"])
-                        if len(rows) > 200 or any(
-                            not all(isinstance(value, str) for value in asdict(row).values())
-                            or row.image_role not in {"avatar", "cover"}
-                            for row in rows
+                        rows = tuple(ContentItem.from_record(item) for item in saved["items"])
+                        if len(rows) > 200 or (
+                            kind == "followings" and any(not row.key.isdecimal() for row in rows)
                         ):
                             raise ValueError("Invalid content cache")
-                        # Cached links remain restricted to canonical provider origins.
-                        for row in rows:
-                            if row.url and not row.url.startswith(
-                                (
-                                    "https://t.bilibili.com/",
-                                    "https://space.bilibili.com/",
-                                    "https://www.bilibili.com/",
-                                    "https://live.bilibili.com/",
-                                )
-                            ):
-                                raise ValueError("Invalid cached target")
                         view = ContentView(
                             kind, rows, bool(saved["has_more"]), saved["notice"], True
                         )

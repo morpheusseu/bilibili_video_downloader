@@ -75,6 +75,7 @@ class InboxPanel(QFrame):
     send_requested = pyqtSignal(object, str)
     reconcile_requested = pyqtSignal()
     reconnect_requested = pyqtSignal()
+    expand_requested = pyqtSignal()
 
     def __init__(self, avatars, images):
         super().__init__()
@@ -90,6 +91,7 @@ class InboxPanel(QFrame):
         self.drafts = {}
         self.draft_talker = None
         self.live_kind = "idle"
+        self.expanded = False
         layout = QVBoxLayout(self)
         layout.setContentsMargins(24, 20, 24, 20)
         heading = QHBoxLayout()
@@ -101,6 +103,12 @@ class InboxPanel(QFrame):
         self.set_connection_indicator("idle", "未连接实时私信")
         heading.addWidget(self.connection_dot)
         heading.addStretch()
+        self.expand = QPushButton("↗")
+        self.expand.setObjectName("link")
+        self.expand.setFixedWidth(36)
+        self.expand.setAccessibleName("在独立窗口打开私信")
+        self.expand.setToolTip("扩大私信，在独立窗口查看会话与消息")
+        heading.addWidget(self.expand)
         self.refresh = QPushButton("刷新会话")
         self.more = QPushButton("更多会话")
         self.reconnect = QPushButton("恢复实时连接")
@@ -179,10 +187,11 @@ class InboxPanel(QFrame):
         splitter.addWidget(history)
         splitter.setSizes([320, 360])
         self.set_compact(False)
-        layout.addWidget(splitter)
+        layout.addWidget(splitter, 1)
         self.refresh.clicked.connect(self.refresh_requested)
         self.more.clicked.connect(self.more_requested)
         self.reconnect.clicked.connect(self.reconnect_requested)
+        self.expand.clicked.connect(self.expand_requested)
         self.sessions.itemSelectionChanged.connect(self.selection_changed)
         self.refresh_thread.clicked.connect(lambda: self.open_requested.emit(self.selected(), True))
         self.older.clicked.connect(self.older_requested)
@@ -194,8 +203,15 @@ class InboxPanel(QFrame):
 
     def set_compact(self, compact):
         # QSplitter derives its cross-axis maximum from its children.
-        self.message_pane.setMaximumHeight(300 if compact else 440)
+        self.message_pane.setMaximumHeight(16777215 if self.expanded else 300 if compact else 440)
         self.splitter.setMinimumHeight(270 if compact else 340)
+
+    def set_expanded(self, expanded):
+        self.expanded = expanded
+        self.expand.setText("↙" if expanded else "↗")
+        self.expand.setAccessibleName("返回主窗口私信" if expanded else "在独立窗口打开私信")
+        self.expand.setToolTip("返回主窗口" if expanded else "扩大私信，在独立窗口查看会话与消息")
+        self.set_compact(not expanded and self.window().height() < 760)
 
     def selected(self):
         item = self.sessions.currentItem()

@@ -88,11 +88,13 @@ STYLE = Template("""
         min-width: 42px; max-width: 42px; min-height: 42px; max-height: 42px; }
     QPushButton#favoritesStar:checked { background: $parchment; border: 1px solid $hairline; }
     QPushButton#favoritesStar:focus { border: 1px solid $focus; }
-    QPushButton#inboxMail { background: transparent; border: 1px solid transparent;
+    QPushButton#inboxMail, QPushButton#followingPeople {
+        background: transparent; border: 1px solid transparent;
         border-radius: 22px; padding: 0;
         min-width: 42px; max-width: 42px; min-height: 42px; max-height: 42px; }
-    QPushButton#inboxMail:checked { background: $parchment; border: 1px solid $hairline; }
-    QPushButton#inboxMail:focus { border: 1px solid $focus; }
+    QPushButton#inboxMail:checked, QPushButton#followingPeople:checked {
+        background: $parchment; border: 1px solid $hairline; }
+    QPushButton#inboxMail:focus, QPushButton#followingPeople:focus { border: 1px solid $focus; }
     QPushButton#downloadDetails { padding: 0; border: none;
         min-width: 56px; max-width: 56px; min-height: 56px; max-height: 56px; }
     QCheckBox { spacing: 8px; min-height: 26px; }

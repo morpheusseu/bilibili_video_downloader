@@ -30,6 +30,7 @@ from PyQt5.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
     QFileDialog,
     QFormLayout,
     QFrame,
@@ -58,8 +59,10 @@ from .api import Bilibili, safe_error
 from .artwork import avatar_icon, decode_image
 from .auth import Session, forget_session, load_session, save_session
 from .browser_login import chrome_login
+from .creator_content import CreatorView
 from .download import Progress, download_source
 from .download_button import DownloadButton
+from .following_panel import FollowingPanel
 from .inbox import InboxView, MessageView, SendReceipt, validate_reply
 from .inbox_panel import InboxPanel
 from .library import FavoriteView
@@ -81,6 +84,7 @@ class Engine(QThread):
     inbox_updated = pyqtSignal(object, object, object, int)
     inbox_status = pyqtSignal(object, object)
     library_updated = pyqtSignal(object, object)
+    creator_updated = pyqtSignal(object, object)
 
     def __init__(self, parent=None, api_factory: Callable | None = None):
         super().__init__(parent)
@@ -227,6 +231,7 @@ class MainWindow(QMainWindow):
         self.engine.inbox_updated.connect(self.show_live_inbox)
         self.engine.inbox_status.connect(self.show_live_status)
         self.engine.library_updated.connect(self.show_cached_library)
+        self.engine.creator_updated.connect(self.show_creator)
         self.engine.start()
         self.busy = False
         self._session_mid = None
@@ -263,11 +268,21 @@ class MainWindow(QMainWindow):
         self.content_toggle = QPushButton("浏览")
         self.content_toggle.setObjectName("link")
         self.content_toggle.setFixedHeight(44)
-        self.content_toggle.setAccessibleName("关注动态、关注列表与观看历史")
-        self.content_toggle.setToolTip("关注动态 · 关注的人 · 观看历史（只读）")
+        self.content_toggle.setAccessibleName("关注动态与观看历史")
+        self.content_toggle.setToolTip("统一关注动态 · 观看历史（只读）")
         self.content_toggle.setCheckable(True)
         self.content_toggle.setEnabled(False)
         header_layout.addWidget(self.content_toggle)
+        self.following_toggle = QPushButton()
+        self.following_toggle.setObjectName("followingPeople")
+        self.following_toggle.setIcon(QIcon(str(Path(__file__).with_name("following.svg"))))
+        self.following_toggle.setIconSize(QSize(28, 28))
+        self.following_toggle.setFixedSize(44, 44)
+        self.following_toggle.setAccessibleName("关注的人")
+        self.following_toggle.setToolTip("关注的人 · 特别关注 · 所选 UP 主的动态与投稿")
+        self.following_toggle.setCheckable(True)
+        self.following_toggle.setEnabled(False)
+        header_layout.addWidget(self.following_toggle)
         self.library_toggle = QPushButton()
         self.library_toggle.setObjectName("favoritesStar")
         star_path = str(Path(__file__).with_name("star.svg"))
@@ -361,9 +376,24 @@ class MainWindow(QMainWindow):
         self.inbox_panel = InboxPanel(self.avatar_for, self.pixmap_for)
         self.inbox_panel.hide()
         body_layout.addWidget(self.inbox_panel)
+        self.inbox_host, self.inbox_slot = body_layout, body_layout.indexOf(self.inbox_panel)
+        self.inbox_dialog = QDialog(self, Qt.Window)
+        self.inbox_dialog.setWindowTitle("私信 · Bilibili")
+        self.inbox_dialog.setMinimumSize(820, 600)
+        self.inbox_dialog.resize(1120, 780)
+        QVBoxLayout(self.inbox_dialog).setContentsMargins(0, 0, 0, 0)
+        self.inbox_dialog.finished.connect(self.embed_inbox)
+        self.inbox_panel.expand_requested.connect(self.toggle_inbox_window)
         self.content_panel = AccountContentPanel(self.avatar_for, self.pixmap_for)
         self.content_panel.hide()
         body_layout.addWidget(self.content_panel)
+        self.following_panel = FollowingPanel(self.avatar_for, self.pixmap_for)
+        self.following_panel.hide()
+        body_layout.addWidget(self.following_panel)
+        self.following_toggle.toggled.connect(self.toggle_followings)
+        self.following_panel.list_requested.connect(self.load_followings)
+        self.following_panel.creator_requested.connect(self.load_creator)
+        self.following_panel.open_requested.connect(lambda url: QDesktopServices.openUrl(QUrl(url)))
 
         source_box, source_layout = self.section("内容来源", "01")
         form = QFormLayout()
@@ -638,30 +668,121 @@ class MainWindow(QMainWindow):
         if visible:
             self.inbox_toggle.setChecked(False)
             self.content_toggle.setChecked(False)
+            self.following_toggle.setChecked(False)
             self.scroll.verticalScrollBar().setValue(0)
             if self._session_mid and not self._library_view.folders:
                 self.load_library()
             self.artwork_timer.start()
 
     def toggle_inbox(self, visible):
+        if self.inbox_dialog.isVisible():
+            if visible:
+                self.inbox_dialog.raise_()
+                self.inbox_dialog.activateWindow()
+                self.inbox_toggle.blockSignals(True)
+                self.inbox_toggle.setChecked(False)
+                self.inbox_toggle.blockSignals(False)
+            return
         self.inbox_panel.setVisible(visible)
-        self.intro.setVisible(not (visible or self.content_toggle.isChecked()))
+        self.update_intro()
         if visible:
             self.library_toggle.setChecked(False)
             self.content_toggle.setChecked(False)
+            self.following_toggle.setChecked(False)
             self.scroll.verticalScrollBar().setValue(0)
             if self._session_mid and self.inbox_panel.view is None:
                 self.load_inbox()
             self.artwork_timer.start()
 
-    def toggle_account_content(self, visible):
-        self.content_panel.setVisible(visible)
-        self.intro.setVisible(not (visible or self.inbox_toggle.isChecked()))
+    def toggle_inbox_window(self):
+        if self.inbox_dialog.isVisible():
+            self.inbox_dialog.close()
+            return
+        self.inbox_toggle.setChecked(False)
+        self.inbox_dialog.layout().addWidget(self.inbox_panel)
+        self.inbox_panel.set_expanded(True)
+        self.inbox_panel.show()
+        self.inbox_dialog.show()
+        self.inbox_dialog.raise_()
+        self.inbox_dialog.activateWindow()
+        self.artwork_timer.start()
+
+    def embed_inbox(self, *_, show=True):
+        self.inbox_dialog.layout().removeWidget(self.inbox_panel)
+        self.inbox_host.insertWidget(self.inbox_slot, self.inbox_panel)
+        self.inbox_panel.set_expanded(False)
+        self.inbox_panel.hide()
+        if show and self._session is not None and not self.engine.closing:
+            self.inbox_toggle.setChecked(True)
+
+    def toggle_followings(self, visible):
+        self.following_panel.setVisible(visible)
+        self.update_intro()
         if visible:
             self.library_toggle.setChecked(False)
             self.inbox_toggle.setChecked(False)
+            self.content_toggle.setChecked(False)
+            self.scroll.verticalScrollBar().setValue(0)
+            view = self.following_panel.view
+            if self._session_mid and (
+                view is None or any(row.special is None for row in view.items)
+            ):
+                self.load_followings()
+            self.artwork_timer.start()
+
+    def load_followings(self, more=False):
+        if self.busy or self._session_mid is None:
+            return
+        self.launch(
+            lambda api: api.read_account_content("followings", more=more),
+            "正在读取关注名单",
+            "只读当前页，特别关注使用平台字段，不扫描全部关注者。",
+            kind="following",
+        )
+
+    def load_creator(self, mid, kind, page, refresh=False, verify=False):
+        if self.busy or self._session_mid is None:
+            return
+        self.launch(
+            lambda api: api.read_creator(
+                mid,
+                kind,
+                page,
+                refresh=refresh,
+                verify=verify,
+                on_update=self.engine.creator_updated.emit,
+            ),
+            "正在读取所选 UP 主",
+            "先显示已保存页面；视频互动按请求间隔逐条核验，可取消。",
+            kind="following",
+        )
+
+    def show_creator(self, owner, view):
+        if owner is self._session:
+            self.following_panel.show_creator(view)
+            self.artwork_timer.start()
+
+    def toggle_account_content(self, visible):
+        self.content_panel.setVisible(visible)
+        self.update_intro()
+        if visible:
+            self.library_toggle.setChecked(False)
+            self.inbox_toggle.setChecked(False)
+            self.following_toggle.setChecked(False)
             self.scroll.verticalScrollBar().setValue(0)
             self.account_content_tab_changed()
+
+    def update_intro(self):
+        self.intro.setVisible(
+            not any(
+                toggle.isChecked()
+                for toggle in (
+                    self.inbox_toggle,
+                    self.content_toggle,
+                    self.following_toggle,
+                )
+            )
+        )
 
     def account_content_tab_changed(self):
         if (
@@ -1003,7 +1124,10 @@ class MainWindow(QMainWindow):
             or self._artwork_pending
             or self._artwork_paused
             or self._session_mid is None
-            or self.isMinimized()
+            or (
+                self.isMinimized()
+                and not (self.inbox_dialog.isVisible() and not self.inbox_dialog.isMinimized())
+            )
             or QApplication.applicationState() != Qt.ApplicationActive
         ):
             self._flush_artwork_hits()
@@ -1011,6 +1135,8 @@ class MainWindow(QMainWindow):
         urls = self.inbox_panel.visible_artwork_urls() if self.inbox_panel.isVisible() else []
         if self.content_panel.isVisible():
             urls.extend(self.content_panel.visible_artwork_urls())
+        if self.following_panel.isVisible():
+            urls.extend(self.following_panel.visible_artwork_urls())
         if self.library_panel.isVisible():
             visible = self.favorite_items.viewport().visibleRegion()
             for index in range(self.favorite_items.topLevelItemCount()):
@@ -1049,6 +1175,7 @@ class MainWindow(QMainWindow):
             self.inbox_panel.update_artwork(url)
             if not pixmap.isNull():
                 self.content_panel.update_artwork(url)
+        self.following_panel.update_artwork(url)
         self.artwork_timer.start()
 
     def _cache_artwork(self, url, pixmap):
@@ -1112,6 +1239,8 @@ class MainWindow(QMainWindow):
         self.inbox_panel.set_busy(busy, self._session_mid is not None)
         self.content_toggle.setEnabled(not busy and self._session_mid is not None)
         self.content_panel.set_busy(busy, self._session_mid is not None)
+        self.following_toggle.setEnabled(not busy and self._session_mid is not None)
+        self.following_panel.set_busy(busy, self._session_mid is not None)
 
     def launch(
         self,
@@ -1128,7 +1257,7 @@ class MainWindow(QMainWindow):
         if kind == "login":
             self.account_dialog.status.setText(note)
         self.details.set_progress(kind == "download")
-        if kind not in {"library", "content"}:
+        if kind not in {"library", "content", "following"}:
             self.details.setChecked(True)
         self.task_title.setText(title)
         self.status.setText(note)
@@ -1164,6 +1293,8 @@ class MainWindow(QMainWindow):
         if self._job == "content":
             self.content_panel.auto.setChecked(False)
             self.content_panel.hint.setText(f"{text}；自动检查已暂停，已加载内容保留。")
+        if self._job == "following":
+            self.following_panel.notice.setText(f"{text}；已加载页面与已核验互动保留，可手动继续。")
         self.task_title.setText("未能完成")
         self.status.setText(text)
         self.bar.setRange(0, 100)
@@ -1227,15 +1358,23 @@ class MainWindow(QMainWindow):
             self._artwork_paused = False
             self.inbox_panel.clear()
             self.content_panel.clear()
+            self.following_panel.clear()
+            if self.inbox_dialog.isVisible():
+                self.inbox_dialog.hide()
+                self.embed_inbox(show=False)
             if session is not None:
                 for view in tuple(self.engine.api.account_content.views.values()):
-                    self.content_panel.show_view(view)
+                    if view.kind == "followings":
+                        self.following_panel.show_followings(view)
+                    else:
+                        self.content_panel.show_view(view)
             self._live_kind = None
         self._session = session
         self._session_mid = mid
         self.library_toggle.setEnabled(session is not None)
         self.inbox_toggle.setEnabled(session is not None)
         self.content_toggle.setEnabled(session is not None and not self.busy)
+        self.following_toggle.setEnabled(session is not None and not self.busy)
         self.identity.setText(
             self.identity.fontMetrics().elidedText(session.name, Qt.ElideRight, 200)
             if session
@@ -1248,9 +1387,11 @@ class MainWindow(QMainWindow):
             self.library_toggle.setChecked(False)
             self.inbox_toggle.setChecked(False)
             self.content_toggle.setChecked(False)
+            self.following_toggle.setChecked(False)
         self.library_controls()
         self.inbox_panel.set_busy(self.busy, session is not None)
         self.content_panel.set_busy(self.busy, session is not None)
+        self.following_panel.set_busy(self.busy, session is not None)
         self.account_dialog.identity.setText(
             f"{session.name} · UID {session.mid}"
             if session
@@ -1297,9 +1438,17 @@ class MainWindow(QMainWindow):
             self.task_title.setText("收藏夹已检查")
             self.show_library(result)
         elif isinstance(result, ContentView):
-            self.content_panel.show_view(result)
+            if result.kind == "followings":
+                self.following_panel.show_followings(result)
+            else:
+                self.content_panel.show_view(result)
             self.task_title.setText(TITLES[result.kind] + "已读取")
             self.status.setText(f"已加载 {len(result.items)} 项；" + result.notice)
+        elif isinstance(result, CreatorView):
+            self.following_panel.show_creator(result)
+            self.status.setText(
+                f"已读取第 {result.page} 页 · {len(result.entries)} 条；" + result.notice
+            )
         elif isinstance(result, InboxView):
             self.task_title.setText("私信会话已读取")
             self.inbox_panel.show_inbox(result, self._session_mid)
@@ -1506,6 +1655,7 @@ class MainWindow(QMainWindow):
         self.content_timer.stop()
         self.activity_timer.stop()
         self.account_dialog.hide()
+        self.inbox_dialog.hide()
         if self.engine.shutdown():
             event.accept()
         else:

@@ -17,10 +17,11 @@ from conftest import (
     library_provider,
     private_message,
 )
-from PyQt5.QtCore import QSize, Qt, QTimer
-from PyQt5.QtGui import QInputMethodEvent, QPalette, QPixmap
+from creator_provider import creator_provider
+from PyQt5.QtCore import QRect, QSize, Qt, QTimer
+from PyQt5.QtGui import QColor, QIcon, QInputMethodEvent, QPainter, QPalette, QPixmap
 from PyQt5.QtTest import QTest
-from PyQt5.QtWidgets import QApplication, QMessageBox
+from PyQt5.QtWidgets import QApplication, QMessageBox, QStyleOptionViewItem
 from websockets.exceptions import ConnectionClosedError
 
 from bili_downloader import gui
@@ -120,6 +121,123 @@ def test_profile_renders_from_login_memory_without_fetching_again(app, window):
     assert widget.account_toggle.text() == "登录" and widget.account_toggle.icon().isNull()
     widget.account_toggle.click()
     assert widget.account_dialog.isVisible() and not provider.requests
+
+
+@pytest.mark.parametrize("window", [lambda: inbox_provider()[0]], indirect=True)
+def test_inbox_popout_reuses_the_same_conversation_and_draft_without_requests(app, window):
+    widget, provider = window
+    open_test_inbox(widget, app)
+    panel = widget.inbox_panel
+    panel.reply.setPlainText("浮窗草稿，不发送")
+    original = history_text(panel)
+    selected, before = panel.selected(), len(provider.requests)
+    panel.expand.click()
+    app.processEvents()
+    assert widget.inbox_dialog.isVisible() and widget.inbox_panel is panel
+    assert panel.parentWidget() is widget.inbox_dialog
+    assert panel.reply.toPlainText() == "浮窗草稿，不发送" and panel.selected() == selected
+    assert panel.message_pane.height() > 440, (
+        widget.inbox_dialog.size(),
+        panel.size(),
+        panel.splitter.size(),
+        panel.message_pane.maximumHeight(),
+    )
+    assert panel.expand.accessibleName() == "返回主窗口私信"
+    assert len(provider.requests) == before
+    widget.inbox_dialog.close()
+    app.processEvents()
+    assert not widget.inbox_dialog.isVisible() and widget.inbox_toggle.isChecked()
+    assert history_text(panel) == original and panel.reply.toPlainText() == "浮窗草稿，不发送"
+    assert len(provider.requests) == before
+
+
+@pytest.mark.parametrize("window", [lambda: inbox_provider()[0]], indirect=True)
+def test_message_avatar_is_at_the_first_line_for_a_tall_message_row(app, window):
+    widget, _ = window
+    open_test_inbox(widget, app)
+    panel = widget.inbox_panel
+    item = panel.body.item(0)
+    icon = QPixmap(32, 32)
+    icon.fill(QColor("#ff0000"))
+    item.setIcon(QIcon(icon))
+    canvas = QPixmap(400, 500)
+    canvas.fill(Qt.white)
+    option = QStyleOptionViewItem()
+    option.rect = QRect(0, 0, 400, 500)
+    option.decorationSize = QSize(32, 32)
+    painter = QPainter(canvas)
+    try:
+        panel.message_delegate.paint(painter, option, panel.body.indexFromItem(item))
+    finally:
+        painter.end()
+    image = canvas.toImage()
+    red_rows = [
+        y
+        for y in range(image.height())
+        for x in range(45)
+        if image.pixelColor(x, y).red() > 230
+        and image.pixelColor(x, y).green() < 30
+        and image.pixelColor(x, y).blue() < 30
+    ]
+    assert red_rows and max(red_rows) < 45
+
+
+@pytest.mark.parametrize("window", [creator_provider], indirect=True)
+def test_following_directory_special_filter_creator_pages_and_stats_use_the_real_worker(
+    app, window
+):
+    widget, provider = window
+    widget.launch(lambda api: api.use_cookie("SESSDATA=synthetic; DedeUserID=42"))
+    wait_for(app, lambda: not widget.busy and bool(widget._library_view.items))
+    assert widget.following_toggle.isEnabled() and not widget.following_toggle.icon().isNull()
+    widget.following_toggle.click()
+    panel = widget.following_panel
+    wait_for(app, lambda: not widget.busy and panel.people.topLevelItemCount() == 20)
+    assert panel.isVisible() and widget.content_panel.isHidden()
+    assert not any("host_mid" in r.url.params for r in provider.requests)
+    assert not any(r.url.path.endswith("/archive/relation") for r in provider.requests)
+    before = len(provider.requests)
+    panel.special_only.setChecked(True)
+    app.processEvents()
+    assert panel.people.topLevelItemCount() == 1
+    assert "特别关注" in panel.people.topLevelItem(0).text(1)
+    assert len(provider.requests) == before
+    panel.people.setCurrentItem(panel.people.topLevelItem(0))
+    wait_for(app, lambda: not widget.busy and panel.creator_view is not None)
+    assert panel.items.topLevelItemCount() == 12 and panel.next.isEnabled()
+    assert "转发：未知" in panel.stats.text() and "投币" in panel.stats.text()
+    panel.items.setCurrentItem(panel.items.topLevelItem(0))
+    assert "合成投稿" in panel.body.toPlainText()
+    panel.next.click()
+    wait_for(
+        app, lambda: not widget.busy and panel.page == 2 and panel.items.topLevelItemCount() == 11
+    )
+    assert not panel.next.isEnabled() and panel.previous.isEnabled()
+    before = len(provider.requests)
+    panel.previous.click()
+    wait_for(app, lambda: not widget.busy and panel.page == 1)
+    assert len(provider.requests) == before
+    panel.tabs.setCurrentIndex(1)
+    wait_for(
+        app,
+        lambda: not widget.busy
+        and panel.creator_view is not None
+        and panel.creator_view.kind == "videos",
+    )
+    assert panel.items.topLevelItemCount() == 20
+    assert len([r for r in provider.requests if r.url.path.endswith("/archive/relation")]) == 23
+    provider.creator_state["states"][23] = {"like": True, "coin": 0}
+    panel.verify.click()
+    wait_for(app, lambda: not widget.busy)
+    assert panel.creator_view.entries[0].liked is True
+    assert panel.creator_view.entries[0].coined is False
+    assert len([r for r in provider.requests if r.url.path.endswith("/archive/relation")]) == 43
+    assert all(r.method == "GET" for r in provider.requests)
+    widget.engine.api.clear_session()
+    widget.show_session(None)
+    assert panel.view is None and not panel.people.topLevelItemCount()
+    assert not panel.items.topLevelItemCount() and not panel.body.toPlainText()
+    assert not widget.following_toggle.isEnabled()
 
 
 def test_favorite_cache_is_visible_while_background_validation_is_still_blocked(
@@ -1002,12 +1120,11 @@ def test_account_browser_real_worker_tabs_pagination_caching_and_logout(app, win
     panel.more.click()
     wait_for(app, lambda: not widget.busy and panel.items.topLevelItemCount() == 21)
     assert not panel.more.isEnabled()
-    for index, expected in ((1, "合成签名"), (2, "播放进度 12 秒")):
-        panel.tabs.setCurrentIndex(index)
-        wait_for(app, lambda: not widget.busy and panel.items.topLevelItemCount() == 20)
-        assert panel.auto.isHidden()
-        panel.items.setCurrentItem(panel.items.topLevelItem(0))
-        assert expected in panel.body.toPlainText()
+    panel.tabs.setCurrentIndex(1)
+    wait_for(app, lambda: not widget.busy and panel.items.topLevelItemCount() == 20)
+    assert panel.auto.isHidden()
+    panel.items.setCurrentItem(panel.items.topLevelItem(0))
+    assert "播放进度 12 秒" in panel.body.toPlainText()
     count = len(provider.requests)
     panel.tabs.setCurrentIndex(0)
     assert panel.items.topLevelItemCount() == 21 and len(provider.requests) == count
@@ -1131,7 +1248,7 @@ def test_restart_restores_ui_then_broadcast_catches_up_and_forget_scrubs_cache(a
     gui.save_session(replace(widget._session, user_agent="Synthetic Browser"))
     widget.content_toggle.click()
     wait_for(app, lambda: not widget.busy)
-    widget.content_panel.tabs.setCurrentIndex(2)
+    widget.content_panel.tabs.setCurrentIndex(1)
     wait_for(app, lambda: not widget.busy)
     assert widget.engine.shutdown()
     widget.close()

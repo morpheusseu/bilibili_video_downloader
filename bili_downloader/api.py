@@ -24,6 +24,7 @@ from .account_content import AccountContent
 from .auth import Session, normalized_cookie
 from .broadcast import BroadcastClient, BroadcastState, Wakeup
 from .cache import MAX_IMAGE_BYTES, AccountCache
+from .creator_content import CreatorContent
 from .inbox import Inbox
 from .library import FavoriteLibrary
 from .sources import DownloadError, Source, VideoPart
@@ -45,6 +46,8 @@ LOGGED_API_PATHS = frozenset(
         "/x/polymer/web-dynamic/v1/feed/all",
         "/x/polymer/web-dynamic/v1/feed/all/update",
         "/x/relation/followings",
+        "/x/space/wbi/arc/search",
+        "/x/web-interface/archive/relation",
         "/x/web-interface/history/cursor",
         "/session_svr/v1/session_svr/get_sessions",
         "/svr_sync/v1/svr_sync/fetch_session_msgs",
@@ -103,8 +106,8 @@ class RequestGate:
             finally:
                 self._last_end = time.monotonic()
 
-    def check(self, status: int, code=None):
-        if status in {403, 412, 429} or code in {-352, -412}:
+    def check(self, status: int, code=None, *, provider_risk=False):
+        if status in {403, 412, 429} or code in {-352, -412} or provider_risk:
             self.stopped = True
             raise DownloadError("服务器拒绝请求或触发限流/风控，已停止；不会自动重试或绕过")
 
@@ -157,7 +160,14 @@ class ApiHttpClient(httpx.AsyncClient):
                     payload = None
                 if isinstance(payload, dict):
                     code = payload.get("code")
-                    self.gate.check(status, code)
+                    data = payload.get("data")
+                    self.gate.check(
+                        status,
+                        code,
+                        provider_risk=request.url.path == "/x/space/wbi/arc/search"
+                        and isinstance(data, dict)
+                        and data.get("is_risk") is True,
+                    )
                 outcome = "complete"
                 return response
             except asyncio.CancelledError:
@@ -213,6 +223,7 @@ class Bilibili:
         self.favorites = FavoriteLibrary(self.sdk.fav)
         self.inbox = Inbox(self.sdk)
         self.account_content = AccountContent(self.sdk)
+        self.creator_content = CreatorContent(self.sdk)
         self.broadcast_factory = broadcast_factory
         self._live_task = None
         self._live_owner = None
@@ -247,6 +258,7 @@ class Bilibili:
         # the new account's state, even if it was already awaiting provider I/O.
         self.inbox = Inbox(self.sdk)
         self.account_content = AccountContent(self.sdk)
+        self.creator_content = CreatorContent(self.sdk)
 
     async def forget_account_cache(self, account_id):
         await self.stop_inbox_live()
@@ -261,6 +273,29 @@ class Bilibili:
         view = await content.read(kind, owner.mid, more=more, check=check)
         if self.session is not owner or self.account_content is not content:
             raise DownloadError("账号已变化，未发布旧账号的内容")
+        return view
+
+    async def read_creator(self, mid, kind, page=1, *, refresh=False, verify=False, on_update=None):
+        owner, content = self.session, self.creator_content
+        followings = self.account_content.views.get("followings")
+        if (
+            owner is None
+            or followings is None
+            or str(mid) not in {row.key for row in followings.items}
+        ):
+            raise DownloadError("请先在当前账号的关注名单中选择 UP 主")
+
+        def publish(view):
+            if self.session is not owner or self.creator_content is not content:
+                raise DownloadError("账号已变化，已停止读取旧账号的关注者内容")
+            if on_update:
+                on_update(owner, view)
+
+        view = await content.read(
+            mid, kind, page, refresh=refresh, verify=verify, on_update=publish
+        )
+        if self.session is not owner or self.creator_content is not content:
+            raise DownloadError("账号已变化，未发布旧账号的关注者内容")
         return view
 
     async def use_cookie(self, cookie: str, *, user_agent: str = "") -> Session:
@@ -281,6 +316,7 @@ class Bilibili:
                     self.favorites = FavoriteLibrary(self.sdk.fav, cache=self.cache)
                     self.inbox = Inbox(self.sdk, cache=self.cache)
                     self.account_content = AccountContent(self.sdk, cache=self.cache)
+                    self.creator_content = CreatorContent(self.sdk, cache=self.cache)
                     count = sum(len(view.messages) for view in self.inbox.threads.values())
                     self.cache_notice = (
                         f"已恢复 {len(self.inbox.threads)} 个会话、{count} 条本地消息；"
@@ -298,6 +334,7 @@ class Bilibili:
                     self.favorites = FavoriteLibrary(self.sdk.fav)
                     self.inbox = Inbox(self.sdk)
                     self.account_content = AccountContent(self.sdk)
+                    self.creator_content = CreatorContent(self.sdk)
                     self.cache_notice = f"{error}；本次仅使用内存，未覆盖原缓存。"
             avatar = b""
             if nav.face:

@@ -3,8 +3,8 @@
 import hashlib
 from html import escape
 
-from PyQt5.QtCore import QSize, Qt, QUrl
-from PyQt5.QtGui import QTextDocument
+from PyQt5.QtCore import QRect, QSize, Qt, QUrl
+from PyQt5.QtGui import QIcon, QTextDocument
 from PyQt5.QtWidgets import QStyle, QStyledItemDelegate, QStyleOptionViewItem
 
 from .message_content import MessageImage
@@ -71,8 +71,17 @@ class MessageDelegate(QStyledItemDelegate):
         # the complete row height, otherwise a tall inline image gets clipped.
         rect.setTop(styled.rect.top())
         rect.setBottom(styled.rect.bottom())
+        icon = QIcon(styled.icon)
+        styled.icon = QIcon()
         styled.text = ""
+        painter.save()
         style.drawControl(QStyle.CE_ItemViewItem, styled, painter, self.parent())
+        painter.restore()
+        icon.paint(
+            painter,
+            QRect(styled.rect.left() + 6, styled.rect.top() + 6, 32, 32),
+            Qt.AlignTop | Qt.AlignHCenter,
+        )
         document = self.document(
             index, rect.width(), selected=bool(styled.state & QStyle.State_Selected)
         )

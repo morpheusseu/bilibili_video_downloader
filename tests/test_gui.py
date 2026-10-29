@@ -210,15 +210,7 @@ def test_following_collection_rounds_can_pause_resume_and_publish_complete_views
     panel = widget.following_panel
     wait_for(app, lambda: not widget.busy and panel.view is not None)
     panel.special_only.setChecked(True)
-    panel.people.setCurrentItem(panel.people.topLevelItem(0))
-    wait_for(app, lambda: not panel.loading and panel.creator_view is not None)
     panel.tabs.setCurrentIndex(1)
-    wait_for(
-        app,
-        lambda: not panel.loading
-        and panel.creator_view is not None
-        and panel.creator_view.kind == "videos",
-    )
     provider.creator_state["videos"].insert(
         0, dict(provider.creator_state["videos"][0], aid=4, bvid="BV0000000004")
     )
@@ -226,6 +218,10 @@ def test_following_collection_rounds_can_pause_resume_and_publish_complete_views
     panel.collect.click()
     wait_for(app, lambda: entered.is_set() and panel.collection is not None)
     assert not widget.busy and panel.people.isEnabled() and panel.tabs.isEnabled()
+    before = len(provider.requests)
+    widget.recent_timer.timeout.emit()
+    app.processEvents()
+    assert len(provider.requests) == before
     panel.special_only.setChecked(False)
 
     def select(mid):
@@ -254,6 +250,8 @@ def test_following_collection_rounds_can_pause_resume_and_publish_complete_views
     widget.engine.loop.call_soon_threadsafe(release.set)
     panel.collect.click()
     wait_for(app, lambda: panel.collection.done and widget.engine.following_task is None)
+    assert not any(r.url.path.endswith("/archive/relation") for r in provider.requests)
+    assert panel.collection.content_done == 42
     panel.people.setCurrentItem(select(7))
     wait_for(
         app,
@@ -262,10 +260,9 @@ def test_following_collection_rounds_can_pause_resume_and_publish_complete_views
         and panel.creator_view.mid == 7,
     )
     assert panel.people.topLevelItemCount() == 21
-    assert panel.collection.content_done == 42
-    assert panel.collection.interactions_done == 4
     assert len(panel.creator_view.entries) == 4
     assert panel.creator_view.entries[0].liked and panel.creator_view.entries[0].coined
+    assert len([r for r in provider.requests if r.url.path.endswith("/archive/relation")]) == 4
     assert "采集完成" in panel.collection_status.text() and not panel.pause.isEnabled()
     assert not widget._following_collecting
     assert all(r.method == "GET" for r in provider.requests)
@@ -376,6 +373,18 @@ def test_following_directory_special_filter_creator_pages_and_stats_use_the_real
     assert "转发：未知" in panel.stats.text() and "投币" in panel.stats.text()
     panel.items.setCurrentItem(panel.items.topLevelItem(0))
     assert "合成投稿" in panel.body.toPlainText()
+    current = panel.creator_view
+    stale = replace(current, observed_at=current.observed_at + 86400 * 365)
+    panel.show_creator(stale)
+    first = panel.items.topLevelItem(0)
+    assert first.text(1) == "未赞（待核验）"
+    assert first.text(2) == "已投（待核验）"
+    assert first.text(3) == "未知"
+    assert "上次确认：" in first.toolTip(1) and "不参与当前比例" in first.toolTip(1)
+    assert "已投（待核验）" in panel.body.toPlainText()
+    assert "上次确认：" in panel.body.toPlainText()
+    assert "分母仅含当前已核验" in panel.stats.toolTip()
+    panel.show_creator(current)
     provider.creator_state["repeat"] = True
     panel.next.click()
     wait_for(app, lambda: not panel.loading)
@@ -413,6 +422,71 @@ def test_following_directory_special_filter_creator_pages_and_stats_use_the_real
     assert panel.view is None and not panel.people.topLevelItemCount()
     assert not panel.items.topLevelItemCount() and not panel.body.toPlainText()
     assert not widget.following_toggle.isEnabled()
+
+
+@pytest.mark.parametrize("window", [lambda: creator_provider(3)], indirect=True)
+def test_recent_actions_button_reconciles_page_and_background_ticks_respect_visibility_and_due(
+    app, window, monkeypatch
+):
+    widget, provider = window
+    monkeypatch.setattr(gui.QApplication, "applicationState", lambda: Qt.ApplicationActive)
+    state = provider.creator_state
+    state["states"][3] = {"like": True, "coin": 1}
+    state["recent_coins"] = [{"aid": 3, "coins": 1}]
+    repost = dynamic(9001)
+    repost["type"] = "DYNAMIC_TYPE_FORWARD"
+    repost["modules"]["module_author"]["mid"] = 42
+    repost["orig"] = {"id_str": "1003"}
+    state["own_dynamics"] = [repost]
+    widget.launch(lambda api: api.use_cookie("SESSDATA=synthetic; DedeUserID=42"))
+    wait_for(app, lambda: not widget.busy and bool(widget._library_view.items))
+    widget.following_toggle.click()
+    panel = widget.following_panel
+    wait_for(app, lambda: not widget.busy and panel.view is not None)
+
+    # All discovery sources are still due; each foreground guard prevents I/O.
+    before = len(provider.requests)
+    widget.following_toggle.click()
+    widget.recent_timer.timeout.emit()
+    widget.following_toggle.click()
+    monkeypatch.setattr(gui.QApplication, "applicationState", lambda: Qt.ApplicationInactive)
+    widget.recent_timer.timeout.emit()
+    monkeypatch.setattr(gui.QApplication, "applicationState", lambda: Qt.ApplicationActive)
+    widget.set_busy(True)
+    widget.recent_timer.timeout.emit()
+    widget.set_busy(False)
+    app.processEvents()
+    assert len(provider.requests) == before and not panel.loading
+
+    panel.people.setCurrentItem(panel.people.topLevelItem(0))
+    wait_for(app, lambda: not panel.loading and panel.creator_view is not None)
+    first = panel.items.topLevelItem(0)
+    panel.items.setCurrentItem(first)
+    assert first.text(2) == "已投" and first.text(3) == "已转"
+    state["recent_coins"] = []
+    state["own_dynamics"] = []
+    state["states"][3] = {"like": True, "coin": 0}
+    before = len(provider.requests)
+    panel.recent.click()
+    wait_for(app, lambda: not panel.loading)
+    first = panel.items.topLevelItem(0)
+    assert first.text(2) == "未投"
+    assert first.text(3) == "已转（待核验）"
+    assert "投币 未投" in panel.body.toPlainText()
+    assert "转发 已转（待核验）" in panel.body.toPlainText()
+    requests = provider.requests[before:]
+    assert [r.url.path for r in requests] == [
+        "/x/space/like/video",
+        "/x/space/coin/video",
+        "/x/polymer/web-dynamic/v1/feed/space",
+        "/x/web-interface/archive/relation",
+    ]
+
+    before = len(provider.requests)
+    for _ in range(2):
+        widget.recent_timer.timeout.emit()
+        wait_for(app, lambda: not panel.loading)
+    assert len(provider.requests) == before
 
 
 def test_favorite_cache_is_visible_while_background_validation_is_still_blocked(

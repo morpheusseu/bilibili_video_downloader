@@ -22,7 +22,7 @@ async def test_selected_cached_content_page_still_fills_missing_personal_states(
     async with provider.api() as api:
         await api.use_cookie("SESSDATA=synthetic; DedeUserID=42")
         await api.read_account_content("followings")
-        # Bulk collection acquired metadata, then paused before its interaction phase.
+        # Bulk collection owns content only; opening a page fills its missing states.
         page = await api.creator_content.read_page(7, "videos")
         assert all(row.liked is None and row.coined is None for row in page.entries)
     async with provider.api() as api:
@@ -77,7 +77,8 @@ async def test_selected_author_pages_share_video_observations_and_keep_dynamic_l
         assert not relation_reads(provider)
         updates = []
         first = await api.read_creator(7, "dynamic", on_update=lambda _, view: updates.append(view))
-        assert len(first.entries) == 12 and first.has_more and len(updates) == 12
+        assert len(first.entries) == 12 and first.has_more
+        assert updates[0].entries[0].coined is None
         assert len(relation_reads(provider)) == 12
         assert all(row.reposted is None for row in first.entries)
         assert "转发：未知" in first.statistics()
@@ -195,8 +196,8 @@ async def test_missing_personal_flags_are_unknown_and_incomplete_pages_never_res
         await api.use_cookie("SESSDATA=synthetic; DedeUserID=42")
         await api.read_account_content("followings")
         page = await api.read_creator(7, "dynamic")
-        assert "投币：已判定部分" in page.statistics()
-        assert "未知 1" in page.statistics()
+        assert "已核验 2/3" in page.statistics()
+        assert "待核验 1" in page.statistics()
         assert all(row.reposted is None for row in page.entries)
         api.cache.put_many({}, remove=(("creator_page", "7:dynamic:1"),))
     async with provider.api() as api:

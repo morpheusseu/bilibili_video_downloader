@@ -20,15 +20,41 @@ from PyQt5.QtWidgets import (
 
 from .account_content import local_time
 
+INTERACTIONS = (
+    ("点赞", "liked", "已赞", "未赞"),
+    ("投币", "coined", "已投", "未投"),
+    ("转发", "reposted", "已转", "未转"),
+)
 
-def interaction_text(entry):
-    def flag(value, yes, no):
-        return yes if value is True else no if value is False else "未知"
 
-    return (
-        f"点赞 {flag(entry.liked, '已赞', '未赞')} · "
-        f"投币 {flag(entry.coined, '已投', '未投')} · "
-        f"转发 {flag(entry.reposted, '已转', '未转')}"
+def interaction_label(entry, field, yes, no, now):
+    value = getattr(entry, field)
+    if value is None:
+        return "未知"
+    label = yes if value else no
+    return label if entry.is_current(field, now) else label + "（待核验）"
+
+
+def interaction_detail(entry, field, now):
+    confirmed = getattr(entry, field + "_at")
+    stamp = local_time(confirmed) if confirmed is not None else "暂无"
+    detail = "上次确认：" + stamp + "。"
+    if getattr(entry, field) is None:
+        detail += "未知表示尚无可用的个人状态，不能视为未操作。"
+    elif not entry.is_current(field, now):
+        detail += "待核验表示保存的上次状态尚未重新确认，不参与当前比例。"
+    else:
+        detail += "已核验，参与当前比例。"
+    if field == "reposted":
+        detail += "个人转发不能用转发总数推断。"
+    return detail
+
+
+def interaction_text(entry, now):
+    return "\n".join(
+        f"{name} {interaction_label(entry, field, yes, no, now)} · "
+        + interaction_detail(entry, field, now)
+        for name, field, yes, no in INTERACTIONS
     )
 
 
@@ -39,6 +65,7 @@ class FollowingPanel(QFrame):
     open_requested = pyqtSignal(str)
     collect_requested = pyqtSignal()
     pause_requested = pyqtSignal()
+    recent_requested = pyqtSignal()
 
     def __init__(self, avatars, images):
         super().__init__()
@@ -68,11 +95,17 @@ class FollowingPanel(QFrame):
         collection_controls = QHBoxLayout()
         self.collect = QPushButton("采集全部最新页")
         self.collect.setToolTip(
-            "先收齐关注名单和每人的最新动态/投稿页，再分轮补齐视频互动；不回溯历史。"
+            "分轮收齐关注名单和每人的最新动态/投稿页；个人互动仅在浏览当前页时核验，不回溯历史。"
         )
         self.pause = QPushButton("暂停采集")
+        self.recent = QPushButton("检查近期操作")
+        self.recent.setToolTip(
+            "只读取本账号最近点赞、投币和本人动态首屏；不是全部历史。"
+            "列表缺失不算取消，不遍历所有关注者的视频。"
+        )
         collection_controls.addWidget(self.collect)
         collection_controls.addWidget(self.pause)
+        collection_controls.addWidget(self.recent)
         collection_controls.addStretch()
         layout.addLayout(collection_controls)
         self.collection_status = QLabel("尚未开始全部采集；随时可暂停，重启后可从保存的进度继续。")
@@ -115,7 +148,8 @@ class FollowingPanel(QFrame):
         self.stats.setToolTip(
             "按本页每条内容是否有该个人行为统计，投币按是否投过币计数，不累加币数。"
             "动态点赞与视频点赞是不同目标；动态页投币指附带视频。"
-            "未知不算未互动，部分可判定时只显示该部分的比例。"
+            "比例的分母仅含当前已核验的条目；待核验的上次状态与未知均不参与。"
+            "缓存保留上次状态，待核验不表示未操作。"
         )
         content.addWidget(self.stats)
         self.items = QTreeWidget()
@@ -154,6 +188,7 @@ class FollowingPanel(QFrame):
         self.more.clicked.connect(lambda: self.list_requested.emit(True))
         self.collect.clicked.connect(self.collect_requested.emit)
         self.pause.clicked.connect(self.pause_requested.emit)
+        self.recent.clicked.connect(self.recent_requested.emit)
         self.special_only.toggled.connect(self.render_people)
         self.people.itemSelectionChanged.connect(self.select_person)
         self.tabs.currentChanged.connect(self.select_person)
@@ -248,26 +283,22 @@ class FollowingPanel(QFrame):
         self.body.clear()
         for entry in view.entries:
             row = entry.content
-            values = (entry.liked, entry.coined, entry.reposted)
-            labels = (("已赞", "未赞"), ("已投", "未投"), ("已转", "未转"))
             item = QTreeWidgetItem(
                 [
                     row.title,
                     *(
-                        yes if value is True else no if value is False else "未知"
-                        for value, (yes, no) in zip(values, labels, strict=True)
+                        interaction_label(entry, field, yes, no, view.observed_at)
+                        for _, field, yes, no in INTERACTIONS
                     ),
                 ]
             )
             item.setData(0, Qt.UserRole, entry)
             item.setToolTip(0, row.summary)
-            for column in range(1, 4):
+            for column, (_, field, _, _) in enumerate(INTERACTIONS, 1):
                 item.setTextAlignment(column, Qt.AlignCenter)
                 item.setToolTip(
                     column,
-                    "个人状态；未知不代表没有操作。"
-                    if column != 3
-                    else "个人转发状态；平台未提供时保持未知，不能用转发总数推断。",
+                    interaction_detail(entry, field, view.observed_at),
                 )
             item.setIcon(
                 0,
@@ -285,7 +316,7 @@ class FollowingPanel(QFrame):
             + "正文采集于 "
             + local_time(view.checked_at)
             + "。 "
-            + (view.notice or "互动为保存的观测，可用“校验本页互动”更新；未知不计为未互动。")
+            + (view.notice or "个人互动仅核验当前页；待核验保留上次状态，可用“校验本页互动”更新。")
         )
         self.update_controls()
 
@@ -293,7 +324,11 @@ class FollowingPanel(QFrame):
         item = self.items.currentItem()
         entry = item.data(0, Qt.UserRole) if item else None
         self.body.setPlainText(
-            entry.content.body + "\n\n我的互动：" + interaction_text(entry) if entry else ""
+            entry.content.body
+            + "\n\n我的互动：\n"
+            + interaction_text(entry, self.creator_view.observed_at)
+            if entry
+            else ""
         )
         self.update_controls()
 
@@ -343,6 +378,7 @@ class FollowingPanel(QFrame):
         ready = self.logged_in and not self.busy
         self.collect.setEnabled(ready and not self.collecting and not self.loading)
         self.pause.setEnabled(self.logged_in and self.collecting)
+        self.recent.setEnabled(ready and not self.collecting and not self.loading)
         target = ready and self.selected() is not None
         self.people.setEnabled(ready)
         self.special_only.setEnabled(ready)

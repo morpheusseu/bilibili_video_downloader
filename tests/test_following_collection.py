@@ -1,11 +1,14 @@
 import asyncio
+from dataclasses import asdict
 
 import pytest
 from account_content_provider import content_provider
 from creator_provider import creator_provider
 
-from bili_downloader.account_content import AccountContent
+from bili_downloader.account_content import AccountContent, ContentItem
 from bili_downloader.cache import AccountCache
+from bili_downloader.creator_content import CreatorEntry
+from bili_downloader.following_collection import FollowingCollection
 from bili_downloader.sources import DownloadError
 
 
@@ -75,7 +78,7 @@ async def test_retained_20_person_frontier_keeps_its_page_boundaries(tmp_path):
         cache.close()
 
 
-async def test_all_people_get_both_latest_pages_before_any_interaction_request(
+async def test_all_people_get_both_latest_pages_without_interaction_requests(
     tmp_path,
 ):
     provider = creator_provider()
@@ -83,7 +86,8 @@ async def test_all_people_get_both_latest_pages_before_any_interaction_request(
     async with provider.api() as api:
         await api.use_cookie("SESSDATA=synthetic; DedeUserID=42")
         first = await api.collect_followings()
-        assert first.content_done < first.content_total and not first.done
+        # The first six-step round reads the directory and five content pages.
+        assert first.content_done == 5 and not first.done
         assert not any(r.url.path.endswith("/archive/relation") for r in provider.requests)
         progress = await drain(api)
         assert progress.done and progress.people == 21 and progress.content_total == 42
@@ -94,41 +98,38 @@ async def test_all_people_get_both_latest_pages_before_any_interaction_request(
         assert {r.url.params["mid"] for r in video_reads} == expected
         assert all("offset" not in r.url.params for r in dynamic_reads)
         assert all(r.url.params["pn"] == "1" for r in video_reads)
-        first_interaction = next(
-            i for i, r in enumerate(provider.requests) if r.url.path.endswith("/archive/relation")
-        )
-        assert all(
-            provider.requests.index(r) < first_interaction for r in dynamic_reads + video_reads
-        )
-        # Latest dynamic page has 12 videos; latest submission page has 20,
-        # with shared aids. Every distinct video is fetched only once.
-        assert progress.interactions_done == progress.interactions_total == 20
-        relations = [r for r in provider.requests if r.url.path.endswith("/archive/relation")]
-        assert len(relations) == len({r.url.params["aid"] for r in relations}) == 20
+        assert len(dynamic_reads) == len(video_reads) == 21
+        assert not any(r.url.path.endswith("/archive/relation") for r in provider.requests)
+        assert "个人视频互动" not in progress.notice
+        checkpoint = api.cache.get("following_collection", "current", max_age=None)
+        assert set(checkpoint) == {
+            "started_at",
+            "stage",
+            "directory_started",
+            "mids",
+            "content_position",
+        }
         before = len(provider.requests)
         await api.collect_followings()
         assert len(provider.requests) == before
         assert all(r.method == "GET" for r in provider.requests)
 
 
-@pytest.mark.parametrize("stage", ["content", "interactions"])
-async def test_cancel_restart_does_not_replay_completed_work(tmp_path, stage):
+async def test_cancel_process_restart_does_not_replay_completed_work(tmp_path):
     provider = creator_provider(3)
     provider.cache_root = tmp_path
     async with provider.api() as api:
         await api.use_cookie("SESSDATA=synthetic; DedeUserID=42")
 
         def stop(owner, progress):
-            if (stage == "content" and progress.content_done == 3) or (
-                stage == "interactions" and progress.interactions_done == 1
-            ):
+            if progress.content_done == 3:
                 raise asyncio.CancelledError
 
         with pytest.raises(asyncio.CancelledError):
             for _ in range(100):
                 await api.collect_followings(on_update=stop)
         previous = api.following_collection.progress()
-        assert previous.content_done == (3 if stage == "content" else 42)
+        assert previous.content_done == 3
     before = len(provider.requests)
     async with provider.api() as api:
         await api.use_cookie("SESSDATA=synthetic; DedeUserID=42")
@@ -139,8 +140,136 @@ async def test_cancel_restart_does_not_replay_completed_work(tmp_path, stage):
         assert not any(r.url.params.get("host_mid") in {"1", "2"} for r in resumed)
         assert not any(r.url.params.get("mid") == "1" for r in resumed)
         assert api.following_collection.progress().done
-        relations = [r for r in provider.requests if r.url.path.endswith("/archive/relation")]
-        assert len(relations) == len({r.url.params["aid"] for r in relations}) == 3
+        assert not any(r.url.path.endswith("/archive/relation") for r in provider.requests)
+
+
+@pytest.fixture
+def retained_interaction_checkpoint():
+    # Sanitized saved value from the former content-then-interactions plan.
+    return {
+        "started_at": 1700000000.0,
+        "stage": "interactions",
+        "directory_started": True,
+        "mids": list(range(1, 22)),
+        "content_position": 42,
+        "aids": [3, 2, 1],
+        "interaction_position": 1,
+    }
+
+
+@pytest.mark.parametrize("stage", ["interactions", "done"])
+async def test_retained_checkpoint_converts_once_without_replaying_content(
+    tmp_path, retained_interaction_checkpoint, stage
+):
+    provider = creator_provider(3)
+    provider.cache_root = tmp_path
+    async with provider.api() as api:
+        await api.use_cookie("SESSDATA=synthetic; DedeUserID=42")
+        await drain(api)
+        saved = {**retained_interaction_checkpoint, "stage": stage}
+        if stage == "done":
+            saved["interaction_position"] = len(saved["aids"])
+        api.cache.put_many({("following_collection", "current"): saved})
+    async with provider.api() as api:
+        await api.use_cookie("SESSDATA=synthetic; DedeUserID=42")
+        before = len(provider.requests)
+        progress = await api.collect_followings()
+        assert progress.done and progress.content_done == 42
+        converted = api.cache.get("following_collection", "current", max_age=None)
+        assert converted == {
+            "started_at": saved["started_at"],
+            "stage": "done",
+            "directory_started": True,
+            "mids": saved["mids"],
+            "content_position": 42,
+        }
+        # Reloading the canonical checkpoint does not rewrite it again.
+        writes = []
+        original_put = api.cache.put_many
+
+        def record_put(*args, **kwargs):
+            writes.append(args)
+            return original_put(*args, **kwargs)
+
+        api.cache.put_many = record_put
+        reloaded = FollowingCollection(api.account_content, api.creator_content, cache=api.cache)
+        assert reloaded.progress() == progress
+        assert not writes
+        assert len(provider.requests) == before
+
+
+async def test_thousands_of_cached_distinct_videos_do_not_add_interaction_work(tmp_path):
+    provider = creator_provider()
+    provider.content_state["followings"] = content_provider(251).content_state["followings"]
+    provider.cache_root = tmp_path
+    cache = AccountCache(tmp_path, 42)
+    records = {}
+    for mid in range(1, 252):
+        for kind in ("dynamic", "videos"):
+            entries = []
+            for number in range(20):
+                aid = mid * 100 + number
+                entries.append(
+                    asdict(
+                        CreatorEntry(ContentItem(str(aid), "合成内容", "", "", "cover"), aid=aid)
+                    )
+                )
+            records[("creator_index", f"{mid}:{kind}")] = {"count": 1}
+            records[("creator_page", f"{mid}:{kind}:1")] = {
+                "entries": entries,
+                "cursor": "next" if kind == "dynamic" else 2,
+                "has_more": True,
+                "fetched_at": 1e12,
+            }
+    cache.put_many(records)
+    cache.close()
+    async with provider.api() as api:
+        await api.use_cookie("SESSDATA=synthetic; DedeUserID=42")
+        progress = await drain(api)
+        assert progress.done and progress.people == 251
+        assert progress.content_done == progress.content_total == 502
+        aids = {
+            row.aid
+            for mid in range(1, 252)
+            for row in api.creator_content.cached_view(mid, "videos").entries
+        }
+        assert len(aids) == 5020
+        assert not any(r.url.path.endswith("/archive/relation") for r in provider.requests)
+        assert not any("host_mid" in r.url.params for r in provider.requests)
+        assert not any(r.url.path.endswith("/arc/search") for r in provider.requests)
+
+
+async def test_explicit_restart_refreshes_directory_and_both_latest_pages(tmp_path):
+    provider = creator_provider(2)
+    provider.cache_root = tmp_path
+    async with provider.api() as api:
+        await api.use_cookie("SESSDATA=synthetic; DedeUserID=42")
+        await drain(api)
+        before = len(provider.requests)
+        progress = await api.collect_followings(restart=True)
+        assert not progress.done
+        await drain(api)
+        refreshed = provider.requests[before:]
+        assert len([r for r in refreshed if r.url.path.endswith("/followings")]) == 1
+        assert len([r for r in refreshed if "host_mid" in r.url.params]) == 21
+        assert len([r for r in refreshed if r.url.path.endswith("/arc/search")]) == 21
+        assert not any(r.url.path.endswith("/archive/relation") for r in refreshed)
+
+
+async def test_collection_rejects_a_different_cache_account_without_changes(tmp_path):
+    provider = creator_provider(2)
+    provider.cache_root = tmp_path
+    async with provider.api() as api:
+        await api.use_cookie("SESSDATA=synthetic; DedeUserID=42")
+        await api.collect_followings()
+        previous = api.following_collection.progress()
+        checkpoint = api.cache.get("following_collection", "current", max_age=None)
+        before = len(provider.requests)
+        with pytest.raises(DownloadError, match="账号不匹配"):
+            await api.following_collection.run_round(43, restart=True)
+        assert api.following_collection.progress() == previous
+        assert api.cache.get("following_collection", "current", max_age=None) == checkpoint
+        assert len(provider.requests) == before
 
 
 async def test_account_change_discards_late_collection_result_and_does_not_continue():
@@ -168,15 +297,22 @@ async def test_account_change_discards_late_collection_result_and_does_not_conti
         assert api.following_collection.progress() is None
 
 
-async def test_missing_page_repairs_the_checkpoint_and_account_forget_scrubs_it(
+@pytest.mark.parametrize("corrupt", [False, True])
+async def test_missing_or_corrupt_page_repairs_checkpoint_and_forget_scrubs_it(
     tmp_path,
+    corrupt,
+    retained_interaction_checkpoint,
 ):
     provider = creator_provider(2)
     provider.cache_root = tmp_path
     async with provider.api() as api:
         await api.use_cookie("SESSDATA=synthetic; DedeUserID=42")
         await drain(api)
-        api.cache.put_many({}, remove=[("creator_page", "7:videos:1")])
+        api.cache.put_many({("following_collection", "current"): retained_interaction_checkpoint})
+        if corrupt:
+            api.cache.put_many({("creator_page", "7:videos:1"): {"entries": "corrupt"}})
+        else:
+            api.cache.put_many({}, remove=[("creator_page", "7:videos:1")])
     before = len(provider.requests)
     async with provider.api() as api:
         await api.use_cookie("SESSDATA=synthetic; DedeUserID=42")

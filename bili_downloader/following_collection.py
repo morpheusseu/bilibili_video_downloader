@@ -1,7 +1,8 @@
-"""Resumable latest-page collection, using the existing page and interaction owners.
+"""Resumable collection of every following's two latest content pages.
 
 The work plan is only a checkpoint. AccountContent owns the directory,
-CreatorContent owns pages/cursors and the account-wide video observations.
+CreatorContent owns pages/cursors. Personal interaction checks have their own
+scope and do not delay this collection's completion.
 No per-creator timers, historical crawls or second HTTP client are introduced.
 """
 
@@ -17,14 +18,40 @@ ROUND_STEPS = 6
 KINDS = ("dynamic", "videos")
 
 
+def _decode_checkpoint(saved):
+    """Convert retained interaction-era work plans into the content-only plan."""
+    mids = saved["mids"]
+    stage = saved["stage"]
+    position = saved["content_position"]
+    if (
+        not valid_time(saved["started_at"])
+        or type(saved["directory_started"]) is not bool
+        or stage not in {"directory", "content", "interactions", "done"}
+        or not isinstance(mids, list)
+        or any(type(mid) is not int or mid <= 0 for mid in mids)
+        or len(set(mids)) != len(mids)
+        or type(position) is not int
+        or not 0 <= position <= 2 * len(mids)
+        or (stage in {"interactions", "done"} and position != 2 * len(mids))
+    ):
+        raise ValueError("Invalid collection checkpoint")
+    # Legacy aids and interaction_position describe work this collection no
+    # longer owns. Do not read or validate them, and never persist them again.
+    return {
+        "started_at": saved["started_at"],
+        "stage": "done" if stage == "interactions" else stage,
+        "directory_started": saved["directory_started"],
+        "mids": mids,
+        "content_position": position,
+    }
+
+
 @dataclass(frozen=True)
 class FollowingProgress:
     stage: str
     people: int
     content_done: int
     content_total: int
-    interactions_done: int
-    interactions_total: int
 
     @property
     def done(self):
@@ -34,14 +61,8 @@ class FollowingProgress:
     def notice(self):
         if self.stage == "directory":
             return f"正在分页收齐关注名单 · 已读取 {self.people} 人"
-        return (
-            f"{self.people} 位关注者 · 最新内容页 {self.content_done}/{self.content_total}"
-            + (
-                " · 内容收齐后核验个人视频互动"
-                if self.stage == "content"
-                else f" · 个人视频互动 {self.interactions_done}/{self.interactions_total}"
-            )
-            + (" · 本轮采集完成" if self.done else " · 可暂停，已完成部分会保存")
+        return f"{self.people} 位关注者 · 最新内容页 {self.content_done}/{self.content_total}" + (
+            " · 本轮采集完成" if self.done else " · 可暂停，已完成部分会保存"
         )
 
 
@@ -58,29 +79,11 @@ class FollowingCollection:
             saved = cache.get("following_collection", "current", max_age=None)
             if saved is not None:
                 try:
-                    mids, aids = saved["mids"], saved["aids"]
-                    if (
-                        not valid_time(saved["started_at"])
-                        or type(saved["directory_started"]) is not bool
-                        or saved["stage"] not in {"directory", "content", "interactions", "done"}
-                        or any(
-                            not isinstance(ids, list)
-                            or any(type(item) is not int or item <= 0 for item in ids)
-                            or len(set(ids)) != len(ids)
-                            for ids in (mids, aids)
-                        )
-                        or type(saved["content_position"]) is not int
-                        or not 0 <= saved["content_position"] <= 2 * len(mids)
-                        or type(saved["interaction_position"]) is not int
-                        or not 0 <= saved["interaction_position"] <= len(aids)
-                        or (
-                            saved["stage"] in {"interactions", "done"}
-                            and saved["content_position"] != 2 * len(mids)
-                        )
-                        or (saved["stage"] == "done" and saved["interaction_position"] != len(aids))
-                    ):
-                        raise ValueError("Invalid collection checkpoint")
-                    self.state = saved
+                    decoded = _decode_checkpoint(saved)
+                    if decoded != saved:
+                        self._save(decoded)
+                    else:
+                        self.state = decoded
                 except (KeyError, TypeError, ValueError):
                     log.warning("Discarded invalid following collection checkpoint")
         if self.state is not None:
@@ -101,8 +104,6 @@ class FollowingCollection:
             len(state["mids"]) if state["stage"] != "directory" else len(view.items) if view else 0,
             state["content_position"],
             2 * len(state["mids"]),
-            state["interaction_position"],
-            len(state["aids"]),
         )
 
     def _restart(self):
@@ -113,8 +114,6 @@ class FollowingCollection:
                 "directory_started": False,
                 "mids": [],
                 "content_position": 0,
-                "aids": [],
-                "interaction_position": 0,
             }
         )
 
@@ -134,14 +133,8 @@ class FollowingCollection:
                         **state,
                         "stage": "content",
                         "content_position": position,
-                        "aids": [],
-                        "interaction_position": 0,
                     }
                 )
-                return
-        for position, aid in enumerate(state["aids"][: state["interaction_position"]]):
-            if self.creators.video_observation(aid) is None:
-                self._save({**state, "stage": "interactions", "interaction_position": position})
                 return
 
     async def run_round(self, account_id, *, restart=False, on_update=None):
@@ -172,34 +165,15 @@ class FollowingCollection:
                         await self.creators.read_page(mid, kind, refresh=True)
                     state["content_position"] += 1
                 if state["content_position"] == 2 * len(state["mids"]):
-                    state.update(
-                        stage="interactions",
-                        aids=list(
-                            dict.fromkeys(
-                                aid
-                                for mid in state["mids"]
-                                for kind in KINDS
-                                for aid in self.creators.video_ids(mid, kind)
-                            )
-                        ),
-                    )
-            else:
-                position = state["interaction_position"]
-                if position < len(state["aids"]):
-                    await self.creators.verify_video(state["aids"][position])
-                    state["interaction_position"] += 1
-                if state["interaction_position"] == len(state["aids"]):
                     state["stage"] = "done"
             self._save(state)
             if on_update:
                 on_update(self.progress())
         progress = self.progress()
         log.info(
-            "Following collection stage=%s content=%s/%s interactions=%s/%s",
+            "Following collection stage=%s content=%s/%s",
             progress.stage,
             progress.content_done,
             progress.content_total,
-            progress.interactions_done,
-            progress.interactions_total,
         )
         return progress

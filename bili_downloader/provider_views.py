@@ -8,6 +8,7 @@ Video relationship reads use the same SDK transport and one typed response.
 import json
 import logging
 
+from bpi._core.params import integer
 from bpi._generated.user_models import UserUploadedVideo, UserUploadedVideoList, UserUploadedVideos
 from bpi.dynamic.models import DynamicAllData, DynamicAllItem
 from bpi.dynamic.params import DEFAULT_ALL_FEATURES, DEFAULT_ALL_WEB_LOCATION, all_query
@@ -79,10 +80,26 @@ class VideoRelationship(BaseModel):
         return value
 
 
+class RecentLikedVideo(BaseModel):
+    model_config = ConfigDict(strict=True, hide_input_in_errors=True)
+    aid: StrictInt = Field(gt=0)
+
+
+class RecentCoinedVideo(RecentLikedVideo):
+    coins: StrictInt = Field(ge=1, le=2)
+
+
+class _RecentLikedVideos(BaseModel):
+    model_config = ConfigDict(strict=True, hide_input_in_errors=True)
+    list: list[RecentLikedVideo]
+
+
 _MESSAGES = TypeAdapter(MessagePage)
 _FEED = TypeAdapter(FeedPage)
 _VIDEO_RELATION = TypeAdapter(VideoRelationship)
 _UPLOADED_VIDEOS = TypeAdapter(UploadedVideos)
+_RECENT_LIKES = TypeAdapter(_RecentLikedVideos | list[RecentLikedVideo])
+_RECENT_COINS = TypeAdapter(list[RecentCoinedVideo])
 
 
 async def message_page(sdk, *, talker_id, size=20, begin_seqno=None, end_seqno=None):
@@ -132,6 +149,35 @@ async def video_relationship(sdk, aid):
     # both account-specific flags in one request. It never performs an action.
     return await sdk._get_payload(
         "/x/web-interface/archive/relation", {"aid": str(aid)}, _VIDEO_RELATION
+    )
+
+
+async def recent_liked_videos(sdk, mid: int) -> list[RecentLikedVideo]:
+    """Read one finite recent list; absence never establishes an unlike.
+
+    The provider's recorded web response wraps rows in ``data.list``; its
+    historical contract also documents a bare data array. Both require rows
+    with valid video identities. Privacy/null/malformed payloads remain errors.
+    """
+    page = await sdk._get_payload(
+        "/x/space/like/video", {"vmid": integer(mid, "mid")}, _RECENT_LIKES
+    )
+    return page.list if isinstance(page, _RecentLikedVideos) else page
+
+
+async def recent_coined_videos(sdk, mid: int) -> list[RecentCoinedVideo]:
+    """Read positive coin observations; the recent list is not full history."""
+    return await sdk._get_payload(
+        "/x/space/coin/video", {"vmid": integer(mid, "mid")}, _RECENT_COINS
+    )
+
+
+async def own_dynamic_page(sdk, mid: int) -> FeedPage:
+    """Read the account space's first screen, retaining forwarded originals."""
+    return await sdk._get_payload(
+        "/x/polymer/web-dynamic/v1/feed/space",
+        {"host_mid": integer(mid, "mid"), "features": DEFAULT_ALL_FEATURES},
+        _FEED,
     )
 
 

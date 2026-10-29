@@ -6,12 +6,12 @@ these saved facts, never persisted as an independent counter.
 """
 
 import logging
-import math
 import time
 from dataclasses import asdict, dataclass, replace
 
 from .account_content import ContentItem, dynamic_item, local_time
-from .provider_views import VideoRelationship, feed_page, uploaded_videos, video_relationship
+from .interactions import INTERACTION_AGE, PersonalInteractions, valid_time
+from .provider_views import feed_page, uploaded_videos
 from .sources import DownloadError
 
 log = logging.getLogger(__name__)
@@ -25,6 +25,19 @@ class CreatorEntry:
     liked: bool | None = None
     reposted: bool | None = None
     coined: bool | None = None
+    liked_at: float | None = None
+    coined_at: float | None = None
+    reposted_at: float | None = None
+    uncertain: tuple[str, ...] = ()
+
+    def is_current(self, field, now):
+        stamp = getattr(self, field + "_at")
+        return (
+            getattr(self, field) is not None
+            and stamp is not None
+            and field not in self.uncertain
+            and 0 <= now - stamp < INTERACTION_AGE
+        )
 
     @classmethod
     def from_record(cls, record):
@@ -38,6 +51,11 @@ class CreatorEntry:
             )
         ):
             raise ValueError("Invalid interaction observation")
+        if any(
+            stamp is not None and not valid_time(stamp)
+            for stamp in (row.liked_at, row.coined_at, row.reposted_at)
+        ) or any(field not in {"liked", "coined", "reposted"} for field in row.uncertain):
+            raise ValueError("Invalid interaction observation time")
         return row
 
 
@@ -59,6 +77,7 @@ class CreatorView:
     checked_at: float
     cached: bool = False
     notice: str = ""
+    observed_at: float = 0
 
     def statistics(self):
         result = []
@@ -66,21 +85,21 @@ class CreatorView:
         if not total:
             return "本页暂无内容，没有可统计的个人互动。"
         for name, field in (("点赞", "liked"), ("投币", "coined"), ("转发", "reposted")):
-            known = [getattr(row, field) for row in self.entries if getattr(row, field) is not None]
+            known = [
+                getattr(row, field)
+                for row in self.entries
+                if row.is_current(field, self.observed_at)
+            ]
             positive = sum(known)
             if not known:
-                result.append(f"{name}：未知（可判定 0/{total}）")
+                result.append(f"{name}：未知（已核验 0/{total}）")
             else:
-                qualifier = "已判定部分 " if len(known) < total else ""
                 result.append(
-                    f"{name}：{qualifier}{positive / len(known):.0%}"
-                    f"（{positive}/{len(known)}，未知 {total - len(known)}）"
+                    f"{name}：{positive / len(known):.0%}"
+                    f"（{positive}/{len(known)}，已核验 {len(known)}/{total}，"
+                    f"待核验 {total - len(known)}）"
                 )
         return "   ·   ".join(result)
-
-
-def valid_time(value):
-    return type(value) in (float, int) and math.isfinite(value) and value >= 0
 
 
 def _flag(value):
@@ -144,7 +163,7 @@ class CreatorContent:
     def __init__(self, sdk, *, cache=None, clock=time.time):
         self.sdk, self.cache, self.clock = sdk, cache, clock
         self.pages = {}
-        self.video_states = {}
+        self.interactions = PersonalInteractions(sdk, cache=cache, clock=lambda: self.clock())
 
     def _pages(self, mid, kind):
         key = f"{mid}:{kind}"
@@ -183,17 +202,6 @@ class CreatorContent:
         self.pages[key] = pages
         return pages
 
-    def video_observation(self, aid):
-        if aid not in self.video_states and self.cache is not None:
-            try:
-                record = self.cache.get("video_interaction", str(aid), max_age=None)
-                if record is not None and valid_time(record["checked_at"]):
-                    state = VideoRelationship.model_validate(record["state"])
-                    self.video_states[aid] = (record["checked_at"], state)
-            except (DownloadError, ValueError, TypeError, KeyError):
-                log.warning("Discarded invalid video interaction cache")
-        return self.video_states.get(aid)
-
     def cached_view(self, mid, kind, page=1):
         pages = self._pages(mid, kind)
         if not 1 <= page <= len(pages):
@@ -203,15 +211,31 @@ class CreatorContent:
     def _view(self, mid, kind, number, page, *, cached=False, notice=""):
         entries = []
         for entry in page.entries:
-            observation = self.video_observation(entry.aid) if entry.aid else None
-            if observation:
-                _, state = observation
+            values = {
+                field + "_at": page.fetched_at if getattr(entry, field) is not None else None
+                for field in ("liked", "coined", "reposted")
+            }
+            uncertain = []
+            if entry.aid:
                 # A dynamic's own like and a video like are different targets.
-                entry = replace(
-                    entry,
-                    liked=state.like if kind == "videos" else entry.liked,
-                    coined=state.coin > 0 if state.coin is not None else entry.coined,
-                )
+                for field, observation in self.interactions.video(entry.aid).items():
+                    if field == "liked" and kind != "videos":
+                        continue
+                    if (
+                        getattr(entry, field) is not None
+                        and page.fetched_at > observation.checked_at
+                    ):
+                        continue
+                    values.update({field: observation.value, field + "_at": observation.checked_at})
+                    if observation.uncertain:
+                        uncertain.append(field)
+            if kind == "dynamic":
+                repost = self.interactions.repost(entry.content.key)
+                if repost and (entry.reposted is None or repost.checked_at > page.fetched_at):
+                    values.update(reposted=repost.value, reposted_at=repost.checked_at)
+                    if repost.uncertain:
+                        uncertain.append("reposted")
+            entry = replace(entry, **values, uncertain=tuple(uncertain))
             entries.append(entry)
         return CreatorView(
             mid,
@@ -222,6 +246,7 @@ class CreatorContent:
             page.fetched_at,
             cached,
             notice,
+            self.clock(),
         )
 
     def _save_page(self, mid, kind, number, page):
@@ -300,44 +325,23 @@ class CreatorContent:
             notice="最新页已变化，后续分页已重置，避免跳过内容。" if reset else "",
         )
 
-    def video_ids(self, mid, kind):
-        view = self.cached_view(mid, kind)
-        return [row.aid for row in view.entries if row.aid] if view else []
-
-    async def verify_video(self, aid, *, force=False):
-        observation = self.video_observation(aid)
-        if observation and not force and 0 <= self.clock() - observation[0] < 600:
-            return
-        state = await video_relationship(self.sdk, aid)
-        if state.like is None and state.coin is None:
-            raise DownloadError("互动接口未返回可确认状态，页面保留为未知；未自动重试")
-        checked_at = self.clock()
-        if self.cache is not None:
-            self.cache.put_many(
-                {
-                    ("video_interaction", str(aid)): {
-                        "checked_at": checked_at,
-                        "state": state.model_dump(mode="json"),
-                    }
-                }
-            )
-        self.video_states[aid] = (checked_at, state)
-
-    async def read(self, mid, kind, page=1, *, refresh=False, verify=False, on_update=None):
+    async def read(
+        self, mid, kind, page=1, *, refresh=False, verify=False, on_update=None, discover=None
+    ):
         cached = self.cached_view(mid, kind, page)
-        if verify and cached:
+        if verify and cached and kind == "videos":
             view = cached
         else:
-            view = await self.read_page(mid, kind, page, refresh=refresh, on_update=on_update)
+            view = await self.read_page(
+                mid, kind, page, refresh=refresh or verify, on_update=on_update
+            )
         value = self._pages(mid, kind)[page - 1]
+        if discover:
+            if on_update:
+                on_update(self._view(mid, kind, page, value, cached=view.cached))
+            await discover()
         targets = list(dict.fromkeys(row.aid for row in value.entries if row.aid))
-        pending = [
-            aid
-            for aid in targets
-            if verify
-            or not self.video_observation(aid)
-            or not 0 <= self.clock() - self.video_observation(aid)[0] < 600
-        ]
+        pending = [aid for aid in targets if verify or self.interactions.needs_video(aid)]
         for index, aid in enumerate(pending):
             if on_update:
                 on_update(
@@ -351,7 +355,7 @@ class CreatorContent:
                         "可继续切换 UP 主，已读内容保留。",
                     )
                 )
-            await self.verify_video(aid, force=verify)
+            await self.interactions.verify_video(aid, force=verify)
         return self._view(
             mid,
             kind,
@@ -359,5 +363,5 @@ class CreatorContent:
             value,
             cached=view.cached,
             notice=view.notice + "比例仅统计本页；未知不算未互动。"
-            "转发状态以明确的个人状态为准，不用全站转发总数推断。",
+            "转发状态以明确的个人状态为准，不用全站转发总数推断。" + self.interactions.notice(),
         )

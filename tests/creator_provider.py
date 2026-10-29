@@ -18,6 +18,9 @@ def creator_provider(count=23):
         "repeat": False,
         "risk": None,
         "risk_flag": False,
+        "recent_likes": [],
+        "recent_coins": [],
+        "own_dynamics": [],
     }
     for number in range(count, 0, -1):
         video = {
@@ -53,6 +56,21 @@ def creator_provider(count=23):
 
     def handler(request):
         path, params = request.url.path, request.url.params
+        if path in {"/x/space/like/video", "/x/space/coin/video"}:
+            assert params["vmid"] == "42"
+            key = "recent_likes" if path.endswith("like/video") else "recent_coins"
+            return response(state[key])
+        if path.endswith("/feed/space"):
+            assert params["host_mid"] == "42"
+            return response(
+                {
+                    "items": state["own_dynamics"],
+                    "has_more": False,
+                    "offset": "",
+                    "update_baseline": "",
+                    "update_num": 0,
+                }
+            )
         scoped = path.endswith("/feed/all") and "host_mid" in params
         if not scoped and path not in {
             "/x/space/wbi/arc/search",

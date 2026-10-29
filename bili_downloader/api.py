@@ -49,6 +49,9 @@ LOGGED_API_PATHS = frozenset(
         "/x/polymer/web-dynamic/v1/feed/all/update",
         "/x/relation/followings",
         "/x/space/wbi/arc/search",
+        "/x/space/like/video",
+        "/x/space/coin/video",
+        "/x/polymer/web-dynamic/v1/feed/space",
         "/x/web-interface/archive/relation",
         "/x/web-interface/history/cursor",
         "/session_svr/v1/session_svr/get_sessions",
@@ -296,11 +299,50 @@ class Bilibili:
                 on_update(owner, view)
 
         view = await content.read(
-            mid, kind, page, refresh=refresh, verify=verify, on_update=publish
+            mid,
+            kind,
+            page,
+            refresh=refresh,
+            verify=verify,
+            on_update=publish,
+            discover=self.check_recent_actions,
         )
         if self.session is not owner or self.creator_content is not content:
             raise DownloadError("账号已变化，未发布旧账号的关注者内容")
         return view
+
+    async def check_recent_actions(self, *, force=False):
+        owner, content = self.session, self.creator_content
+        if owner is None:
+            raise DownloadError("请先登录当前账号")
+
+        def check_current():
+            if self.session is not owner or self.creator_content is not content:
+                raise DownloadError("账号已变化，未发布旧账号的近期操作")
+
+        refreshed = False
+        try:
+            refreshed = await content.interactions.refresh_recent(
+                owner.mid, force=force, check_current=check_current
+            )
+        except (
+            ApiError,
+            AuthenticationError,
+            HttpStatusError,
+            ResponseDecodeError,
+            TransportError,
+            DownloadError,
+            httpx.HTTPError,
+        ) as error:
+            check_current()
+            if self.gate.stopped:
+                raise
+            # Optional recent surfaces can be private or drift independently.
+            # Keep cached facts and current-page verification usable; this source
+            # is blocked until an explicit refresh, rather than retried on a timer.
+            log.warning("Recent interaction discovery stopped error=%s", type(error).__name__)
+        check_current()
+        return content.interactions.notice(), refreshed
 
     async def collect_followings(self, *, restart=False, on_update=None):
         owner, collection = self.session, self.following_collection

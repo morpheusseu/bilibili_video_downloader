@@ -86,6 +86,7 @@ class Engine(QThread):
     creator_updated = pyqtSignal(object, int, object)
     collection_updated = pyqtSignal(object, int, object, object, object)
     following_finished = pyqtSignal(object, int, str)
+    recent_updated = pyqtSignal(object, int, str)
 
     def __init__(self, parent=None, api_factory: Callable | None = None):
         super().__init__(parent)
@@ -287,6 +288,7 @@ class MainWindow(QMainWindow):
         self.engine.creator_updated.connect(self.show_creator)
         self.engine.collection_updated.connect(self.show_collection)
         self.engine.following_finished.connect(self.on_following_finished)
+        self.engine.recent_updated.connect(self.show_recent_actions)
         self.engine.start()
         self.busy = False
         self._following_collecting = False
@@ -458,6 +460,7 @@ class MainWindow(QMainWindow):
         self.following_panel.open_requested.connect(lambda url: QDesktopServices.openUrl(QUrl(url)))
         self.following_panel.collect_requested.connect(self.start_following_collection)
         self.following_panel.pause_requested.connect(self.pause_following_collection)
+        self.following_panel.recent_requested.connect(lambda: self.check_recent_actions(force=True))
 
         source_box, source_layout = self.section("内容来源", "01")
         form = QFormLayout()
@@ -690,6 +693,10 @@ class MainWindow(QMainWindow):
         self.following_timer.setSingleShot(True)
         self.following_timer.setInterval(1500)
         self.following_timer.timeout.connect(self.run_following_round)
+        self.recent_timer = QTimer(self)
+        self.recent_timer.setInterval(60000)
+        self.recent_timer.timeout.connect(self.check_recent_actions)
+        self.recent_timer.start()
         self.mode_changed()
 
     @staticmethod
@@ -841,6 +848,50 @@ class MainWindow(QMainWindow):
             self.following_panel.show_creator(view)
             self.artwork_timer.start()
 
+    def check_recent_actions(self, *, force=False):
+        if (
+            self.busy
+            or self._session is None
+            or self._following_kind is not None
+            or self._following_collecting
+            or not self.following_panel.isVisible()
+            or self.isMinimized()
+            or (not force and QApplication.applicationState() != Qt.ApplicationActive)
+        ):
+            return
+        self._following_ticket += 1
+        ticket = self._following_ticket
+        self._following_kind = "recent"
+        self.following_panel.set_loading(True)
+        mid, kind, page = (
+            self.following_panel.selected(),
+            self.following_panel.kind,
+            self.following_panel.page,
+        )
+
+        async def operation(api):
+            notice, refreshed = await api.check_recent_actions(force=force)
+            self.engine.recent_updated.emit(api.session, ticket, notice)
+            if mid is not None and (force or refreshed):
+                view = await api.read_creator(
+                    mid,
+                    kind,
+                    page,
+                    on_update=lambda owner, value: self.engine.creator_updated.emit(
+                        owner, ticket, value
+                    ),
+                )
+                self.engine.creator_updated.emit(api.session, ticket, view)
+
+        try:
+            self.engine.submit_following(operation, ticket)
+        except Exception as error:
+            self.on_following_finished(self._session, ticket, safe_error(error))
+
+    def show_recent_actions(self, owner, ticket, notice):
+        if owner is self._session and ticket == self._following_ticket:
+            self.following_panel.notice.setText(notice)
+
     def cancel_following_read(self):
         self._following_ticket += 1
         self._following_kind = None
@@ -848,7 +899,7 @@ class MainWindow(QMainWindow):
         self.following_panel.set_loading(False)
 
     def cancel_creator_read(self):
-        if self._following_kind == "creator":
+        if self._following_kind in {"creator", "recent"}:
             self.cancel_following_read()
             self.following_panel.notice.setText("读取已停止；已取得的页面和个人互动保留。")
             if self._following_collecting:

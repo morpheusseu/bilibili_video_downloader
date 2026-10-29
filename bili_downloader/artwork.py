@@ -1,7 +1,7 @@
 """Bounded Qt image decoding and reusable, native circular avatars."""
 
 from PyQt5.QtCore import QBuffer, QByteArray, QIODevice, QSize, Qt
-from PyQt5.QtGui import QColor, QIcon, QImageReader, QPainter, QPainterPath, QPixmap
+from PyQt5.QtGui import QColor, QIcon, QImageReader, QPainter, QPainterPath, QPen, QPixmap
 
 from .theme import COLORS
 
@@ -19,7 +19,7 @@ def decode_image(data, size=None):
     return QPixmap.fromImage(reader.read())
 
 
-def avatar_icon(pixmap, name, size=32):
+def avatar_icon(pixmap, name, size=32, *, special=False):
     canvas = QPixmap(size, size)
     canvas.fill(Qt.transparent)
     painter = QPainter(canvas)
@@ -38,5 +38,10 @@ def avatar_icon(pixmap, name, size=32):
         painter.setFont(font)
         painter.setPen(QColor(COLORS["blue"]))
         painter.drawText(canvas.rect(), Qt.AlignCenter, name[:1] or "B")
+    if special:
+        painter.setClipping(False)
+        painter.setBrush(Qt.NoBrush)
+        painter.setPen(QPen(QColor(COLORS["yellow"]), 2.5))
+        painter.drawEllipse(2, 2, size - 4, size - 4)
     painter.end()
     return QIcon(canvas)

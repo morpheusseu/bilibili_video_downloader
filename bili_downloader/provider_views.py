@@ -1,13 +1,14 @@
 """Narrow read adapters for fields/endpoints omitted by bpi-py 0.3.1.
 
 The pinned SDK owns parameters, authentication, transport and API errors. These
-response adapters retain message emoji maps and the first forwarded item.
+response adapters retain emoji maps, forwarded items and cooperative video markers.
 Video relationship reads use the same SDK transport and one typed response.
 """
 
 import json
 import logging
 
+from bpi._generated.user_models import UserUploadedVideo, UserUploadedVideoList, UserUploadedVideos
 from bpi.dynamic.models import DynamicAllData, DynamicAllItem
 from bpi.dynamic.params import DEFAULT_ALL_FEATURES, DEFAULT_ALL_WEB_LOCATION, all_query
 from bpi.message.models import PrivateMessage, SessionMessagesData
@@ -51,6 +52,20 @@ class FeedPage(DynamicAllData):
     items: list[FeedItem]
 
 
+class UploadedVideo(UserUploadedVideo):
+    # Recorded /arc/search responses include coauthored videos whose actual
+    # uploader differs from the requested space owner. The SDK drops this flag.
+    is_union_video: StrictInt = Field(default=0, ge=0, le=1)
+
+
+class UploadedVideoList(UserUploadedVideoList):
+    videos: list[UploadedVideo] = Field(default_factory=list, alias="vlist")
+
+
+class UploadedVideos(UserUploadedVideos):
+    list: UploadedVideoList
+
+
 class VideoRelationship(BaseModel):
     model_config = ConfigDict(hide_input_in_errors=True)
     like: StrictBool | None = None
@@ -67,6 +82,7 @@ class VideoRelationship(BaseModel):
 _MESSAGES = TypeAdapter(MessagePage)
 _FEED = TypeAdapter(FeedPage)
 _VIDEO_RELATION = TypeAdapter(VideoRelationship)
+_UPLOADED_VIDEOS = TypeAdapter(UploadedVideos)
 
 
 async def message_page(sdk, *, talker_id, size=20, begin_seqno=None, end_seqno=None):
@@ -117,3 +133,18 @@ async def video_relationship(sdk, aid):
     return await sdk._get_payload(
         "/x/web-interface/archive/relation", {"aid": str(aid)}, _VIDEO_RELATION
     )
+
+
+async def uploaded_videos(sdk, *, mid, page, page_size):
+    # Same pinned SDK endpoint/signing/transport; retain its omitted cooperation
+    # marker instead of weakening identity validation for all mismatching rows.
+    params = await sdk._sign(
+        {
+            "mid": str(mid),
+            "pn": str(page),
+            "ps": str(page_size),
+            "order": "pubdate",
+            "tid": "0",
+        }
+    )
+    return await sdk._get_payload("/x/space/wbi/arc/search", params, _UPLOADED_VIDEOS)

@@ -187,6 +187,20 @@ def test_following_collection_rounds_can_pause_resume_and_publish_complete_views
     app, window, monkeypatch, tmp_path
 ):
     widget, provider = window
+    entered, cancelled, release = threading.Event(), threading.Event(), asyncio.Event()
+    original = provider.handler
+
+    async def delayed(request):
+        if request.url.path.endswith("/arc/search") and request.url.params.get("mid") == "2":
+            entered.set()
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+        return original(request)
+
+    provider.handler = delayed
     widget.engine.api.cache_root = tmp_path
     monkeypatch.setattr(gui.QApplication, "applicationState", lambda: Qt.ApplicationActive)
     widget.following_timer.setInterval(1)
@@ -197,26 +211,56 @@ def test_following_collection_rounds_can_pause_resume_and_publish_complete_views
     wait_for(app, lambda: not widget.busy and panel.view is not None)
     panel.special_only.setChecked(True)
     panel.people.setCurrentItem(panel.people.topLevelItem(0))
-    wait_for(app, lambda: not widget.busy and panel.creator_view is not None)
+    wait_for(app, lambda: not panel.loading and panel.creator_view is not None)
     panel.tabs.setCurrentIndex(1)
-    wait_for(app, lambda: not widget.busy and panel.creator_view.kind == "videos")
+    wait_for(
+        app,
+        lambda: not panel.loading
+        and panel.creator_view is not None
+        and panel.creator_view.kind == "videos",
+    )
     provider.creator_state["videos"].insert(
         0, dict(provider.creator_state["videos"][0], aid=4, bvid="BV0000000004")
     )
     provider.creator_state["states"][4] = {"like": True, "coin": 1}
     panel.collect.click()
-    wait_for(app, lambda: panel.collection is not None and panel.collection.content_done >= 2)
+    wait_for(app, lambda: entered.is_set() and panel.collection is not None)
+    assert not widget.busy and panel.people.isEnabled() and panel.tabs.isEnabled()
+    panel.special_only.setChecked(False)
+
+    def select(mid):
+        return next(
+            panel.people.topLevelItem(i)
+            for i in range(panel.people.topLevelItemCount())
+            if panel.people.topLevelItem(i).data(0, Qt.UserRole).key == str(mid)
+        )
+
+    panel.people.setCurrentItem(select(8))
+    wait_for(
+        app,
+        lambda: not panel.loading
+        and panel.creator_view is not None
+        and panel.creator_view.mid == 8,
+    )
+    assert cancelled.is_set() and widget._following_collecting
     panel.pause.click()
-    wait_for(app, lambda: not widget.busy)
+    wait_for(app, lambda: widget.engine.following_task is None)
     paused = panel.collection
     assert paused is not None and not paused.done and not widget._following_collecting
     before = len(provider.requests)
     QTest.qWait(30)
     app.processEvents()
     assert len(provider.requests) == before
+    widget.engine.loop.call_soon_threadsafe(release.set)
     panel.collect.click()
-    wait_for(app, lambda: not widget.busy and panel.collection.done)
-    panel.special_only.setChecked(False)
+    wait_for(app, lambda: panel.collection.done and widget.engine.following_task is None)
+    panel.people.setCurrentItem(select(7))
+    wait_for(
+        app,
+        lambda: not panel.loading
+        and panel.creator_view is not None
+        and panel.creator_view.mid == 7,
+    )
     assert panel.people.topLevelItemCount() == 21
     assert panel.collection.content_done == 42
     assert panel.collection.interactions_done == 4
@@ -228,10 +272,63 @@ def test_following_collection_rounds_can_pause_resume_and_publish_complete_views
 
 
 @pytest.mark.parametrize("window", [creator_provider], indirect=True)
+def test_slow_creator_read_keeps_ui_live_and_new_selection_preempts_it(app, window):
+    widget, provider = window
+    entered, cancelled = threading.Event(), threading.Event()
+    original = provider.handler
+    release = asyncio.Event()
+
+    async def delayed(request):
+        if request.url.params.get("host_mid") == "7":
+            entered.set()
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+        return original(request)
+
+    provider.handler = delayed
+    widget.launch(lambda api: api.use_cookie("SESSDATA=synthetic; DedeUserID=42"))
+    wait_for(app, lambda: not widget.busy and bool(widget._library_view.items))
+    widget.following_toggle.click()
+    panel = widget.following_panel
+    wait_for(app, lambda: not widget.busy and panel.view is not None)
+    panel.people.setCurrentItem(panel.people.topLevelItem(0))
+    wait_for(app, entered.is_set)
+    assert panel.loading and not widget.busy
+    assert panel.people.isEnabled() and panel.tabs.isEnabled()
+    # A timer and ordinary UI interactions continue while the HTTP read is pending.
+    ticks = []
+    QTimer.singleShot(0, lambda: ticks.append(True))
+    wait_for(app, lambda: bool(ticks))
+    newest = next(
+        panel.people.topLevelItem(i)
+        for i in range(panel.people.topLevelItemCount())
+        if panel.people.topLevelItem(i).data(0, Qt.UserRole).key == "8"
+    )
+    panel.people.setCurrentItem(newest)
+    wait_for(app, lambda: not panel.loading and panel.creator_view is not None)
+    assert cancelled.is_set() and panel.selected() == 8 and panel.creator_view.mid == 8
+    assert not panel.items.topLevelItemCount()
+    before = len(provider.requests)
+    # Stop immediately, even before the worker registers the debounced read.
+    panel.people.setCurrentItem(panel.people.topLevelItem(0))
+    assert panel.verify.text() == "停止读取"
+    panel.verify.click()
+    QTest.qWait(200)
+    app.processEvents()
+    assert not panel.loading and len(provider.requests) == before
+    assert "读取已停止" in panel.notice.text()
+
+
+@pytest.mark.parametrize("window", [creator_provider], indirect=True)
 def test_following_directory_special_filter_creator_pages_and_stats_use_the_real_worker(
     app, window
 ):
     widget, provider = window
+    face = "https://i0.hdslb.com/bfs/face/special.png"
+    provider.content_state["followings"][6]["face"] = face
     widget.launch(lambda api: api.use_cookie("SESSDATA=synthetic; DedeUserID=42"))
     wait_for(app, lambda: not widget.busy and bool(widget._library_view.items))
     assert widget.following_toggle.isEnabled() and not widget.following_toggle.icon().isNull()
@@ -239,34 +336,66 @@ def test_following_directory_special_filter_creator_pages_and_stats_use_the_real
     panel = widget.following_panel
     wait_for(app, lambda: not widget.busy and panel.people.topLevelItemCount() == 21)
     assert panel.isVisible() and widget.content_panel.isHidden()
+    assert panel.people.columnCount() == 1
+    assert panel.people.topLevelItem(0).data(0, Qt.UserRole).key == "7"
+    assert panel.people.topLevelItem(1).data(0, Qt.UserRole).key == "1"
+
+    def gold_pixels(item):
+        image = item.icon(0).pixmap(32, 32).toImage()
+        return sum(
+            image.pixelColor(x, y).red() > 180
+            and 90 < image.pixelColor(x, y).green() < 200
+            and image.pixelColor(x, y).blue() < 60
+            for x in range(32)
+            for y in range(32)
+        )
+
+    assert gold_pixels(panel.people.topLevelItem(0)) > 50
+    assert gold_pixels(panel.people.topLevelItem(1)) == 0
+    picture = QPixmap(32, 32)
+    picture.fill(Qt.blue)
+    widget._cache_artwork(face, picture)
+    panel.update_artwork(face)
+    assert gold_pixels(panel.people.topLevelItem(0)) > 50
     assert not any("host_mid" in r.url.params for r in provider.requests)
     assert not any(r.url.path.endswith("/archive/relation") for r in provider.requests)
     before = len(provider.requests)
     panel.special_only.setChecked(True)
     app.processEvents()
     assert panel.people.topLevelItemCount() == 1
-    assert "特别关注" in panel.people.topLevelItem(0).text(1)
+    assert panel.people.columnCount() == 1
+    assert panel.people.topLevelItem(0).data(0, Qt.UserRole).special is True
     assert len(provider.requests) == before
     panel.people.setCurrentItem(panel.people.topLevelItem(0))
-    wait_for(app, lambda: not widget.busy and panel.creator_view is not None)
+    wait_for(app, lambda: not panel.loading and panel.creator_view is not None)
     assert panel.items.topLevelItemCount() == 12 and panel.next.isEnabled()
+    assert [panel.items.headerItem().text(i) for i in range(4)] == ["内容", "点赞", "投币", "转发"]
+    assert panel.items.topLevelItem(0).text(1) == "未赞"
+    assert panel.items.topLevelItem(0).text(2) == "已投"
+    assert panel.items.topLevelItem(0).text(3) == "未知"
     assert "转发：未知" in panel.stats.text() and "投币" in panel.stats.text()
     panel.items.setCurrentItem(panel.items.topLevelItem(0))
     assert "合成投稿" in panel.body.toPlainText()
+    provider.creator_state["repeat"] = True
+    panel.next.click()
+    wait_for(app, lambda: not panel.loading)
+    assert panel.page == panel.creator_view.page == 1
+    assert "未推进" in panel.notice.text() and panel.next.isEnabled()
+    provider.creator_state["repeat"] = False
     panel.next.click()
     wait_for(
         app,
-        lambda: not widget.busy and panel.page == 2 and panel.items.topLevelItemCount() == 11,
+        lambda: not panel.loading and panel.page == 2 and panel.items.topLevelItemCount() == 11,
     )
     assert not panel.next.isEnabled() and panel.previous.isEnabled()
     before = len(provider.requests)
     panel.previous.click()
-    wait_for(app, lambda: not widget.busy and panel.page == 1)
+    wait_for(app, lambda: not panel.loading and panel.page == 1)
     assert len(provider.requests) == before
     panel.tabs.setCurrentIndex(1)
     wait_for(
         app,
-        lambda: not widget.busy
+        lambda: not panel.loading
         and panel.creator_view is not None
         and panel.creator_view.kind == "videos",
     )
@@ -274,7 +403,7 @@ def test_following_directory_special_filter_creator_pages_and_stats_use_the_real
     assert len([r for r in provider.requests if r.url.path.endswith("/archive/relation")]) == 23
     provider.creator_state["states"][23] = {"like": True, "coin": 0}
     panel.verify.click()
-    wait_for(app, lambda: not widget.busy)
+    wait_for(app, lambda: not panel.loading)
     assert panel.creator_view.entries[0].liked is True
     assert panel.creator_view.entries[0].coined is False
     assert len([r for r in provider.requests if r.url.path.endswith("/archive/relation")]) == 43

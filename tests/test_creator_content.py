@@ -1,5 +1,7 @@
 import asyncio
+import json
 from copy import deepcopy
+from pathlib import Path
 
 import pytest
 from creator_provider import creator_provider
@@ -12,6 +14,56 @@ from bili_downloader.sources import DownloadError
 
 def relation_reads(provider):
     return [r for r in provider.requests if r.url.path.endswith("/archive/relation")]
+
+
+async def test_selected_cached_content_page_still_fills_missing_personal_states(tmp_path):
+    provider = creator_provider(3)
+    provider.cache_root = tmp_path
+    async with provider.api() as api:
+        await api.use_cookie("SESSDATA=synthetic; DedeUserID=42")
+        await api.read_account_content("followings")
+        # Bulk collection acquired metadata, then paused before its interaction phase.
+        page = await api.creator_content.read_page(7, "videos")
+        assert all(row.liked is None and row.coined is None for row in page.entries)
+    async with provider.api() as api:
+        await api.use_cookie("SESSDATA=synthetic; DedeUserID=42")
+        updates = []
+        completed = await api.read_creator(
+            7, "videos", on_update=lambda _, view: updates.append(view)
+        )
+        assert completed.cached
+        assert all(row.liked is not None and row.coined is not None for row in completed.entries)
+        assert updates[0].entries[0].liked is None
+        assert len(relation_reads(provider)) == 3
+        assert len([r for r in provider.requests if r.url.path.endswith("/arc/search")]) == 1
+        before = len(provider.requests)
+        await api.read_creator(7, "videos")
+        assert len(provider.requests) == before
+
+
+@pytest.mark.parametrize("cooperative", [True, False])
+async def test_recorded_cooperative_submission_preserves_actual_author_and_validates_ordinary_rows(
+    cooperative,
+):
+    # Live /arc/search returned is_union_video=1 with a different uploader;
+    # this fixture retains that shape with synthetic IDs/text.
+    row = json.loads((Path(__file__).parent / "fixtures/cooperative_submission.json").read_text())
+    row["is_union_video"] = int(cooperative)
+    provider = creator_provider(1)
+    provider.creator_state["videos"] = [row]
+    provider.creator_state["states"][9001] = {"like": True, "coin": 1}
+    async with provider.api() as api:
+        await api.use_cookie("SESSDATA=synthetic; DedeUserID=42")
+        await api.read_account_content("followings")
+        if cooperative:
+            page = await api.read_creator(7, "videos")
+            assert "合作投稿" in page.entries[0].content.summary
+            assert "合成合作作者" in page.entries[0].content.body
+            assert page.entries[0].liked and page.entries[0].coined
+        else:
+            with pytest.raises(DownloadError, match="作者"):
+                await api.read_creator(7, "videos")
+            assert not relation_reads(provider)
 
 
 async def test_selected_author_pages_share_video_observations_and_keep_dynamic_likes_distinct(

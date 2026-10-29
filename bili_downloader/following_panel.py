@@ -22,15 +22,20 @@ from .account_content import local_time
 
 
 def interaction_text(entry):
-    def flag(value):
-        return "✓" if value is True else "—" if value is False else "?"
+    def flag(value, yes, no):
+        return yes if value is True else no if value is False else "未知"
 
-    return f"赞 {flag(entry.liked)} · 转发 {flag(entry.reposted)} · 币 {flag(entry.coined)}"
+    return (
+        f"点赞 {flag(entry.liked, '已赞', '未赞')} · "
+        f"投币 {flag(entry.coined, '已投', '未投')} · "
+        f"转发 {flag(entry.reposted, '已转', '未转')}"
+    )
 
 
 class FollowingPanel(QFrame):
     list_requested = pyqtSignal(bool)
     creator_requested = pyqtSignal(object, str, int, bool, bool)
+    creator_cancel_requested = pyqtSignal()
     open_requested = pyqtSignal(str)
     collect_requested = pyqtSignal()
     pause_requested = pyqtSignal()
@@ -42,6 +47,7 @@ class FollowingPanel(QFrame):
         self.view, self.creator_view = None, None
         self.busy, self.logged_in, self.page = False, False, 1
         self.collection, self.collecting = None, False
+        self.loading = False
         layout = QVBoxLayout(self)
         layout.setContentsMargins(24, 20, 24, 20)
         heading = QHBoxLayout()
@@ -79,11 +85,10 @@ class FollowingPanel(QFrame):
         self.splitter = QSplitter(Qt.Horizontal)
         self.people = QTreeWidget()
         self.people.setAccessibleName("关注的人列表")
-        self.people.setHeaderLabels(["UP 主", "关注类型"])
+        self.people.setHeaderLabels(["UP 主"])
         self.people.setRootIsDecorated(False)
         self.people.setIconSize(QSize(32, 32))
         self.people.header().setSectionResizeMode(0, QHeaderView.Stretch)
-        self.people.header().setSectionResizeMode(1, QHeaderView.ResizeToContents)
         self.splitter.addWidget(self.people)
         right = QWidget()
         content = QVBoxLayout(right)
@@ -103,7 +108,7 @@ class FollowingPanel(QFrame):
         controls.addWidget(self.refresh_creator)
         controls.addWidget(self.verify)
         content.addLayout(controls)
-        self.stats = QLabel("点赞 / 转发 / 投币：选择 UP 主后统计本页；未知不计为未互动。")
+        self.stats = QLabel("点赞 / 投币 / 转发：选择 UP 主后统计本页；未知不计为未互动。")
         self.stats.setTextFormat(Qt.PlainText)
         self.stats.setWordWrap(True)
         self.stats.setObjectName("hint")
@@ -115,16 +120,17 @@ class FollowingPanel(QFrame):
         content.addWidget(self.stats)
         self.items = QTreeWidget()
         self.items.setAccessibleName("关注者内容列表")
-        self.items.setHeaderLabels(["内容", "我的互动"])
+        self.items.setHeaderLabels(["内容", "点赞", "投币", "转发"])
         self.items.setRootIsDecorated(False)
         self.items.setIconSize(QSize(48, 40))
         self.items.header().setSectionResizeMode(0, QHeaderView.Stretch)
-        self.items.header().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        for column in range(1, 4):
+            self.items.header().setSectionResizeMode(column, QHeaderView.ResizeToContents)
         content.addWidget(self.items, 1)
         self.body = QPlainTextEdit()
         self.body.setReadOnly(True)
         self.body.setMaximumHeight(110)
-        self.body.setPlaceholderText("选择条目查看正文；? 为未知，— 为接口返回未互动。")
+        self.body.setPlaceholderText("选择条目查看正文；未知表示接口未提供或尚待核验。")
         content.addWidget(self.body)
         paging = QHBoxLayout()
         self.previous = QPushButton("上一页")
@@ -152,7 +158,7 @@ class FollowingPanel(QFrame):
         self.people.itemSelectionChanged.connect(self.select_person)
         self.tabs.currentChanged.connect(self.select_person)
         self.refresh_creator.clicked.connect(lambda: self.request_page(1, refresh=True))
-        self.verify.clicked.connect(lambda: self.request_page(self.page, verify=True))
+        self.verify.clicked.connect(self.verify_current)
         self.previous.clicked.connect(lambda: self.request_page(self.page - 1))
         self.next.clicked.connect(lambda: self.request_page(self.page + 1))
         self.items.itemSelectionChanged.connect(self.select_item)
@@ -175,21 +181,21 @@ class FollowingPanel(QFrame):
         selected = self.selected()
         self.people.blockSignals(True)
         self.people.clear()
-        for row in self.view.items if self.view else ():
+        rows = sorted(self.view.items, key=lambda row: row.special is not True) if self.view else ()
+        for row in rows:
             if self.special_only.isChecked() and row.special is not True:
                 continue
-            label = (
-                "★ 特别关注" if row.special else "普通关注" if row.special is False else "未核验"
-            )
-            item = QTreeWidgetItem([row.title, label])
+            item = QTreeWidgetItem([row.title])
             item.setData(0, Qt.UserRole, row)
             item.setToolTip(0, row.body)
-            item.setIcon(0, self.avatars(row.image, row.title))
+            item.setIcon(0, self.avatars(row.image, row.title, special=row.special is True))
             self.people.addTopLevelItem(item)
             if row.key == str(selected):
                 self.people.setCurrentItem(item)
         self.people.blockSignals(False)
         if self.selected() is None:
+            if selected is not None:
+                self.creator_cancel_requested.emit()
             self.creator_view = None
             self.items.clear()
             self.body.clear()
@@ -212,10 +218,18 @@ class FollowingPanel(QFrame):
         self.body.clear()
         row = self.people.currentItem()
         self.author.setText(row.text(0) if row else "选择一位关注的 UP 主")
-        self.stats.setText("正在读取最新一页…" if row else "选择 UP 主后统计本页。")
+        self.stats.setText("后台读取最新页，可继续切换 UP 主…" if row else "选择 UP 主后统计本页。")
         self.update_controls()
         if row and not self.busy:
             self.request_page(1)
+        elif row is None:
+            self.creator_cancel_requested.emit()
+
+    def verify_current(self):
+        if self.loading:
+            self.creator_cancel_requested.emit()
+        else:
+            self.request_page(self.page, verify=True)
 
     def request_page(self, page, *, refresh=False, verify=False):
         mid = self.selected()
@@ -234,9 +248,27 @@ class FollowingPanel(QFrame):
         self.body.clear()
         for entry in view.entries:
             row = entry.content
-            item = QTreeWidgetItem([row.title, interaction_text(entry)])
+            values = (entry.liked, entry.coined, entry.reposted)
+            labels = (("已赞", "未赞"), ("已投", "未投"), ("已转", "未转"))
+            item = QTreeWidgetItem(
+                [
+                    row.title,
+                    *(
+                        yes if value is True else no if value is False else "未知"
+                        for value, (yes, no) in zip(values, labels, strict=True)
+                    ),
+                ]
+            )
             item.setData(0, Qt.UserRole, entry)
             item.setToolTip(0, row.summary)
+            for column in range(1, 4):
+                item.setTextAlignment(column, Qt.AlignCenter)
+                item.setToolTip(
+                    column,
+                    "个人状态；未知不代表没有操作。"
+                    if column != 3
+                    else "个人转发状态；平台未提供时保持未知，不能用转发总数推断。",
+                )
             item.setIcon(
                 0,
                 self.avatars(row.image, row.title)
@@ -274,6 +306,24 @@ class FollowingPanel(QFrame):
         self.busy, self.logged_in = busy, logged_in
         self.update_controls()
 
+    def set_loading(self, loading):
+        self.loading = loading
+        if not loading and self.creator_view is not None:
+            self.page = self.creator_view.page
+        if not loading and self.creator_view is None:
+            self.stats.setText(
+                "暂无可统计内容；可重新检查最新页。"
+                if self.selected() is not None
+                else "选择 UP 主后统计本页。"
+            )
+        self.verify.setText("停止读取" if loading else "校验本页互动")
+        self.verify.setToolTip(
+            "停止当前只读采集，已取得的内容和互动保留。"
+            if loading
+            else "只读核验本页点赞和投币；切换 UP 主会优先读取新的选择。"
+        )
+        self.update_controls()
+
     def show_collection(self, progress, *, running=False):
         self.collection, self.collecting = progress, running
         if progress is not None:
@@ -291,7 +341,7 @@ class FollowingPanel(QFrame):
 
     def update_controls(self):
         ready = self.logged_in and not self.busy
-        self.collect.setEnabled(ready and not self.collecting)
+        self.collect.setEnabled(ready and not self.collecting and not self.loading)
         self.pause.setEnabled(self.logged_in and self.collecting)
         target = ready and self.selected() is not None
         self.people.setEnabled(ready)
@@ -300,15 +350,19 @@ class FollowingPanel(QFrame):
         self.more.setEnabled(ready and self.view is not None and self.view.has_more)
         self.tabs.setEnabled(ready)
         self.refresh_creator.setEnabled(target)
-        self.verify.setEnabled(target and self.creator_view is not None)
-        self.previous.setEnabled(target and self.page > 1)
+        self.verify.setEnabled(target and (self.loading or self.creator_view is not None))
+        self.previous.setEnabled(target and not self.loading and self.page > 1)
         self.next.setEnabled(
-            target and self.creator_view is not None and self.creator_view.has_more
+            target
+            and not self.loading
+            and self.creator_view is not None
+            and self.creator_view.has_more
         )
         self.open.setEnabled(ready and self.items.currentItem() is not None)
 
     def clear(self):
         self.view, self.creator_view, self.page = None, None, 1
+        self.set_loading(False)
         self.special_only.setChecked(False)
         self.show_collection(None)
         self.collection_status.setText("尚未开始全部采集；随时可暂停，重启后可从保存的进度继续。")
@@ -336,7 +390,9 @@ class FollowingPanel(QFrame):
                 if row.image == url:
                     item.setIcon(
                         0,
-                        self.avatars(row.image, row.title)
-                        if tree is self.people or row.image_role == "avatar"
+                        self.avatars(row.image, row.title, special=row.special is True)
+                        if tree is self.people
+                        else self.avatars(row.image, row.title)
+                        if row.image_role == "avatar"
                         else QIcon(self.images(row.image)),
                     )

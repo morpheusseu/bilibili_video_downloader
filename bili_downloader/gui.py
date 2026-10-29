@@ -59,10 +59,8 @@ from .api import Bilibili, safe_error
 from .artwork import avatar_icon, decode_image
 from .auth import Session, forget_session, load_session, save_session
 from .browser_login import chrome_login
-from .creator_content import CreatorView
 from .download import Progress, download_source
 from .download_button import DownloadButton
-from .following_collection import FollowingProgress
 from .following_panel import FollowingPanel
 from .inbox import InboxView, MessageView, SendReceipt, validate_reply
 from .inbox_panel import InboxPanel
@@ -85,8 +83,9 @@ class Engine(QThread):
     inbox_updated = pyqtSignal(object, object, object, int)
     inbox_status = pyqtSignal(object, object)
     library_updated = pyqtSignal(object, object)
-    creator_updated = pyqtSignal(object, object)
-    collection_updated = pyqtSignal(object, object, object, object)
+    creator_updated = pyqtSignal(object, int, object)
+    collection_updated = pyqtSignal(object, int, object, object, object)
+    following_finished = pyqtSignal(object, int, str)
 
     def __init__(self, parent=None, api_factory: Callable | None = None):
         super().__init__(parent)
@@ -94,6 +93,8 @@ class Engine(QThread):
         self.ready = threading.Event()
         self.future = None
         self.active = None
+        self.following_task = None
+        self.following_ticket = 0
         self.cancel_requested = False
         self.artwork_task = None
         self.closing = False
@@ -116,6 +117,7 @@ class Engine(QThread):
             if self.active:
                 self.active.cancel()
                 await asyncio.gather(self.active, return_exceptions=True)
+            await self.stop_following()
             await self.stop_artwork()
 
     def submit(self, operation):
@@ -129,6 +131,7 @@ class Engine(QThread):
     async def perform(self, operation):
         self.active = asyncio.current_task()
         try:
+            await self.stop_following()
             await self.stop_artwork()
             if self.cancel_requested:
                 raise asyncio.CancelledError
@@ -148,6 +151,54 @@ class Engine(QThread):
                 )
             self.api.start_inbox_live(self.inbox_updated.emit, self.inbox_status.emit)
             self.idle.emit()
+
+    def submit_following(self, operation, ticket):
+        if self.closing or not self.ready.is_set():
+            raise DownloadError("后台尚未就绪，请稍后重试")
+        asyncio.run_coroutine_threadsafe(self.perform_following(operation, ticket), self.loop)
+
+    async def perform_following(self, operation, ticket):
+        # New selections preempt prior reads/collection rounds. UI tickets also
+        # reject late A -> B -> A results; SQLite stays on this one worker loop.
+        if ticket < self.following_ticket:
+            return
+        self.following_ticket = ticket
+        current = asyncio.current_task()
+        previous, self.following_task = self.following_task, current
+        owner, error = self.api.session, ""
+        try:
+            if previous is not None:
+                previous.cancel()
+                await asyncio.gather(previous, return_exceptions=True)
+            await self.stop_artwork()
+            if self.active is not None or owner is None:
+                raise asyncio.CancelledError
+            await operation(self.api)
+        except asyncio.CancelledError:
+            pass
+        except Exception as caught:
+            error = safe_error(caught)
+        finally:
+            if self.following_task is current:
+                self.following_task = None
+            self.following_finished.emit(owner, ticket, error)
+
+    async def stop_following(self):
+        task = self.following_task
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    def cancel_following(self, ticket):
+        if self.ready.is_set() and not self.loop.is_closed():
+            self.loop.call_soon_threadsafe(self._cancel_following, ticket)
+
+    def _cancel_following(self, ticket):
+        if ticket < self.following_ticket:
+            return
+        self.following_ticket = ticket
+        if self.following_task is not None:
+            self.following_task.cancel()
 
     async def stop_artwork(self):
         if self.artwork_task:
@@ -235,9 +286,12 @@ class MainWindow(QMainWindow):
         self.engine.library_updated.connect(self.show_cached_library)
         self.engine.creator_updated.connect(self.show_creator)
         self.engine.collection_updated.connect(self.show_collection)
+        self.engine.following_finished.connect(self.on_following_finished)
         self.engine.start()
         self.busy = False
         self._following_collecting = False
+        self._following_ticket = 0
+        self._following_kind = None
         self._session_mid = None
         self._session = None
         self._live_kind = None
@@ -400,6 +454,7 @@ class MainWindow(QMainWindow):
         self.following_toggle.toggled.connect(self.toggle_followings)
         self.following_panel.list_requested.connect(self.load_followings)
         self.following_panel.creator_requested.connect(self.load_creator)
+        self.following_panel.creator_cancel_requested.connect(self.cancel_creator_read)
         self.following_panel.open_requested.connect(lambda url: QDesktopServices.openUrl(QUrl(url)))
         self.following_panel.collect_requested.connect(self.start_following_collection)
         self.following_panel.pause_requested.connect(self.pause_following_collection)
@@ -731,6 +786,8 @@ class MainWindow(QMainWindow):
     def toggle_followings(self, visible):
         self.following_panel.setVisible(visible)
         self.update_intro()
+        if not visible:
+            self.cancel_following_read()
         if visible:
             self.library_toggle.setChecked(False)
             self.inbox_toggle.setChecked(False)
@@ -756,24 +813,63 @@ class MainWindow(QMainWindow):
     def load_creator(self, mid, kind, page, refresh=False, verify=False):
         if self.busy or self._session_mid is None:
             return
-        self.launch(
-            lambda api: api.read_creator(
-                mid,
-                kind,
-                page,
-                refresh=refresh,
-                verify=verify,
-                on_update=self.engine.creator_updated.emit,
-            ),
-            "正在读取所选 UP 主",
-            "先显示已保存页面；视频互动按请求间隔逐条核验，可取消。",
-            kind="following",
-        )
+        self.following_timer.stop()
+        self._following_ticket += 1
+        ticket = self._following_ticket
+        self._following_kind = "creator"
+        self.following_panel.set_loading(True)
 
-    def show_creator(self, owner, view):
-        if owner is self._session:
+        async def operation(api):
+            # Rapid navigation only fetches the final choice; Qt stays usable.
+            await asyncio.sleep(0.15)
+
+            def publish(owner, view):
+                self.engine.creator_updated.emit(owner, ticket, view)
+
+            view = await api.read_creator(
+                mid, kind, page, refresh=refresh, verify=verify, on_update=publish
+            )
+            publish(api.session, view)
+
+        try:
+            self.engine.submit_following(operation, ticket)
+        except Exception as error:
+            self.on_following_finished(self._session, ticket, safe_error(error))
+
+    def show_creator(self, owner, ticket, view):
+        if owner is self._session and ticket == self._following_ticket:
             self.following_panel.show_creator(view)
             self.artwork_timer.start()
+
+    def cancel_following_read(self):
+        self._following_ticket += 1
+        self._following_kind = None
+        self.engine.cancel_following(self._following_ticket)
+        self.following_panel.set_loading(False)
+
+    def cancel_creator_read(self):
+        if self._following_kind == "creator":
+            self.cancel_following_read()
+            self.following_panel.notice.setText("读取已停止；已取得的页面和个人互动保留。")
+            if self._following_collecting:
+                self.following_timer.start()
+
+    def on_following_finished(self, owner, ticket, error):
+        if owner is not self._session or ticket != self._following_ticket:
+            return
+        kind, self._following_kind = self._following_kind, None
+        self.following_panel.set_loading(False)
+        if error:
+            if kind == "collection":
+                self.pause_following_collection()
+                self.following_panel.collection_status.setText(
+                    error + "；采集已暂停，已完成部分保存。"
+                )
+            else:
+                self.following_panel.notice.setText(error + "；已读内容保留，没有自动重试。")
+        elif self._following_collecting:
+            self.following_timer.start()
+        self.artwork_timer.start()
 
     def start_following_collection(self):
         if self.busy or self._session is None:
@@ -787,14 +883,15 @@ class MainWindow(QMainWindow):
         self._following_collecting = False
         self.following_timer.stop()
         self.following_panel.show_collection(self.following_panel.collection)
-        if self._job == "following_collection":
-            self.engine.cancel()
+        if self._following_kind == "collection":
+            self.cancel_following_read()
 
     def run_following_round(self):
         if not self._following_collecting or self._session is None or self.engine.closing:
             return
         if (
             self.busy
+            or self._following_kind is not None
             or not self.following_panel.isVisible()
             or self.isMinimized()
             or QApplication.applicationState() != Qt.ApplicationActive
@@ -803,6 +900,9 @@ class MainWindow(QMainWindow):
             return
         progress = self.following_panel.collection
         restart = bool(progress and progress.done)
+        self._following_ticket += 1
+        ticket = self._following_ticket
+        self._following_kind = "collection"
         mid, kind, page = (
             self.following_panel.selected(),
             self.following_panel.kind,
@@ -816,22 +916,21 @@ class MainWindow(QMainWindow):
                 view = api.creator_content.cached_view(mid, kind, page) if mid is not None else None
                 self.engine.collection_updated.emit(
                     owner,
+                    ticket,
                     progress,
                     api.account_content.views.get("followings"),
                     view,
                 )
 
-            return await api.collect_followings(restart=restart, on_update=publish)
+            await api.collect_followings(restart=restart, on_update=publish)
 
-        self.launch(
-            operation,
-            "正在分轮采集关注内容",
-            "每轮最多 6 项；先收齐最新内容，再补视频互动，已完成部分保存，可暂停。",
-            kind="following_collection",
-        )
+        try:
+            self.engine.submit_following(operation, ticket)
+        except Exception as error:
+            self.on_following_finished(self._session, ticket, safe_error(error))
 
-    def show_collection(self, owner, progress, directory=None, creator=None):
-        if owner is not self._session:
+    def show_collection(self, owner, ticket, progress, directory=None, creator=None):
+        if owner is not self._session or ticket != self._following_ticket:
             return
         if progress.done:
             self._following_collecting = False
@@ -1168,8 +1267,8 @@ class MainWindow(QMainWindow):
                 self.favorite_items.setCurrentItem(item)
         self.favorite_items.verticalScrollBar().setValue(position)
 
-    def avatar_for(self, url, name):
-        return avatar_icon(self.pixmap_for(url), name)
+    def avatar_for(self, url, name, *, special=False):
+        return avatar_icon(self.pixmap_for(url), name, special=special)
 
     def pixmap_for(self, url):
         pixmap = self._artwork.get(url, QPixmap())
@@ -1338,7 +1437,7 @@ class MainWindow(QMainWindow):
         if kind == "login":
             self.account_dialog.status.setText(note)
         self.details.set_progress(kind == "download")
-        if kind not in {"library", "content", "following", "following_collection"}:
+        if kind not in {"library", "content", "following"}:
             self.details.setChecked(True)
         self.task_title.setText(title)
         self.status.setText(note)
@@ -1364,9 +1463,6 @@ class MainWindow(QMainWindow):
             self.following_timer.start()
 
     def show_error(self, text):
-        if self._job == "following_collection":
-            self.pause_following_collection()
-            self.following_panel.collection_status.setText(text + "；采集已暂停，已完成部分保存。")
         self.details.setChecked(True)
         if self._job == "login":
             self.account_dialog.status.setText(text)
@@ -1388,8 +1484,6 @@ class MainWindow(QMainWindow):
         self.log.appendPlainText(text)
 
     def show_cancelled(self):
-        if self._job == "following_collection":
-            self.pause_following_collection()
         self.details.setChecked(True)
         if self._job == "login":
             self.account_dialog.status.setText("登录已取消；没有保存新的凭证。")
@@ -1435,6 +1529,7 @@ class MainWindow(QMainWindow):
         mid = session.mid if session else None
         if session is not self._session:
             self.pause_following_collection()
+            self.cancel_following_read()
             self._library_view = FavoriteView()
             self.folders.blockSignals(True)
             self.folders.clear()
@@ -1536,13 +1631,6 @@ class MainWindow(QMainWindow):
                 self.content_panel.show_view(result)
             self.task_title.setText(TITLES[result.kind] + "已读取")
             self.status.setText(f"已加载 {len(result.items)} 项；" + result.notice)
-        elif isinstance(result, CreatorView):
-            self.following_panel.show_creator(result)
-            self.status.setText(
-                f"已读取第 {result.page} 页 · {len(result.entries)} 条；" + result.notice
-            )
-        elif isinstance(result, FollowingProgress):
-            self.show_collection(self._session, result)
         elif isinstance(result, InboxView):
             self.task_title.setText("私信会话已读取")
             self.inbox_panel.show_inbox(result, self._session_mid)

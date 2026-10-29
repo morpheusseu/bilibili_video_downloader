@@ -11,7 +11,7 @@ import time
 from dataclasses import asdict, dataclass, replace
 
 from .account_content import ContentItem, dynamic_item, local_time
-from .provider_views import VideoRelationship, feed_page, video_relationship
+from .provider_views import VideoRelationship, feed_page, uploaded_videos, video_relationship
 from .sources import DownloadError
 
 log = logging.getLogger(__name__)
@@ -65,7 +65,7 @@ class CreatorView:
         total = len(self.entries)
         if not total:
             return "本页暂无内容，没有可统计的个人互动。"
-        for name, field in (("点赞", "liked"), ("转发", "reposted"), ("投币", "coined")):
+        for name, field in (("点赞", "liked"), ("投币", "coined"), ("转发", "reposted")):
             known = [getattr(row, field) for row in self.entries if getattr(row, field) is not None]
             positive = sum(known)
             if not known:
@@ -112,15 +112,26 @@ def dynamic_entry(item, mid):
 
 
 def video_entry(video, mid):
-    if video.mid != mid or video.aid <= 0:
+    if video.aid <= 0 or video.mid <= 0 or (video.mid != mid and not video.is_union_video):
         raise DownloadError("投稿作者或视频标识不匹配，保留原缓存")
     stamp = local_time(video.created)
     content = ContentItem(
         str(video.aid),
         video.title,
-        f"{video.author} · {stamp} · {video.length}",
+        ("合作投稿 · " if video.is_union_video else "")
+        + f"{video.author} · {stamp} · {video.length}",
         "\n\n".join(
-            filter(None, (video.title, video.description, video.author, stamp, video.bvid))
+            filter(
+                None,
+                (
+                    video.title,
+                    video.description,
+                    video.author,
+                    stamp,
+                    video.bvid,
+                    "合作投稿；按平台原字段展示实际作者。" if video.is_union_video else "",
+                ),
+            )
         ),
         "cover",
         f"https://www.bilibili.com/video/av{video.aid}",
@@ -269,7 +280,7 @@ class CreatorContent:
             if has_more and (not next_cursor or next_cursor == cursor):
                 raise DownloadError("关注者动态分页未推进，保留原缓存")
         else:
-            data = await self.sdk.user.uploaded_videos(mid=mid, page=page, page_size=PAGE_SIZE)
+            data = await uploaded_videos(self.sdk, mid=mid, page=page, page_size=PAGE_SIZE)
             if data.is_risk or data.page.pn != page or data.page.count < 0:
                 raise DownloadError("投稿列表未通过页面或风控检查，已停止")
             entries = tuple(video_entry(item, mid) for item in data.list.videos)
@@ -318,8 +329,6 @@ class CreatorContent:
             view = cached
         else:
             view = await self.read_page(mid, kind, page, refresh=refresh, on_update=on_update)
-            if view.cached:
-                return view
         value = self._pages(mid, kind)[page - 1]
         targets = list(dict.fromkeys(row.aid for row in value.entries if row.aid))
         pending = [
@@ -337,8 +346,9 @@ class CreatorContent:
                         kind,
                         page,
                         value,
-                        notice=f"正在核验视频互动 {index + 1}/{len(pending)}"
-                        "；可取消并保留已读页面。",
+                        cached=view.cached,
+                        notice=f"后台核验互动 {index + 1}/{len(pending)}；"
+                        "可继续切换 UP 主，已读内容保留。",
                     )
                 )
             await self.verify_video(aid, force=verify)
@@ -347,6 +357,7 @@ class CreatorContent:
             kind,
             page,
             value,
+            cached=view.cached,
             notice=view.notice + "比例仅统计本页；未知不算未互动。"
             "转发状态以明确的个人状态为准，不用全站转发总数推断。",
         )

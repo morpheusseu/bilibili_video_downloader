@@ -460,22 +460,24 @@ class InboxPanel(QFrame):
                             urls.append(part.url)
         return urls
 
-    def update_artwork(self, url):
-        url = canonical_image_url(url)
+    def update_artwork(self, urls):
+        urls = {canonical_image_url(url) for url in urls}
         scrollbar = self.body.verticalScrollBar()
         at_bottom = scrollbar.value() >= scrollbar.maximum() - 4
         resized = False
         for index in range(self.sessions.topLevelItemCount()):
             item = self.sessions.topLevelItem(index)
-            if canonical_image_url(item.data(0, Qt.UserRole + 1)) == url:
+            url = item.data(0, Qt.UserRole + 1)
+            if canonical_image_url(url) in urls:
                 item.setIcon(0, self.avatars(url, item.text(0)))
         for index in range(self.body.count()):
             item = self.body.item(index)
-            if canonical_image_url(item.data(Qt.UserRole + 1)) == url:
+            url = item.data(Qt.UserRole + 1)
+            if canonical_image_url(url) in urls:
                 item.setIcon(self.avatars(url, item.data(Qt.UserRole + 2)))
             content = item.data(CONTENT_ROLE)
             if content and any(
-                isinstance(part, MessageImage) and canonical_image_url(part.url) == url
+                isinstance(part, MessageImage) and canonical_image_url(part.url) in urls
                 for part in content.parts
             ):
                 self.message_delegate.sizeHintChanged.emit(self.body.indexFromItem(item))

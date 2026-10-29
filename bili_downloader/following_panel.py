@@ -449,14 +449,14 @@ class FollowingPanel(QFrame):
                     urls.append(row.image if tree is self.people else row.content.image)
         return urls
 
-    def update_artwork(self, url):
-        url = canonical_image_url(url)
+    def update_artwork(self, urls):
+        urls = {canonical_image_url(url) for url in urls}
         for tree in (self.people, self.items):
             for index in range(tree.topLevelItemCount()):
                 item = tree.topLevelItem(index)
                 row = item.data(0, Qt.UserRole)
                 row = row if tree is self.people else row.content
-                if canonical_image_url(row.image) == url:
+                if canonical_image_url(row.image) in urls:
                     item.setIcon(
                         0,
                         self.avatars(row.image, row.title, special=row.special is True)

@@ -213,7 +213,7 @@ class AccountCache:
         except (sqlite3.Error, ValueError, KeyError, TypeError):
             raise DownloadError("持久消息缓存校验失败，未加载其游标") from None
 
-    def image(self, url):
+    def image(self, url, *, touch=True):
         db = self._db()
         key, now = self._key(url), self.clock()
         try:
@@ -233,7 +233,8 @@ class AccountCache:
                 body = row[1]
                 if not isinstance(body, bytes) or not body:
                     raise ValueError("Invalid image body")
-                db.execute("UPDATE images SET touched=? WHERE key=?", (now, key))
+                if touch:
+                    db.execute("UPDATE images SET touched=? WHERE key=?", (now, key))
             log.info("Image cache reused bytes=%s", len(body))
             return body
         except (sqlite3.Error, ValueError, TypeError):

@@ -537,6 +537,13 @@ class Bilibili:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
 
+    def cached_image(self, value):
+        """Local-only lookup; displayed hits are renewed together by Qt."""
+        value = canonical_image_url(value)
+        if value and self.cache is not None:
+            return self.cache.image(value, touch=False)
+        return None
+
     async def cdn_image(self, value: str) -> bytes:
         value = canonical_image_url(value)
         if not value:

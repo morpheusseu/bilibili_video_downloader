@@ -264,6 +264,7 @@ def test_account_image_idle_expiry_isolation_and_precise_forget(tmp_path):
     one.put_many({("inbox", "head"): []})
     clock[0] += 20 * 86400
     assert one.image("image-0") == PNG
+    assert one.image("image-2", touch=False) == PNG  # Merely probing is not a displayed hit.
     assert one.get("inbox", "head") == []
     clock[0] += 15 * 86400
     assert one.image("image-0") == PNG

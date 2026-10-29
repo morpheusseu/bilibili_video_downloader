@@ -438,7 +438,7 @@ def test_following_directory_special_filter_creator_pages_and_stats_use_the_real
     picture = QPixmap(32, 32)
     picture.fill(Qt.blue)
     widget._cache_artwork(face, picture)
-    panel.update_artwork(face)
+    panel.update_artwork({face})
     assert gold_pixels(panel.people.topLevelItem(0)) > 50
     assert not any("host_mid" in r.url.params for r in provider.requests)
     assert not any(r.url.path.endswith("/archive/relation") for r in provider.requests)
@@ -745,7 +745,7 @@ def test_closed_worker_rejects_late_login_refresh_and_artwork(app, window):
     assert widget.engine.shutdown()
     widget._session_mid = 42
     widget.load_library()
-    widget.engine.request_artwork("https://i0.hdslb.com/bfs/face/late.png")
+    widget.engine.request_artwork(widget._session, 1, ("https://i0.hdslb.com/bfs/face/late.png",))
     with pytest.raises(DownloadError, match="后台已关闭"):
         widget.engine.submit(lambda api: api.sdk.login.nav())
     app.processEvents()
@@ -906,6 +906,107 @@ def cover_provider(count=21):
     return provider
 
 
+@pytest.mark.parametrize("window", [creator_provider], indirect=True)
+@pytest.mark.parametrize("status", [200, 429])
+def test_visible_cached_avatars_restore_together_before_a_slow_miss_and_after_restart(
+    app, window, monkeypatch, tmp_path, status
+):
+    widget, provider = window
+    monkeypatch.setattr(gui.QApplication, "applicationState", lambda: Qt.ApplicationInactive)
+    monkeypatch.setattr(gui, "ARTWORK_BATCH", 2)  # Exercise multiple cache groups in one viewport.
+    provider.cache_root = tmp_path
+    widget.engine.api.cache_root = tmp_path
+    missing = "https://i0.hdslb.com/bfs/face/batch7.png"
+    cache = AccountCache(tmp_path, 42)
+    try:
+        for row in provider.content_state["followings"]:
+            row["face"] = f"https://i0.hdslb.com/bfs/face/batch{row['mid']}.png"
+            if row["face"] != missing:
+                cache.put_image(row["face"], PNG)
+    finally:
+        cache.close()
+    entered, release = threading.Event(), asyncio.Event()
+    decoded_threads, updates = [], []
+    original_decode = gui.decode_qimage
+    main_thread = threading.get_ident()
+
+    def decode(body, size):
+        decoded_threads.append(threading.get_ident())
+        return original_decode(body, size)
+
+    monkeypatch.setattr(gui, "decode_qimage", decode)
+
+    async def image(request):
+        assert str(request.url) == missing and "cookie" not in request.headers
+        entered.set()
+        await release.wait()
+        return httpx.Response(status, content=PNG, headers={"content-type": "image/png"})
+
+    provider.image_handler = image
+    widget.engine.artwork_ready.connect(
+        lambda owner, ticket, pictures, complete, error: updates.append((set(pictures), complete))
+    )
+    widget.launch(lambda api: api.use_cookie("SESSDATA=synthetic; DedeUserID=42"))
+    wait_for(app, lambda: not widget.busy and bool(widget._library_view.items))
+    widget.following_toggle.click()
+    panel = widget.following_panel
+    wait_for(app, lambda: panel.view is not None and not panel.directory_loading)
+    panel.people.scrollToTop()
+    visible = set(panel.visible_artwork_urls())
+    cached = visible - {missing}
+    assert missing in visible and len(cached) >= 2
+    widget.load_visible_artwork()
+    wait_for(app, lambda: visible <= widget._artwork.keys() and widget._artwork_pending is None)
+    assert not provider.images and widget._artwork[missing] is None
+    assert all(not widget._artwork[url].isNull() for url in cached)
+    monkeypatch.setattr(gui.QApplication, "applicationState", lambda: Qt.ApplicationActive)
+    widget.application_state_changed(Qt.ApplicationActive)
+    widget.load_visible_artwork()
+    wait_for(app, lambda: entered.is_set() and cached <= widget._artwork.keys())
+    assert widget._artwork_pending is not None and missing not in widget._artwork
+    assert cached <= set().union(*(pictures for pictures, complete in updates))
+    assert set(widget._artwork) <= visible
+    assert len(provider.images) == 1
+    assert decoded_threads and all(thread != main_thread for thread in decoded_threads)
+    ticks = []
+    QTimer.singleShot(0, lambda: ticks.append(True))
+    wait_for(app, lambda: bool(ticks))
+    widget.engine.loop.call_soon_threadsafe(release.set)
+    wait_for(app, lambda: widget._artwork_pending is None)
+    if status == 429:
+        assert widget.engine.api.gate.stopped and widget._artwork_paused
+    else:
+        assert not widget._artwork[missing].isNull()
+    # Scrolling requests a new visible cache region without new HTTP, including
+    # after a refused network read. It does not restore the entire directory.
+    panel.people.scrollToBottom()
+    bottom = set(panel.visible_artwork_urls())
+    wait_for(app, lambda: bottom <= widget._artwork.keys() and widget._artwork_pending is None)
+    assert len(provider.images) == 1
+    if status == 429:
+        return
+    assert widget.engine.shutdown()
+    widget.close()
+    second = gui.MainWindow(api_factory=provider.api)
+    batches = []
+    second.engine.artwork_ready.connect(
+        lambda owner, ticket, pictures, complete, error: batches.append((len(pictures), complete))
+    )
+    second.show()
+    try:
+        second.launch(lambda api: api.use_cookie("SESSDATA=synthetic; DedeUserID=42"))
+        wait_for(app, lambda: not second.busy and second._session is not None)
+        second.following_toggle.click()
+        second.following_panel.people.scrollToTop()
+        visible = set(second.following_panel.visible_artwork_urls())
+        wait_for(app, lambda: visible <= second._artwork.keys() and second._artwork_pending is None)
+        assert any(count > 1 for count, complete in batches) and batches[-1][1]
+        assert len(provider.images) == 1
+    finally:
+        assert second.engine.shutdown()
+        second.close()
+
+
 def visible_cover_urls(widget):
     region = widget.favorite_items.viewport().visibleRegion()
     return {
@@ -942,7 +1043,7 @@ def test_visible_favorite_covers_are_cached_and_never_fetch_hidden_rows(app, win
     assert len(provider.images) == count
     widget.show_session(None)
     assert not widget._artwork and widget._artwork_pending is None
-    widget.show_artwork(42, first_url, PNG, "")
+    widget.show_artwork(42, 1, {first_url: gui.decode_qimage(PNG)}, True, "")
     assert not widget._artwork  # Late image replies cannot repopulate a logged-out account.
 
 
@@ -1649,10 +1750,10 @@ def test_late_image_from_same_uid_previous_login_cannot_refill_current_cache(app
     url = "https://i0.hdslb.com/bfs/face/same.png"
     widget.show_session(old)
     widget.show_session(current)
-    widget._artwork_pending = (current, url)
-    widget.show_artwork(old, url, PNG, "")
-    assert not widget._artwork and widget._artwork_pending == (current, url)
-    widget.show_artwork(current, url, PNG, "")
+    widget._artwork_pending = (current, 7)
+    widget.show_artwork(old, 7, {url: gui.decode_qimage(PNG)}, True, "")
+    assert not widget._artwork and widget._artwork_pending == (current, 7)
+    widget.show_artwork(current, 7, {url: gui.decode_qimage(PNG)}, True, "")
     assert url in widget._artwork and widget._artwork_pending is None
 
 
@@ -1754,7 +1855,7 @@ def test_cover_and_avatar_shapes_stay_consistent_after_load_and_rerender(app, wi
         assert cover_size.width() > cover_size.height()
         assert avatar_size.width() == avatar_size.height()
 
-    panel.update_artwork(url)
+    panel.update_artwork({url})
     shapes()
     panel.render()
     shapes()
@@ -1795,7 +1896,7 @@ def test_message_emoji_http_to_qt_renders_safe_image_and_retains_copyable_text(a
     pixmap = QPixmap(72, 72)
     pixmap.fill(Qt.magenta)
     widget._cache_artwork(url, pixmap)
-    panel.update_artwork(url)
+    panel.update_artwork({url})
     panel.body.scrollToBottom()
     app.processEvents()
     image = panel.body.viewport().grab().toImage()

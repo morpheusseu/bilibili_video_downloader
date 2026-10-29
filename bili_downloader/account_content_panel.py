@@ -175,9 +175,10 @@ class AccountContentPanel(QFrame):
             return self.avatars(row.image, row.title)
         return QIcon(self.images(row.image))
 
-    def update_artwork(self, url):
+    def update_artwork(self, urls):
+        urls = {canonical_image_url(url) for url in urls}
         for index in range(self.items.topLevelItemCount()):
             item = self.items.topLevelItem(index)
             row = item.data(0, Qt.UserRole)
-            if canonical_image_url(row.image) == canonical_image_url(url):
+            if canonical_image_url(row.image) in urls:
                 item.setIcon(0, self.icon_for(row))

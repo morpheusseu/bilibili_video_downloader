@@ -24,6 +24,7 @@ from PyQt5.QtGui import (
     QDesktopServices,
     QFontDatabase,
     QIcon,
+    QImage,
     QPixmap,
 )
 from PyQt5.QtWidgets import (
@@ -56,7 +57,7 @@ from .account_content import TITLES, ContentView
 from .account_content_panel import AccountContentPanel
 from .account_dialog import AccountDialog
 from .api import Bilibili, safe_error
-from .artwork import avatar_icon, decode_image
+from .artwork import avatar_icon, decode_image, decode_qimage
 from .auth import Session, forget_session, load_session, save_session
 from .browser_login import chrome_login
 from .cache import canonical_image_url
@@ -70,6 +71,7 @@ from .sources import DownloadError, parse_source
 from .theme import STYLE
 
 ARTWORK_BYTES = 256 * 1024 * 1024
+ARTWORK_BATCH = 16
 READ_ONLY_JOBS = frozenset({"library", "content", "inbox"})
 
 
@@ -81,7 +83,7 @@ class Engine(QThread):
     idle = pyqtSignal()
     progress = pyqtSignal(object)
     session_changed = pyqtSignal(object)
-    artwork_ready = pyqtSignal(object, str, object, str)
+    artwork_ready = pyqtSignal(object, int, object, bool, str)
     inbox_updated = pyqtSignal(object, object, object, int)
     inbox_status = pyqtSignal(object, object)
     library_updated = pyqtSignal(object, object)
@@ -221,9 +223,11 @@ class Engine(QThread):
             self.artwork_task.cancel()
             await asyncio.gather(self.artwork_task, return_exceptions=True)
 
-    def request_artwork(self, url):
+    def request_artwork(self, owner, ticket, urls, *, network=True):
         if not self.closing and self.ready.is_set():
-            asyncio.run_coroutine_threadsafe(self.load_artwork(url), self.loop)
+            asyncio.run_coroutine_threadsafe(
+                self.load_artwork(owner, ticket, urls, network=network), self.loop
+            )
 
     def touch_artwork(self, owner, urls):
         if not self.closing and self.ready.is_set() and not self.loop.is_closed():
@@ -240,22 +244,63 @@ class Engine(QThread):
         if not self.closing and self.ready.is_set() and not self.loop.is_closed():
             self.loop.call_soon_threadsafe(self.api.check_inbox_live, reason)
 
-    async def load_artwork(self, url):
-        session = self.api.session
-        if session is None or self.active:
-            self.artwork_ready.emit(session, url, None, "")
+    async def load_artwork(self, owner, ticket, urls, *, network=True):
+        if owner is None or self.api.session is not owner or self.active:
+            self.artwork_ready.emit(owner, ticket, {}, True, "")
             return
         self.artwork_task = asyncio.current_task()
-        body, error = None, ""
+        pictures, missing, error = {}, [], ""
+        url = None
+        hits = 0
+        started = time.monotonic()
         try:
-            body = await self.api.cdn_image(url)
+            # Restore a visible region first. Decode one body at a time to avoid
+            # retaining a batch of large compressed files or touching QPixmap
+            # outside Qt's GUI thread. Each cache read closes before we yield.
+            for url in urls:
+                if self.api.session is not owner:
+                    raise asyncio.CancelledError
+                body = self.api.cached_image(url)
+                if body is None:
+                    missing.append(url)
+                else:
+                    pictures[url] = decode_qimage(body, QSize(320, 240))
+                    hits += 1
+                    if len(pictures) == ARTWORK_BATCH:
+                        self.artwork_ready.emit(owner, ticket, pictures, False, "")
+                        pictures = {}
+                await asyncio.sleep(0)
+            logging.getLogger(__name__).info(
+                "Artwork cache_batch requested=%s hits=%s missing=%s duration_ms=%s",
+                len(urls),
+                hits,
+                len(missing),
+                round((time.monotonic() - started) * 1000),
+            )
+            if missing and network and not self.api.gate.stopped:
+                if pictures:
+                    self.artwork_ready.emit(owner, ticket, pictures, False, "")
+                    pictures = {}
+                # Only one cache miss per pass. The next pass re-evaluates the
+                # visible region; HTTP still uses the existing shared gate.
+                url = missing[0]
+                body = await self.api.cdn_image(url)
+                if self.api.session is not owner:
+                    raise asyncio.CancelledError
+                pictures[url] = decode_qimage(body, QSize(320, 240))
+            else:
+                # A stopped network must not prevent other local pictures from
+                # restoring. Empty placeholders can be retried by explicit refresh.
+                pictures.update((url, None) for url in missing)
         except asyncio.CancelledError:
             pass  # Foreground operations preempt optional images; retry only when visible and idle.
         except Exception as caught:
             error = safe_error(caught)
+            if url is not None:
+                pictures[url] = QImage()
         finally:
             self.artwork_task = None
-            self.artwork_ready.emit(session, url, body, error)
+            self.artwork_ready.emit(owner, ticket, pictures, True, error)
 
     def cancel(self, *, only_readonly=False):
         if self.ready.is_set():
@@ -321,6 +366,7 @@ class MainWindow(QMainWindow):
         self._artwork_bytes = 0
         self._artwork_hits = set()
         self._artwork_pending = None
+        self._artwork_ticket = 0
         self._artwork_paused = False
         self._library_view = FavoriteView()
         root = QWidget()
@@ -688,6 +734,12 @@ class MainWindow(QMainWindow):
             lambda: self.artwork_timer.start()
         )
         self.content_panel.items.verticalScrollBar().valueChanged.connect(
+            lambda: self.artwork_timer.start()
+        )
+        self.following_panel.people.verticalScrollBar().valueChanged.connect(
+            lambda: self.artwork_timer.start()
+        )
+        self.following_panel.items.verticalScrollBar().valueChanged.connect(
             lambda: self.artwork_timer.start()
         )
         self.scroll.verticalScrollBar().valueChanged.connect(lambda: self.artwork_timer.start())
@@ -1230,7 +1282,9 @@ class MainWindow(QMainWindow):
         if force:
             self._artwork_paused = False
             self._artwork = OrderedDict(
-                (url, pixmap) for url, pixmap in self._artwork.items() if not pixmap.isNull()
+                (url, pixmap)
+                for url, pixmap in self._artwork.items()
+                if pixmap is not None and not pixmap.isNull()
             )
 
         async def operation(api):
@@ -1373,6 +1427,8 @@ class MainWindow(QMainWindow):
     def pixmap_for(self, url):
         url = canonical_image_url(url)
         pixmap = self._artwork.get(url, QPixmap())
+        if pixmap is None:
+            return QPixmap()
         if self._session is not None and not pixmap.isNull():
             self._artwork.move_to_end(url)
             self._artwork_hits.add(url)
@@ -1390,6 +1446,11 @@ class MainWindow(QMainWindow):
             return
         self.artwork_timer.start()
         if state == Qt.ApplicationActive:
+            # None is a disk miss deferred while network reads were disabled;
+            # a null QPixmap is an attempted/invalid image, retried only explicitly.
+            self._artwork = OrderedDict(
+                (url, pixmap) for url, pixmap in self._artwork.items() if pixmap is not None
+            )
             self._last_activity_check = time.time()
             self.engine.check_inbox_connection("foreground")
 
@@ -1402,15 +1463,14 @@ class MainWindow(QMainWindow):
 
     def load_visible_artwork(self):
         if (
-            self.busy
+            self.engine.closing
+            or self.busy
             or self._artwork_pending
-            or self._artwork_paused
             or self._session_mid is None
             or (
                 self.isMinimized()
                 and not (self.inbox_dialog.isVisible() and not self.inbox_dialog.isMinimized())
             )
-            or QApplication.applicationState() != Qt.ApplicationActive
         ):
             self._flush_artwork_hits()
             return
@@ -1427,48 +1487,55 @@ class MainWindow(QMainWindow):
                     urls.append(item.data(0, Qt.UserRole + 1))
         urls = list(dict.fromkeys(key for url in urls if (key := canonical_image_url(url))))
         self._artwork_hits.update(
-            url for url in urls if url in self._artwork and not self._artwork[url].isNull()
+            url
+            for url in urls
+            if self._artwork.get(url) is not None and not self._artwork[url].isNull()
         )
         self._flush_artwork_hits()
-        for url in urls:
-            if url and url not in self._artwork:
-                self._artwork_pending = (self._session, url)
-                self.engine.request_artwork(url)
-                return
+        missing = tuple(url for url in urls if url not in self._artwork)
+        if missing:
+            self._artwork_ticket += 1
+            self._artwork_pending = (self._session, self._artwork_ticket)
+            self.engine.request_artwork(
+                self._session,
+                self._artwork_ticket,
+                missing,
+                network=not self._artwork_paused
+                and QApplication.applicationState() == Qt.ApplicationActive,
+            )
 
-    def show_artwork(self, owner, url, body, error):
-        if self._artwork_pending != (owner, url):
+    def show_artwork(self, owner, ticket, pictures, complete, error):
+        if self._artwork_pending != (owner, ticket):
             return
         if owner is not self._session:
             return
-        self._artwork_pending = None
+        if complete:
+            self._artwork_pending = None
+        for url, image in pictures.items():
+            self._cache_artwork(url, QPixmap.fromImage(image) if image is not None else None)
+        if pictures:
+            for index in range(self.favorite_items.topLevelItemCount()):
+                item = self.favorite_items.topLevelItem(index)
+                url = canonical_image_url(item.data(0, Qt.UserRole + 1))
+                pixmap = self._artwork.get(url)
+                if url in pictures and pixmap is not None and not pixmap.isNull():
+                    item.setIcon(0, QIcon(pixmap))
+            self.inbox_panel.update_artwork(pictures)
+            self.content_panel.update_artwork(pictures)
+            self.following_panel.update_artwork(pictures)
         if error:
             self._artwork_paused = True
             self.library_hint.setText(f"封面读取已暂停，条目仍可用：{error}")
             self.inbox_panel.send_notice.setText(f"头像读取已暂停，消息仍可用：{error}")
             if self.content_panel.isVisible():
                 self.content_panel.hint.setText(f"图片读取已暂停，条目仍可用：{error}")
-        elif body is not None:
-            started = time.monotonic()
-            pixmap = decode_image(body, QSize(320, 240))
-            logging.getLogger(__name__).info(
-                "UI image_decode body_bytes=%s duration_ms=%s",
-                len(body),
-                round((time.monotonic() - started) * 1000),
-            )
-            self._cache_artwork(url, pixmap)
-            for index in range(self.favorite_items.topLevelItemCount()):
-                item = self.favorite_items.topLevelItem(index)
-                if (
-                    canonical_image_url(item.data(0, Qt.UserRole + 1)) == url
-                    and not pixmap.isNull()
-                ):
-                    item.setIcon(0, QIcon(pixmap))
-            self.inbox_panel.update_artwork(url)
-            if not pixmap.isNull():
-                self.content_panel.update_artwork(url)
-        self.following_panel.update_artwork(url)
-        self.artwork_timer.start()
+        logging.getLogger(__name__).info(
+            "UI artwork_batch images=%s complete=%s", len(pictures), complete
+        )
+        if complete:
+            # The 180ms timer coalesces scrolls; it is not a delay between local
+            # cache hits. Yield to Qt, then re-evaluate the visible region.
+            QTimer.singleShot(0, self.load_visible_artwork)
 
     def _cache_artwork(self, url, pixmap):
         url = canonical_image_url(url)
@@ -1478,10 +1545,10 @@ class MainWindow(QMainWindow):
         if previous is not None:
             self._artwork_bytes -= previous.toImage().sizeInBytes()
         self._artwork[url] = pixmap
-        self._artwork_bytes += pixmap.toImage().sizeInBytes()
+        self._artwork_bytes += pixmap.toImage().sizeInBytes() if pixmap is not None else 0
         while self._artwork_bytes > ARTWORK_BYTES:
             _, evicted = self._artwork.popitem(last=False)
-            self._artwork_bytes -= evicted.toImage().sizeInBytes()
+            self._artwork_bytes -= evicted.toImage().sizeInBytes() if evicted is not None else 0
 
     def mode_changed(self):
         self.clear_preview()

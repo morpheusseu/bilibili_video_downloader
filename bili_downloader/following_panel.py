@@ -1,5 +1,8 @@
 """Following directory, collection progress and the selected creator's pages."""
 
+import logging
+import time
+
 from PyQt5.QtCore import QSize, Qt, pyqtSignal
 from PyQt5.QtGui import QIcon
 from PyQt5.QtWidgets import (
@@ -19,6 +22,9 @@ from PyQt5.QtWidgets import (
 )
 
 from .account_content import local_time
+from .cache import canonical_image_url
+
+log = logging.getLogger(__name__)
 
 INTERACTIONS = (
     ("点赞", "liked", "已赞", "未赞"),
@@ -75,6 +81,7 @@ class FollowingPanel(QFrame):
         self.busy, self.logged_in, self.page = False, False, 1
         self.collection, self.collecting = None, False
         self.loading = False
+        self.directory_loading = False
         layout = QVBoxLayout(self)
         layout.setContentsMargins(24, 20, 24, 20)
         heading = QHBoxLayout()
@@ -120,6 +127,7 @@ class FollowingPanel(QFrame):
         self.people.setAccessibleName("关注的人列表")
         self.people.setHeaderLabels(["UP 主"])
         self.people.setRootIsDecorated(False)
+        self.people.setUniformRowHeights(True)
         self.people.setIconSize(QSize(32, 32))
         self.people.header().setSectionResizeMode(0, QHeaderView.Stretch)
         self.splitter.addWidget(self.people)
@@ -209,11 +217,16 @@ class FollowingPanel(QFrame):
         return int(item.data(0, Qt.UserRole).key) if item else None
 
     def show_followings(self, view):
+        if self.view is view:
+            return
         self.view = view
         self.render_people()
 
     def render_people(self):
+        started = time.monotonic()
         selected = self.selected()
+        position = self.people.verticalScrollBar().value()
+        self.people.setUpdatesEnabled(False)
         self.people.blockSignals(True)
         self.people.clear()
         rows = sorted(self.view.items, key=lambda row: row.special is not True) if self.view else ()
@@ -228,6 +241,8 @@ class FollowingPanel(QFrame):
             if row.key == str(selected):
                 self.people.setCurrentItem(item)
         self.people.blockSignals(False)
+        self.people.verticalScrollBar().setValue(position)
+        self.people.setUpdatesEnabled(True)
         if self.selected() is None:
             if selected is not None:
                 self.creator_cancel_requested.emit()
@@ -246,6 +261,11 @@ class FollowingPanel(QFrame):
                 + (" 可加载更多。" if self.view.has_more else " 名单已到末尾。")
             )
         self.update_controls()
+        log.info(
+            "UI following_directory rows=%s duration_ms=%s",
+            self.people.topLevelItemCount(),
+            round((time.monotonic() - started) * 1000),
+        )
 
     def select_person(self):
         self.creator_view, self.page = None, 1
@@ -359,6 +379,11 @@ class FollowingPanel(QFrame):
         )
         self.update_controls()
 
+    def set_directory_loading(self, loading):
+        self.directory_loading = loading
+        self.refresh.setText("停止读取名单" if loading else "刷新关注列表")
+        self.update_controls()
+
     def show_collection(self, progress, *, running=False):
         self.collection, self.collecting = progress, running
         if progress is not None:
@@ -376,14 +401,20 @@ class FollowingPanel(QFrame):
 
     def update_controls(self):
         ready = self.logged_in and not self.busy
-        self.collect.setEnabled(ready and not self.collecting and not self.loading)
+        self.collect.setEnabled(
+            ready and not self.collecting and not self.loading and not self.directory_loading
+        )
         self.pause.setEnabled(self.logged_in and self.collecting)
-        self.recent.setEnabled(ready and not self.collecting and not self.loading)
+        self.recent.setEnabled(
+            ready and not self.collecting and not self.loading and not self.directory_loading
+        )
         target = ready and self.selected() is not None
         self.people.setEnabled(ready)
         self.special_only.setEnabled(ready)
         self.refresh.setEnabled(ready)
-        self.more.setEnabled(ready and self.view is not None and self.view.has_more)
+        self.more.setEnabled(
+            ready and not self.directory_loading and self.view is not None and self.view.has_more
+        )
         self.tabs.setEnabled(ready)
         self.refresh_creator.setEnabled(target)
         self.verify.setEnabled(target and (self.loading or self.creator_view is not None))
@@ -399,6 +430,7 @@ class FollowingPanel(QFrame):
     def clear(self):
         self.view, self.creator_view, self.page = None, None, 1
         self.set_loading(False)
+        self.set_directory_loading(False)
         self.special_only.setChecked(False)
         self.show_collection(None)
         self.collection_status.setText("尚未开始全部采集；随时可暂停，重启后可从保存的进度继续。")
@@ -418,12 +450,13 @@ class FollowingPanel(QFrame):
         return urls
 
     def update_artwork(self, url):
+        url = canonical_image_url(url)
         for tree in (self.people, self.items):
             for index in range(tree.topLevelItemCount()):
                 item = tree.topLevelItem(index)
                 row = item.data(0, Qt.UserRole)
                 row = row if tree is self.people else row.content
-                if row.image == url:
+                if canonical_image_url(row.image) == url:
                     item.setIcon(
                         0,
                         self.avatars(row.image, row.title, special=row.special is True)

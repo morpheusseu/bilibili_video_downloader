@@ -269,6 +269,92 @@ def test_following_collection_rounds_can_pause_resume_and_publish_complete_views
 
 
 @pytest.mark.parametrize("window", [creator_provider], indirect=True)
+def test_open_followings_preempts_slow_login_favorite_check(app, window):
+    widget, provider = window
+    entered, cancelled = threading.Event(), threading.Event()
+    fallback = provider.handler
+
+    async def delayed(request):
+        if request.url.path.endswith("/fav/resource/ids"):
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+        return fallback(request)
+
+    provider.handler = delayed
+    widget.launch(lambda api: api.use_cookie("SESSDATA=synthetic; DedeUserID=42"))
+    wait_for(app, lambda: entered.is_set() and widget.busy)
+    assert widget._job == "library" and widget.following_toggle.isEnabled()
+    widget.following_toggle.click()
+    wait_for(
+        app,
+        lambda: cancelled.is_set() and not widget.busy and widget.following_panel.view is not None,
+    )
+    assert widget.following_panel.isVisible() and widget.source.isEnabled()
+    assert widget.following_panel.people.isEnabled() and widget.following_panel.tabs.isEnabled()
+    assert not widget.details.isChecked()  # Navigation is not a failed download.
+
+
+@pytest.mark.parametrize("window", [creator_provider], indirect=True)
+def test_slow_following_directory_keeps_window_live_and_cached_reopen_needs_no_request(app, window):
+    widget, provider = window
+    provider.content_state["followings"][0].pop("special", None)
+    provider.content_state["followings"][0].pop("tag", None)
+    entered, cancelled = threading.Event(), threading.Event()
+    release = asyncio.Event()
+    waiting = [True]
+    fallback = provider.handler
+
+    async def delayed(request):
+        if request.url.path.endswith("/relation/followings") and waiting[0]:
+            entered.set()
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+        return fallback(request)
+
+    provider.handler = delayed
+    widget.launch(lambda api: api.use_cookie("SESSDATA=synthetic; DedeUserID=42"))
+    wait_for(app, lambda: not widget.busy and bool(widget._library_view.items))
+    widget.following_toggle.click()
+    panel = widget.following_panel
+    wait_for(app, entered.is_set)
+    assert not widget.busy and panel.directory_loading
+    assert widget.source.isEnabled() and panel.people.isEnabled() and panel.tabs.isEnabled()
+    ticks = []
+    QTimer.singleShot(0, lambda: ticks.append(True))
+    wait_for(app, lambda: bool(ticks))
+    panel.refresh.click()
+    wait_for(app, lambda: cancelled.is_set() and not panel.directory_loading)
+    assert "停止" in panel.hint.text()
+    waiting[0] = False
+    panel.refresh.click()
+    wait_for(app, lambda: panel.view is not None and not panel.directory_loading)
+    old_view, old_count = panel.view, panel.people.topLevelItemCount()
+    before = len(provider.requests)
+    widget.following_toggle.click()
+    widget.following_toggle.click()
+    app.processEvents()
+    assert panel.view is old_view and len(provider.requests) == before
+    waiting[0] = True
+    entered.clear()
+    cancelled.clear()
+    panel.refresh.click()
+    wait_for(app, entered.is_set)
+    assert panel.view is old_view and panel.people.topLevelItemCount() == old_count
+    # A selected cached person preempts a slow directory check without locking
+    # the input, scrollable list or the rest of the window.
+    panel.people.setCurrentItem(panel.people.topLevelItem(0))
+    wait_for(app, lambda: cancelled.is_set() and not panel.loading)
+    assert not panel.directory_loading and not widget.busy
+
+
+@pytest.mark.parametrize("window", [creator_provider], indirect=True)
 def test_slow_creator_read_keeps_ui_live_and_new_selection_preempts_it(app, window):
     widget, provider = window
     entered, cancelled = threading.Event(), threading.Event()
@@ -823,7 +909,7 @@ def cover_provider(count=21):
 def visible_cover_urls(widget):
     region = widget.favorite_items.viewport().visibleRegion()
     return {
-        item.data(0, Qt.UserRole + 1)
+        gui.canonical_image_url(item.data(0, Qt.UserRole + 1))
         for index in range(widget.favorite_items.topLevelItemCount())
         if region.intersects(
             widget.favorite_items.visualItemRect(item := widget.favorite_items.topLevelItem(index))
@@ -1466,7 +1552,8 @@ def test_account_content_visible_images_reuse_shared_private_free_cache(app, win
     for row in provider.content_state["dynamic"]:
         row["modules"]["module_author"]["face"] = face
     for row in provider.content_state["followings"]:
-        row["face"] = face
+        row["face"] = face.replace("https:", "http:")
+    provider.inbox_state["faces"][7] = face.replace("https:", "http:")
 
     def image(request):
         assert "cookie" not in request.headers
@@ -1482,6 +1569,21 @@ def test_account_content_visible_images_reuse_shared_private_free_cache(app, win
     wait_for(app, lambda: not widget.busy)
     widget.load_visible_artwork()
     assert len(provider.images) == 1
+    widget.following_toggle.click()
+    wait_for(
+        app,
+        lambda: widget.following_panel.view is not None
+        and not widget.following_panel.directory_loading,
+    )
+    widget.load_visible_artwork()
+    app.processEvents()
+    assert len(provider.images) == 1
+    widget.inbox_toggle.click()
+    wait_for(app, lambda: not widget.busy and widget.inbox_panel.view is not None)
+    widget.load_visible_artwork()
+    app.processEvents()
+    assert len(provider.images) == 1
+    assert list(widget._artwork) == [face]
     assert widget.engine.api.gate.count == len(provider.requests) + len(provider.images)
 
 
@@ -1564,14 +1666,25 @@ def test_image_memory_cache_uses_bytes_not_entry_count_and_resets_on_logout(
     pixmap.fill(Qt.blue)
     size = pixmap.toImage().sizeInBytes()
     for index in range(200):
-        widget._cache_artwork(f"image-{index}", pixmap)
+        widget._cache_artwork(f"https://i0.hdslb.com/image-{index}.png", pixmap)
     assert len(widget._artwork) == 200
     assert widget._artwork_bytes == 200 * size
     monkeypatch.setattr(gui, "ARTWORK_BYTES", 2 * size)
-    widget._cache_artwork("image-200", pixmap)
-    assert set(widget._artwork) == {"image-199", "image-200"}
-    widget._cache_artwork("image-200", pixmap)
+    widget._cache_artwork("https://i0.hdslb.com/image-200.png", pixmap)
+    assert set(widget._artwork) == {
+        "https://i0.hdslb.com/image-199.png",
+        "https://i0.hdslb.com/image-200.png",
+    }
+    widget._cache_artwork("http://i0.hdslb.com/image-200.png", pixmap)
     assert widget._artwork_bytes == 2 * size
+    # All panels use this lookup; a hit through an HTTP alias shares one decoded
+    # picture and protects it from eviction rather than storing another copy.
+    assert not widget.pixmap_for("http://i0.hdslb.com/image-199.png").isNull()
+    widget._cache_artwork("https://i0.hdslb.com/image-201.png", pixmap)
+    assert set(widget._artwork) == {
+        "https://i0.hdslb.com/image-199.png",
+        "https://i0.hdslb.com/image-201.png",
+    }
     widget.show_session(None)
     assert not widget._artwork and widget._artwork_bytes == 0
     assert not provider.requests

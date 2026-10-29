@@ -59,6 +59,7 @@ from .api import Bilibili, safe_error
 from .artwork import avatar_icon, decode_image
 from .auth import Session, forget_session, load_session, save_session
 from .browser_login import chrome_login
+from .cache import canonical_image_url
 from .download import Progress, download_source
 from .download_button import DownloadButton
 from .following_panel import FollowingPanel
@@ -69,6 +70,7 @@ from .sources import DownloadError, parse_source
 from .theme import STYLE
 
 ARTWORK_BYTES = 256 * 1024 * 1024
+READ_ONLY_JOBS = frozenset({"library", "content", "inbox"})
 
 
 class Engine(QThread):
@@ -87,6 +89,7 @@ class Engine(QThread):
     collection_updated = pyqtSignal(object, int, object, object, object)
     following_finished = pyqtSignal(object, int, str)
     recent_updated = pyqtSignal(object, int, str)
+    directory_updated = pyqtSignal(object, int, object)
 
     def __init__(self, parent=None, api_factory: Callable | None = None):
         super().__init__(parent)
@@ -94,6 +97,7 @@ class Engine(QThread):
         self.ready = threading.Event()
         self.future = None
         self.active = None
+        self.active_readonly = False
         self.following_task = None
         self.following_ticket = 0
         self.cancel_requested = False
@@ -121,16 +125,19 @@ class Engine(QThread):
             await self.stop_following()
             await self.stop_artwork()
 
-    def submit(self, operation):
+    def submit(self, operation, *, readonly=False):
         if self.closing or not self.isRunning():
             raise DownloadError("后台已关闭，不再接受新操作")
         if not self.ready.wait(5):
             raise DownloadError("后台任务尚未就绪")
         self.cancel_requested = False
-        self.future = asyncio.run_coroutine_threadsafe(self.perform(operation), self.loop)
+        self.future = asyncio.run_coroutine_threadsafe(
+            self.perform(operation, readonly=readonly), self.loop
+        )
 
-    async def perform(self, operation):
+    async def perform(self, operation, *, readonly=False):
         self.active = asyncio.current_task()
+        self.active_readonly = readonly
         try:
             await self.stop_following()
             await self.stop_artwork()
@@ -138,11 +145,15 @@ class Engine(QThread):
                 raise asyncio.CancelledError
             self.result.emit(await operation(self.api))
         except asyncio.CancelledError:
-            self.cancelled.emit()
+            if readonly:
+                self.notice.emit("读取已停止，已加载内容保留。")
+            else:
+                self.cancelled.emit()
         except Exception as error:
             self.error.emit(safe_error(error))
         finally:
             self.active = None
+            self.active_readonly = False
             self.session_changed.emit(self.api.session)
             if self.api.session is not None and (
                 self.api.inbox.view.cached or self.api.inbox.view.conversations
@@ -172,6 +183,10 @@ class Engine(QThread):
                 previous.cancel()
                 await asyncio.gather(previous, return_exceptions=True)
             await self.stop_artwork()
+            if self.active is not None and self.active_readonly:
+                task = self.active
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
             if self.active is not None or owner is None:
                 raise asyncio.CancelledError
             await operation(self.api)
@@ -242,11 +257,13 @@ class Engine(QThread):
             self.artwork_task = None
             self.artwork_ready.emit(session, url, body, error)
 
-    def cancel(self):
+    def cancel(self, *, only_readonly=False):
         if self.ready.is_set():
-            self.loop.call_soon_threadsafe(self._cancel)
+            self.loop.call_soon_threadsafe(self._cancel, only_readonly)
 
-    def _cancel(self):
+    def _cancel(self, only_readonly=False):
+        if only_readonly and not self.active_readonly:
+            return
         self.cancel_requested = True
         if self.active:
             self.active.cancel()
@@ -289,6 +306,7 @@ class MainWindow(QMainWindow):
         self.engine.collection_updated.connect(self.show_collection)
         self.engine.following_finished.connect(self.on_following_finished)
         self.engine.recent_updated.connect(self.show_recent_actions)
+        self.engine.directory_updated.connect(self.show_followings)
         self.engine.start()
         self.busy = False
         self._following_collecting = False
@@ -791,39 +809,68 @@ class MainWindow(QMainWindow):
             self.inbox_toggle.setChecked(True)
 
     def toggle_followings(self, visible):
+        started = time.monotonic()
         self.following_panel.setVisible(visible)
         self.update_intro()
         if not visible:
             self.cancel_following_read()
         if visible:
+            if self.readonly_busy:
+                self.engine.cancel(only_readonly=True)
             self.library_toggle.setChecked(False)
             self.inbox_toggle.setChecked(False)
             self.content_toggle.setChecked(False)
             self.scroll.verticalScrollBar().setValue(0)
             view = self.following_panel.view
-            if self._session_mid and (
-                view is None or any(row.special is None for row in view.items)
-            ):
+            if self._session_mid and view is None:
                 self.load_followings()
             self.artwork_timer.start()
-
-    def load_followings(self, more=False):
-        if self.busy or self._session_mid is None:
-            return
-        self.launch(
-            lambda api: api.read_account_content("followings", more=more),
-            "正在读取关注名单",
-            "每页最多 50 人，特别关注使用平台字段；可分轮采集全部关注者的最新页。",
-            kind="following",
+        logging.getLogger(__name__).info(
+            "UI following_toggle visible=%s duration_ms=%s cached_people=%s",
+            visible,
+            round((time.monotonic() - started) * 1000),
+            self.following_panel.people.topLevelItemCount(),
         )
 
+    def load_followings(self, more=False):
+        if (self.busy and not self.readonly_busy) or self._session_mid is None:
+            return
+        if self._following_kind == "directory":
+            self.cancel_following_read()
+            self.following_panel.hint.setText("名单读取已停止；已加载的关注者和分页位置保留。")
+            return
+        self.following_timer.stop()
+        self._following_ticket += 1
+        ticket = self._following_ticket
+        self._following_kind = "directory"
+        self.following_panel.set_loading(False)
+        self.following_panel.set_directory_loading(True)
+
+        async def operation(api):
+            cached = api.account_content.views.get("followings")
+            if cached is not None:
+                self.engine.directory_updated.emit(api.session, ticket, cached)
+            view = await api.read_account_content("followings", more=more)
+            self.engine.directory_updated.emit(api.session, ticket, view)
+
+        try:
+            self.engine.submit_following(operation, ticket)
+        except Exception as error:
+            self.on_following_finished(self._session, ticket, safe_error(error))
+
+    def show_followings(self, owner, ticket, view):
+        if owner is self._session and ticket == self._following_ticket:
+            self.following_panel.show_followings(view)
+            self.artwork_timer.start()
+
     def load_creator(self, mid, kind, page, refresh=False, verify=False):
-        if self.busy or self._session_mid is None:
+        if (self.busy and not self.readonly_busy) or self._session_mid is None:
             return
         self.following_timer.stop()
         self._following_ticket += 1
         ticket = self._following_ticket
         self._following_kind = "creator"
+        self.following_panel.set_directory_loading(False)
         self.following_panel.set_loading(True)
 
         async def operation(api):
@@ -897,6 +944,7 @@ class MainWindow(QMainWindow):
         self._following_kind = None
         self.engine.cancel_following(self._following_ticket)
         self.following_panel.set_loading(False)
+        self.following_panel.set_directory_loading(False)
 
     def cancel_creator_read(self):
         if self._following_kind in {"creator", "recent"}:
@@ -910,6 +958,7 @@ class MainWindow(QMainWindow):
             return
         kind, self._following_kind = self._following_kind, None
         self.following_panel.set_loading(False)
+        self.following_panel.set_directory_loading(False)
         if error:
             if kind == "collection":
                 self.pause_following_collection()
@@ -1322,8 +1371,10 @@ class MainWindow(QMainWindow):
         return avatar_icon(self.pixmap_for(url), name, special=special)
 
     def pixmap_for(self, url):
+        url = canonical_image_url(url)
         pixmap = self._artwork.get(url, QPixmap())
         if self._session is not None and not pixmap.isNull():
+            self._artwork.move_to_end(url)
             self._artwork_hits.add(url)
             if not self.artwork_timer.isActive():
                 self.artwork_timer.start()
@@ -1374,6 +1425,7 @@ class MainWindow(QMainWindow):
                 item = self.favorite_items.topLevelItem(index)
                 if visible.intersects(self.favorite_items.visualItemRect(item)):
                     urls.append(item.data(0, Qt.UserRole + 1))
+        urls = list(dict.fromkeys(key for url in urls if (key := canonical_image_url(url))))
         self._artwork_hits.update(
             url for url in urls if url in self._artwork and not self._artwork[url].isNull()
         )
@@ -1397,11 +1449,20 @@ class MainWindow(QMainWindow):
             if self.content_panel.isVisible():
                 self.content_panel.hint.setText(f"图片读取已暂停，条目仍可用：{error}")
         elif body is not None:
+            started = time.monotonic()
             pixmap = decode_image(body, QSize(320, 240))
+            logging.getLogger(__name__).info(
+                "UI image_decode body_bytes=%s duration_ms=%s",
+                len(body),
+                round((time.monotonic() - started) * 1000),
+            )
             self._cache_artwork(url, pixmap)
             for index in range(self.favorite_items.topLevelItemCount()):
                 item = self.favorite_items.topLevelItem(index)
-                if item.data(0, Qt.UserRole + 1) == url and not pixmap.isNull():
+                if (
+                    canonical_image_url(item.data(0, Qt.UserRole + 1)) == url
+                    and not pixmap.isNull()
+                ):
                     item.setIcon(0, QIcon(pixmap))
             self.inbox_panel.update_artwork(url)
             if not pixmap.isNull():
@@ -1410,6 +1471,9 @@ class MainWindow(QMainWindow):
         self.artwork_timer.start()
 
     def _cache_artwork(self, url, pixmap):
+        url = canonical_image_url(url)
+        if not url:
+            return
         previous = self._artwork.pop(url, None)
         if previous is not None:
             self._artwork_bytes -= previous.toImage().sizeInBytes()
@@ -1444,6 +1508,10 @@ class MainWindow(QMainWindow):
         self.ffmpeg.setVisible(visible)
         self.output_form.labelForField(self.ffmpeg).setVisible(visible)
 
+    @property
+    def readonly_busy(self):
+        return self.busy and self._job in READ_ONLY_JOBS
+
     def set_busy(self, busy):
         self.busy = busy
         self.account_dialog.set_busy(busy, authorizing=busy and self._job == "login")
@@ -1470,8 +1538,12 @@ class MainWindow(QMainWindow):
         self.inbox_panel.set_busy(busy, self._session_mid is not None)
         self.content_toggle.setEnabled(not busy and self._session_mid is not None)
         self.content_panel.set_busy(busy, self._session_mid is not None)
-        self.following_toggle.setEnabled(not busy and self._session_mid is not None)
-        self.following_panel.set_busy(busy, self._session_mid is not None)
+        self.following_toggle.setEnabled(
+            (not busy or self.readonly_busy) and self._session_mid is not None
+        )
+        self.following_panel.set_busy(
+            busy and not self.readonly_busy, self._session_mid is not None
+        )
 
     def launch(
         self,
@@ -1488,13 +1560,13 @@ class MainWindow(QMainWindow):
         if kind == "login":
             self.account_dialog.status.setText(note)
         self.details.set_progress(kind == "download")
-        if kind not in {"library", "content", "following"}:
+        if kind not in {"library", "content"}:
             self.details.setChecked(True)
         self.task_title.setText(title)
         self.status.setText(note)
         self.bar.setRange(0, 0)
         try:
-            self.engine.submit(operation)
+            self.engine.submit(operation, readonly=kind in READ_ONLY_JOBS)
         except Exception as error:
             self.show_error(safe_error(error))
             self.on_idle()
@@ -1526,8 +1598,6 @@ class MainWindow(QMainWindow):
         if self._job == "content":
             self.content_panel.auto.setChecked(False)
             self.content_panel.hint.setText(f"{text}；自动检查已暂停，已加载内容保留。")
-        if self._job == "following":
-            self.following_panel.notice.setText(f"{text}；已加载页面与已核验互动保留，可手动继续。")
         self.task_title.setText("未能完成")
         self.status.setText(text)
         self.bar.setRange(0, 100)
@@ -1612,7 +1682,9 @@ class MainWindow(QMainWindow):
         self.library_toggle.setEnabled(session is not None)
         self.inbox_toggle.setEnabled(session is not None)
         self.content_toggle.setEnabled(session is not None and not self.busy)
-        self.following_toggle.setEnabled(session is not None and not self.busy)
+        self.following_toggle.setEnabled(
+            session is not None and (not self.busy or self.readonly_busy)
+        )
         self.identity.setText(
             self.identity.fontMetrics().elidedText(session.name, Qt.ElideRight, 200)
             if session
@@ -1629,7 +1701,7 @@ class MainWindow(QMainWindow):
         self.library_controls()
         self.inbox_panel.set_busy(self.busy, session is not None)
         self.content_panel.set_busy(self.busy, session is not None)
-        self.following_panel.set_busy(self.busy, session is not None)
+        self.following_panel.set_busy(self.busy and not self.readonly_busy, session is not None)
         self.account_dialog.identity.setText(
             f"{session.name} · UID {session.mid}"
             if session

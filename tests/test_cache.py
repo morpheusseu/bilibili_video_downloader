@@ -198,7 +198,8 @@ async def test_content_resumes_saved_pages_and_never_scans_on_login(tmp_path):
         assert provider.requests[-1].url.params["max"] == "2"
 
 
-async def test_stale_display_projection_does_not_disable_message_or_image_cache(tmp_path):
+@pytest.mark.parametrize("missing", [False, True])
+async def test_stale_display_projection_does_not_disable_message_or_image_cache(tmp_path, missing):
     provider = persistent(content_provider(), tmp_path)
     url = "https://i0.hdslb.com/saved-avatar.png"
     async with provider.api() as api:
@@ -207,10 +208,13 @@ async def test_stale_display_projection_does_not_disable_message_or_image_cache(
         await api.inbox.open(7, 42)
         await api.read_account_content("dynamic")
         api.cache.put_image(url, PNG)
-        stale = api.cache.get("content", "dynamic")
-        for row in stale["items"]:
-            row.pop("image_role")
-        api.cache.put_many({("content", "dynamic"): stale})
+        stale = api.cache.get("content_block", "dynamic:0", max_age=None)
+        if missing:
+            api.cache.put_many({}, remove=[("content_block", "dynamic:0")])
+        else:
+            for row in stale:
+                row.pop("image_role")
+            api.cache.put_many({("content_block", "dynamic:0"): stale})
     before = len(provider.requests)
     async with provider.api() as api:
         await api.use_cookie("SESSDATA=synthetic; DedeUserID=42")
@@ -225,19 +229,26 @@ async def test_stale_display_projection_does_not_disable_message_or_image_cache(
         assert all(row.image_role in {"avatar", "cover"} for row in view.items)
 
 
-async def test_over_content_cache_cap_does_not_save_cursor_past_missing_pages(tmp_path):
+@pytest.mark.parametrize("kind", ["dynamic", "history"])
+async def test_all_manually_loaded_content_resumes_after_restart_without_refetch(tmp_path, kind):
     provider = persistent(content_provider(221), tmp_path)
     async with provider.api() as api:
         await api.use_cookie("SESSDATA=synthetic; DedeUserID=42")
-        await api.read_account_content("dynamic")
+        await api.read_account_content(kind)
         for _ in range(10):
-            await api.read_account_content("dynamic", more=True)
-        assert len(api.account_content.views["dynamic"].items) == 220
+            await api.read_account_content(kind, more=True)
+        assert len(api.account_content.views[kind].items) == 220
+    before = len(provider.requests)
     async with provider.api() as api:
         await api.use_cookie("SESSDATA=synthetic; DedeUserID=42")
-        assert len(api.account_content.views["dynamic"].items) == 200
-        view = await api.read_account_content("dynamic", more=True)
-        assert len(view.items) == 220 and provider.requests[-1].url.params["offset"] == "200"
+        assert len(provider.requests) == before + 1  # Navigation only, no history scan.
+        assert len(api.account_content.views[kind].items) == 220
+        view = await api.read_account_content(kind, more=True)
+        assert len(view.items) == 221 and len(provider.requests) == before + 2
+        if kind == "dynamic":
+            assert provider.requests[-1].url.params["offset"] == "220"
+        else:
+            assert provider.requests[-1].url.params["max"] == "2"
 
 
 def test_account_image_idle_expiry_isolation_and_precise_forget(tmp_path):

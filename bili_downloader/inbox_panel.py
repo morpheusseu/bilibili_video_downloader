@@ -23,6 +23,7 @@ from PyQt5.QtWidgets import (
 )
 
 from .artwork import avatar_icon
+from .cache import canonical_image_url
 from .inbox import message_text
 from .message_content import MessageImage, message_content
 from .message_rendering import CONTENT_ROLE, HEADER_ROLE, MessageDelegate
@@ -460,20 +461,22 @@ class InboxPanel(QFrame):
         return urls
 
     def update_artwork(self, url):
+        url = canonical_image_url(url)
         scrollbar = self.body.verticalScrollBar()
         at_bottom = scrollbar.value() >= scrollbar.maximum() - 4
         resized = False
         for index in range(self.sessions.topLevelItemCount()):
             item = self.sessions.topLevelItem(index)
-            if item.data(0, Qt.UserRole + 1) == url:
+            if canonical_image_url(item.data(0, Qt.UserRole + 1)) == url:
                 item.setIcon(0, self.avatars(url, item.text(0)))
         for index in range(self.body.count()):
             item = self.body.item(index)
-            if item.data(Qt.UserRole + 1) == url:
+            if canonical_image_url(item.data(Qt.UserRole + 1)) == url:
                 item.setIcon(self.avatars(url, item.data(Qt.UserRole + 2)))
             content = item.data(CONTENT_ROLE)
             if content and any(
-                isinstance(part, MessageImage) and part.url == url for part in content.parts
+                isinstance(part, MessageImage) and canonical_image_url(part.url) == url
+                for part in content.parts
             ):
                 self.message_delegate.sizeHintChanged.emit(self.body.indexFromItem(item))
                 resized = True

@@ -7,7 +7,6 @@ import re
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from urllib.parse import urlparse
 
 import httpx
 from bpi import AsyncBpiClient
@@ -23,7 +22,7 @@ from bpi.session import parse_cookie
 from .account_content import AccountContent
 from .auth import Session, normalized_cookie
 from .broadcast import BroadcastClient, BroadcastState, Wakeup
-from .cache import MAX_IMAGE_BYTES, AccountCache
+from .cache import MAX_IMAGE_BYTES, AccountCache, canonical_image_url
 from .creator_content import CreatorContent
 from .following_collection import FollowingCollection
 from .inbox import Inbox
@@ -60,20 +59,6 @@ LOGGED_API_PATHS = frozenset(
         "/web_im/v1/web_im/send_msg",
     }
 )
-
-
-def canonical_image_url(value):
-    url = urlparse(value)
-    host = url.hostname or ""
-    if (
-        url.scheme not in {"http", "https"}
-        or url.username
-        or url.password
-        or url.netloc != host
-        or not (host == "hdslb.com" or host.endswith(".hdslb.com"))
-    ):
-        return ""
-    return url._replace(scheme="https").geturl()
 
 
 class RequestGate:

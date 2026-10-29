@@ -12,6 +12,7 @@ import os
 import sqlite3
 import time
 from pathlib import Path
+from urllib.parse import urlparse
 
 from .local_store import account_folder, private_directory
 from .sources import DownloadError
@@ -24,6 +25,21 @@ THREAD_BYTES = 16 * 1024 * 1024
 MAX_RECORD = 2 * 1024 * 1024
 IMAGE_AGE = 30 * 86400
 MESSAGE_AGE = 30 * 86400
+
+
+def canonical_image_url(value):
+    """One trusted identity for network reads, disk bytes and decoded pictures."""
+    url = urlparse(value)
+    host = url.hostname or ""
+    if (
+        url.scheme not in {"http", "https"}
+        or url.username
+        or url.password
+        or url.netloc != host
+        or not (host == "hdslb.com" or host.endswith(".hdslb.com"))
+    ):
+        return ""
+    return url._replace(scheme="https").geturl()
 
 
 class AccountCache:

@@ -11,6 +11,7 @@ KINDS = ("dynamic", "followings", "history")
 TITLES = {"dynamic": "关注动态", "followings": "关注的人", "history": "观看历史"}
 PAGE_SIZE = 20
 FOLLOWING_PAGE_SIZE = 50
+CACHE_BLOCK_SIZE = 50
 log = logging.getLogger(__name__)
 
 
@@ -301,12 +302,32 @@ class AccountContent:
         self.frontiers = {}
         if cache is not None:
             for kind in KINDS:
-                saved = cache.get("content", kind)
+                saved = cache.get("content", kind, max_age=None)
                 if saved is not None:
                     try:
-                        rows = tuple(ContentItem.from_record(item) for item in saved["items"])
-                        if (kind != "followings" and len(rows) > 200) or (
-                            kind == "followings" and any(not row.key.isdecimal() for row in rows)
+                        if "items" in saved:
+                            # Convert the retained single-record view once. Only
+                            # blocks own content after this transaction commits.
+                            rows = tuple(ContentItem.from_record(item) for item in saved["items"])
+                        else:
+                            count = saved["blocks"]
+                            if type(count) is not int or count < 0:
+                                raise ValueError("Invalid content block count")
+                            rows = tuple(
+                                ContentItem.from_record(item)
+                                for index in range(count)
+                                for item in cache.get(
+                                    "content_block", f"{kind}:{index}", max_age=None
+                                )
+                            )
+                        if (
+                            len({row.key for row in rows}) != len(rows)
+                            or (
+                                kind == "followings"
+                                and any(not row.key.isdecimal() for row in rows)
+                            )
+                            or type(saved["has_more"]) is not bool
+                            or not isinstance(saved["notice"], str)
                         ):
                             raise ValueError("Invalid content cache")
                         view = ContentView(
@@ -325,8 +346,10 @@ class AccountContent:
                                 or len({row.key for row in rows}) != len(rows)
                             ):
                                 raise ValueError("Invalid following frontier")
+                        if "items" in saved:
+                            self._save(kind, rows, view.has_more, view.notice, frontier)
                         self.views[kind], self.frontiers[kind] = view, frontier
-                    except (KeyError, TypeError, ValueError):
+                    except (KeyError, TypeError, ValueError, DownloadError):
                         # Display strings are not provider truth. A stale projection
                         # must be rebuilt on demand, never disable valid DM/image caches
                         # or retain a pagination cursor without its usable pages.
@@ -345,22 +368,33 @@ class AccountContent:
             view, frontier = await self._followings(current, account_id, more, frontier)
         else:
             view, frontier = await self._history(current, more, frontier)
-        # Never store a farther pagination cursor without all pages preceding it.
-        # Larger explicitly loaded views stay in RAM; restart resumes the last
-        # complete <=200-item cache instead of skipping uncached pages.
-        if self.cache is not None and (kind == "followings" or len(view.items) <= 200):
-            self.cache.put_many(
-                {
-                    ("content", kind): {
-                        "items": [asdict(row) for row in view.items],
-                        "has_more": view.has_more,
-                        "notice": view.notice,
-                        "frontier": frontier,
-                    }
-                }
-            )
+        # Every loaded row and its forward frontier commit together. Blocks keep
+        # a long manually paged history below the per-record byte limit.
+        if self.cache is not None:
+            self._save(kind, view.items, view.has_more, view.notice, frontier)
         self.views[kind], self.frontiers[kind] = view, frontier
         return view
+
+    def _save(self, kind, rows, has_more, notice, frontier):
+        blocks = [rows[i : i + CACHE_BLOCK_SIZE] for i in range(0, len(rows), CACHE_BLOCK_SIZE)]
+        previous = self.cache.get("content", kind, max_age=None)
+        old_count = previous.get("blocks", 0) if previous else 0
+        if type(old_count) is not int or old_count < 0:
+            old_count = 0
+        records = {
+            ("content_block", f"{kind}:{index}"): [asdict(row) for row in block]
+            for index, block in enumerate(blocks)
+        }
+        records[("content", kind)] = {
+            "blocks": len(blocks),
+            "has_more": has_more,
+            "notice": notice,
+            "frontier": frontier,
+        }
+        self.cache.put_many(
+            records,
+            remove=[("content_block", f"{kind}:{i}") for i in range(len(blocks), old_count)],
+        )
 
     async def _dynamic(self, current, more, check, frontier):
         baseline = frontier.get("baseline", "")

@@ -17,6 +17,7 @@ from PyQt5.QtWidgets import (
 )
 
 from .account_content import TITLES
+from .cache import canonical_image_url
 
 
 class AccountContentPanel(QFrame):
@@ -178,5 +179,5 @@ class AccountContentPanel(QFrame):
         for index in range(self.items.topLevelItemCount()):
             item = self.items.topLevelItem(index)
             row = item.data(0, Qt.UserRole)
-            if row.image == url:
+            if canonical_image_url(row.image) == canonical_image_url(url):
                 item.setIcon(0, self.icon_for(row))

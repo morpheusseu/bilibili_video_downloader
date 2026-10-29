@@ -272,6 +272,7 @@ async def test_earlier_following_cache_restores_unknown_then_provider_marks_spec
                 next(row for row in content.views["followings"].items if row.key == "7").special
                 is True
             )
-            assert cache.get("content", "followings")["items"][6]["special"] is True
+            assert cache.get("content_block", "followings:0", max_age=None)[6]["special"] is True
+            assert "items" not in cache.get("content", "followings", max_age=None)
     finally:
         cache.close()

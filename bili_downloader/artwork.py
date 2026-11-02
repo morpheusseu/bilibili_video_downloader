@@ -1,0 +1,52 @@
+"""Bounded Qt image decoding and reusable, native circular avatars."""
+
+from PyQt5.QtCore import QBuffer, QByteArray, QIODevice, QSize, Qt
+from PyQt5.QtGui import QColor, QIcon, QImage, QImageReader, QPainter, QPainterPath, QPen, QPixmap
+
+from .theme import COLORS
+
+
+def decode_image(data, size=None):
+    return QPixmap.fromImage(decode_qimage(data, size))
+
+
+def decode_qimage(data, size=None):
+    """Decode off the GUI thread; QPixmap creation stays in the GUI thread."""
+    size = size or QSize(96, 96)
+    buffer = QBuffer()
+    buffer.setData(QByteArray(data))
+    buffer.open(QIODevice.ReadOnly)
+    reader = QImageReader(buffer)
+    source_size = reader.size()
+    if not source_size.isValid() or max(source_size.width(), source_size.height()) > 4096:
+        return QImage()
+    reader.setScaledSize(source_size.scaled(size, Qt.KeepAspectRatio))
+    return reader.read()
+
+
+def avatar_icon(pixmap, name, size=32, *, special=False):
+    canvas = QPixmap(size, size)
+    canvas.fill(Qt.transparent)
+    painter = QPainter(canvas)
+    painter.setRenderHint(QPainter.Antialiasing)
+    clip = QPainterPath()
+    clip.addEllipse(0, 0, size, size)
+    painter.setClipPath(clip)
+    painter.fillRect(canvas.rect(), QColor(COLORS["soft"]))
+    if not pixmap.isNull():
+        source = pixmap.scaled(size, size, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
+        painter.drawPixmap((size - source.width()) // 2, (size - source.height()) // 2, source)
+    else:
+        font = painter.font()
+        font.setPixelSize(size // 2)
+        font.setBold(True)
+        painter.setFont(font)
+        painter.setPen(QColor(COLORS["blue"]))
+        painter.drawText(canvas.rect(), Qt.AlignCenter, name[:1] or "B")
+    if special:
+        painter.setClipping(False)
+        painter.setBrush(Qt.NoBrush)
+        painter.setPen(QPen(QColor(COLORS["yellow"]), 2.5))
+        painter.drawEllipse(2, 2, size - 4, size - 4)
+    painter.end()
+    return QIcon(canvas)

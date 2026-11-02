@@ -97,7 +97,7 @@ class RequestGate:
                 self._last_end = time.monotonic()
 
     def check(self, status: int, code=None, *, provider_risk=False):
-        if status in {403, 412, 429} or code in {-352, -412} or provider_risk:
+        if status in {403, 412, 429} or code in {-352, -412, -509, -799} or provider_risk:
             self.stopped = True
             raise DownloadError("服务器拒绝请求或触发限流/风控，已停止；不会自动重试或绕过")
 

@@ -114,7 +114,8 @@ async def test_nonadvancing_favorite_page_is_not_success(empty):
     assert len(provider.requests) <= 2
 
 
-async def test_spacing_and_risk_latch():
+@pytest.mark.parametrize("code", [-352, -412, -509, -799])
+async def test_spacing_and_risk_latch(code):
     gate = RequestGate(0.5, 0.51)
     async with gate.request():
         pass
@@ -124,7 +125,7 @@ async def test_spacing_and_risk_latch():
 
     def deny(request):
         calls.append(request)
-        return httpx.Response(200, content=b'{"code":-352}', headers={"content-type": "text/plain"})
+        return httpx.Response(200, json={"code": code}, headers={"content-type": "text/plain"})
 
     async with Bilibili(gate=RequestGate(0, 0), transport=httpx.MockTransport(deny)) as api:
         for _ in range(2):

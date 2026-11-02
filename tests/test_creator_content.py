@@ -4,12 +4,11 @@ from copy import deepcopy
 from pathlib import Path
 
 import pytest
+from bilibili_client.account_content import AccountContent
+from bilibili_client.cache import AccountCache
+from bilibili_client.creator_content import CreatorContent
+from bilibili_client.sources import DownloadError
 from creator_provider import creator_provider
-
-from bili_downloader.account_content import AccountContent
-from bili_downloader.cache import AccountCache
-from bili_downloader.creator_content import CreatorContent
-from bili_downloader.sources import DownloadError
 
 
 def relation_reads(provider):

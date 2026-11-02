@@ -9,10 +9,10 @@ from urllib.parse import parse_qs
 
 import httpx
 import pytest
+from bilibili_client import local_store
+from bilibili_client.api import Bilibili, RequestGate
+from bilibili_client.broadcast import BroadcastClient
 
-from bili_downloader import local_store
-from bili_downloader.api import Bilibili, RequestGate
-from bili_downloader.broadcast import BroadcastClient
 from bili_downloader.download import ffmpeg_executable
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -164,6 +164,7 @@ class Provider:
             image_transport=httpx.MockTransport(image),
             broadcast_factory=self.broadcast_factory,
             cache_root=self.cache_root,
+            fetch_avatar=True,
         )
 
 

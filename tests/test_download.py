@@ -2,11 +2,11 @@ import asyncio
 
 import httpx
 import pytest
+from bilibili_client.api import RequestGate
+from bilibili_client.sources import DownloadError, Source
 from conftest import BV, Provider, playback, response
 
-from bili_downloader.api import RequestGate
 from bili_downloader.download import download_source, media_url, transfer
-from bili_downloader.sources import DownloadError, Source
 
 
 @pytest.mark.parametrize("format", ["mp4", "mp3", "wav"])

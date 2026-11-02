@@ -20,13 +20,13 @@ from bpi.errors import (
 from bpi.session import parse_cookie
 
 from .account_content import AccountContent
-from .auth import Session, normalized_cookie
 from .broadcast import BroadcastClient, BroadcastState, Wakeup
 from .cache import MAX_IMAGE_BYTES, AccountCache, canonical_image_url
 from .creator_content import CreatorContent
 from .following_collection import FollowingCollection
 from .inbox import Inbox
 from .library import FavoriteLibrary
+from .session import Session, normalized_cookie
 from .sources import DownloadError, Source, VideoPart
 
 log = logging.getLogger(__name__)
@@ -204,6 +204,7 @@ class Bilibili:
         image_transport=None,
         broadcast_factory=BroadcastClient,
         cache_root=None,
+        fetch_avatar=False,
     ):
         self.gate = gate or RequestGate()
         self.http = ApiHttpClient(self.gate, transport=transport)
@@ -222,6 +223,7 @@ class Bilibili:
         self.cache_root = cache_root
         self.cache = None
         self.cache_notice = ""
+        self.fetch_avatar = fetch_avatar
 
     async def __aenter__(self):
         return self
@@ -389,7 +391,7 @@ class Bilibili:
                     )
                     self.cache_notice = f"{error}；本次仅使用内存，未覆盖原缓存。"
             avatar = b""
-            if nav.face:
+            if self.fetch_avatar and nav.face:
                 try:
                     avatar = await self.cdn_image(nav.face)
                 except (DownloadError, httpx.HTTPError):

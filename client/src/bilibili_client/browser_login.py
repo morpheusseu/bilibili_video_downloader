@@ -8,11 +8,16 @@ from playwright.async_api import TimeoutError as BrowserTimeout
 from playwright.async_api import async_playwright
 
 from .api import Bilibili, safe_error
-from .auth import COOKIE_NAMES, Session
+from .session import COOKIE_NAMES, Session
 from .sources import DownloadError
 
 
-async def chrome_login(api: Bilibili, status: Callable[[str], None]) -> Session:
+async def chrome_login(
+    api: Bilibili,
+    status: Callable[[str], None],
+    *,
+    check_cancelled: Callable[[], None] | None = None,
+) -> Session:
     """No credentials are typed, challenges solved or existing profiles inspected."""
     if api.gate.stopped:
         raise DownloadError("当前实例已因风控/限流停止；请先在官方客户端检查，不会另开登录绕过")
@@ -44,6 +49,8 @@ async def chrome_login(api: Bilibili, status: Callable[[str], None]) -> Session:
                 status("2/4 · 请在 Chrome 的 Bilibili 官方页面扫码并确认；完成后会自动交接")
                 deadline = asyncio.get_running_loop().time() + 300
                 while asyncio.get_running_loop().time() < deadline:
+                    if check_cancelled is not None:
+                        check_cancelled()
                     stage = "读取登录状态"
                     if not browser.is_connected():
                         raise DownloadError("登录窗口已关闭；未改变已有 Chrome 登录")
@@ -61,6 +68,8 @@ async def chrome_login(api: Bilibili, status: Callable[[str], None]) -> Session:
                         if str(session.mid) != pairs["DedeUserID"]:
                             api.clear_session()
                             raise DownloadError("浏览器与 API 返回的账号不一致，已停止")
+                        if check_cancelled is not None:
+                            check_cancelled()
                         status("4/4 · 账号身份已验证，正在关闭本次临时登录窗口")
                         return session
                     if not context.pages:

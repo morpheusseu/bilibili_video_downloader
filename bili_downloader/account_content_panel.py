@@ -1,5 +1,7 @@
 """Plain-text, read-only unified feed and history; followings have their own panel."""
 
+from bilibili_client.account_content import TITLES
+from bilibili_client.cache import canonical_image_url
 from PyQt5.QtCore import QSize, Qt, pyqtSignal
 from PyQt5.QtGui import QIcon
 from PyQt5.QtWidgets import (
@@ -15,9 +17,6 @@ from PyQt5.QtWidgets import (
     QTreeWidgetItem,
     QVBoxLayout,
 )
-
-from .account_content import TITLES
-from .cache import canonical_image_url
 
 
 class AccountContentPanel(QFrame):

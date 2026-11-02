@@ -8,13 +8,12 @@ import stat
 import httpx
 import pytest
 from account_content_provider import content_provider
+from bilibili_client import cache as storage
+from bilibili_client.cache import AccountCache, account_folder
+from bilibili_client.inbox import message_text
+from bilibili_client.message_content import MessageImage, message_content
+from bilibili_client.sources import DownloadError
 from conftest import PNG, inbox_provider, private_message
-
-from bili_downloader import cache as storage
-from bili_downloader.cache import AccountCache, account_folder
-from bili_downloader.inbox import message_text
-from bili_downloader.message_content import MessageImage, message_content
-from bili_downloader.sources import DownloadError
 
 
 def persistent(provider, root):
@@ -23,7 +22,7 @@ def persistent(provider, root):
 
 
 async def test_received_messages_images_and_selection_restore_without_refetch(tmp_path, caplog):
-    caplog.set_level("INFO", logger="bili_downloader")
+    caplog.set_level("INFO", logger="bilibili_client")
     provider, state = inbox_provider()
     persistent(provider, tmp_path)
     url = "https://i0.hdslb.com/bfs/face/PATH_SECRET.png?token=QUERY_SECRET"
@@ -48,7 +47,7 @@ async def test_received_messages_images_and_selection_restore_without_refetch(tm
         assert await api.cdn_image(url) == PNG
         assert len(provider.requests) == before and len(provider.images) == images
         own_logs = "\n".join(
-            r.getMessage() for r in caplog.records if r.name.startswith("bili_downloader.")
+            r.getMessage() for r in caplog.records if r.name.startswith("bilibili_client.")
         )
         assert own_logs.count("endpoint=cdn.image") == 1
         assert "Image cache reused bytes=" in own_logs
@@ -387,7 +386,7 @@ async def test_cdn_image_limit_is_twenty_mib_and_logs_only_sizes(tmp_path, caplo
         200, content=body, headers={"content-type": "image/png"}
     )
     url = "https://i0.hdslb.com/PATH_SECRET.png?token=QUERY_SECRET"
-    caplog.set_level("INFO", logger="bili_downloader")
+    caplog.set_level("INFO", logger="bilibili_client")
     async with provider.api() as api:
         await api.use_cookie("SESSDATA=synthetic; DedeUserID=42")
         result = await api.cdn_image(url)
@@ -398,7 +397,7 @@ async def test_cdn_image_limit_is_twenty_mib_and_logs_only_sizes(tmp_path, caplo
             assert result == b"" and api.cache.image(url) is None
         assert len(provider.images) == 1
     own_logs = "\n".join(
-        r.getMessage() for r in caplog.records if r.name.startswith("bili_downloader.")
+        r.getMessage() for r in caplog.records if r.name.startswith("bilibili_client.")
     )
     assert "endpoint=cdn.image" in own_logs
     assert "SECRET" not in own_logs and "SESSDATA" not in own_logs

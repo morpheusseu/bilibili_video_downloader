@@ -8,6 +8,10 @@ from functools import partial
 import httpx
 import pytest
 from account_content_provider import content_provider, dynamic
+from bilibili_client.account_content import ContentItem, ContentView
+from bilibili_client.broadcast import BroadcastClient, BroadcastState
+from bilibili_client.cache import AccountCache, account_folder
+from bilibili_client.sources import DownloadError, Source
 from broadcast_peer import BroadcastPeer, notice
 from conftest import (
     BV,
@@ -25,14 +29,10 @@ from PyQt5.QtWidgets import QApplication, QMessageBox, QStyleOptionViewItem
 from websockets.exceptions import ConnectionClosedError
 
 from bili_downloader import gui
-from bili_downloader.account_content import ContentItem, ContentView
 from bili_downloader.auth import Session
-from bili_downloader.broadcast import BroadcastClient, BroadcastState
-from bili_downloader.cache import AccountCache, account_folder
 from bili_downloader.download import Progress, Result
 from bili_downloader.inbox_panel import ReplyEditor
 from bili_downloader.message_rendering import CONTENT_ROLE
-from bili_downloader.sources import DownloadError, Source
 from bili_downloader.theme import COLORS
 
 
@@ -1408,7 +1408,7 @@ def paused_live_inbox_provider():
 def test_foreground_resume_retry_indicator_and_gap_recovery_through_real_worker(
     app, window, monkeypatch
 ):
-    import bili_downloader.broadcast as module
+    import bilibili_client.broadcast as module
 
     monkeypatch.setattr(module, "RECONNECT_BASE_SECONDS", 0.6)
     widget, provider = window

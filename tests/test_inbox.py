@@ -1,10 +1,9 @@
 import json
 
 import pytest
+from bilibili_client.inbox import message_text
+from bilibili_client.sources import DownloadError
 from conftest import inbox_provider, private_message
-
-from bili_downloader.inbox import message_text
-from bili_downloader.sources import DownloadError
 
 
 async def test_read_only_inbox_categories_pagination_and_selected_history():

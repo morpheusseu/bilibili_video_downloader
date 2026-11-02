@@ -5,13 +5,12 @@ from copy import deepcopy
 
 import httpx
 import pytest
+from bilibili_client.api import Bilibili, RequestGate
+from bilibili_client.cache import AccountCache
+from bilibili_client.creator_content import CreatorContent
+from bilibili_client.sources import DownloadError
 from conftest import response
 from creator_provider import creator_provider
-
-from bili_downloader.api import Bilibili, RequestGate
-from bili_downloader.cache import AccountCache
-from bili_downloader.creator_content import CreatorContent
-from bili_downloader.sources import DownloadError
 
 RECENT_PATHS = {
     "/x/space/like/video",

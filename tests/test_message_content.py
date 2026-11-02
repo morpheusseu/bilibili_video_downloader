@@ -1,11 +1,10 @@
 import json
 
 import pytest
+from bilibili_client.inbox import message_text
+from bilibili_client.message_content import MessageImage, message_content
+from bilibili_client.provider_views import ReceivedMessage
 from conftest import private_message
-
-from bili_downloader.inbox import message_text
-from bili_downloader.message_content import MessageImage, message_content
-from bili_downloader.provider_views import ReceivedMessage
 
 
 @pytest.mark.parametrize(

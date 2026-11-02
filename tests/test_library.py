@@ -1,14 +1,14 @@
 import httpx
 import pytest
+from bilibili_client import local_store
+from bilibili_client.api import Bilibili, RequestGate
+from bilibili_client.cache import AccountCache
+from bilibili_client.library import FavoriteLibrary
+from bilibili_client.sources import DownloadError
 from bpi.errors import HttpStatusError
 from conftest import PNG, favorite_item, library_provider, response
 
-from bili_downloader import local_store
-from bili_downloader.api import Bilibili, RequestGate
 from bili_downloader.auth import load_session, save_session
-from bili_downloader.cache import AccountCache
-from bili_downloader.library import FavoriteLibrary
-from bili_downloader.sources import DownloadError
 
 
 def detail_calls(provider):
@@ -96,7 +96,7 @@ async def test_batch_metadata_failure_never_replaces_membership_or_retries_per_v
 async def test_minute_checks_refresh_directory_only_every_ten_minutes_and_force_is_immediate(
     caplog,
 ):
-    caplog.set_level("INFO", logger="bili_downloader.library")
+    caplog.set_level("INFO", logger="bilibili_client.library")
     provider, _ = library_provider(1)
     now = [0.0]
     async with provider.api() as api:
@@ -418,6 +418,7 @@ async def test_login_profile_fetches_avatar_once_without_credentials(image_statu
         gate=RequestGate(0, 0),
         transport=httpx.MockTransport(nav),
         image_transport=httpx.MockTransport(picture),
+        fetch_avatar=True,
     ) as api:
         session = await api.use_cookie(
             "SESSDATA=synthetic; DedeUserID=42", user_agent="Synthetic Chrome"

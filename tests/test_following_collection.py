@@ -3,13 +3,12 @@ from dataclasses import asdict
 
 import pytest
 from account_content_provider import content_provider
+from bilibili_client.account_content import AccountContent, ContentItem
+from bilibili_client.cache import AccountCache
+from bilibili_client.creator_content import CreatorEntry
+from bilibili_client.following_collection import FollowingCollection
+from bilibili_client.sources import DownloadError
 from creator_provider import creator_provider
-
-from bili_downloader.account_content import AccountContent, ContentItem
-from bili_downloader.cache import AccountCache
-from bili_downloader.creator_content import CreatorEntry
-from bili_downloader.following_collection import FollowingCollection
-from bili_downloader.sources import DownloadError
 
 
 async def drain(api):

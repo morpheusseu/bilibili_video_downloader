@@ -10,6 +10,14 @@ from collections.abc import Callable
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
+from bilibili_client import local_store
+from bilibili_client.account_content import TITLES, ContentView
+from bilibili_client.api import Bilibili, safe_error
+from bilibili_client.browser_login import chrome_login
+from bilibili_client.cache import canonical_image_url
+from bilibili_client.inbox import InboxView, MessageView, SendReceipt, validate_reply
+from bilibili_client.library import FavoriteView
+from bilibili_client.sources import DownloadError, parse_source
 from PyQt5.QtCore import (
     QSettings,
     QSize,
@@ -52,22 +60,14 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
-from . import local_store
-from .account_content import TITLES, ContentView
 from .account_content_panel import AccountContentPanel
 from .account_dialog import AccountDialog
-from .api import Bilibili, safe_error
 from .artwork import avatar_icon, decode_image, decode_qimage
 from .auth import Session, forget_session, load_session, save_session
-from .browser_login import chrome_login
-from .cache import canonical_image_url
 from .download import Progress, download_source
 from .download_button import DownloadButton
 from .following_panel import FollowingPanel
-from .inbox import InboxView, MessageView, SendReceipt, validate_reply
 from .inbox_panel import InboxPanel
-from .library import FavoriteView
-from .sources import DownloadError, parse_source
 from .theme import STYLE
 
 ARTWORK_BYTES = 256 * 1024 * 1024
@@ -95,7 +95,9 @@ class Engine(QThread):
 
     def __init__(self, parent=None, api_factory: Callable | None = None):
         super().__init__(parent)
-        self.api_factory = api_factory or (lambda: Bilibili(cache_root=local_store.data_root()))
+        self.api_factory = api_factory or (
+            lambda: Bilibili(cache_root=local_store.data_root(), fetch_avatar=True)
+        )
         self.ready = threading.Event()
         self.future = None
         self.active = None
@@ -2046,9 +2048,10 @@ def main():
         handler.setFormatter(
             logging.Formatter("%(asctime)s %(levelname)s pid=%(process)d %(message)s")
         )
-        logger = logging.getLogger("bili_downloader")
-        logger.setLevel(logging.INFO)
-        logger.addHandler(handler)
+        for namespace in ("bili_downloader", "bilibili_client"):
+            logger = logging.getLogger(namespace)
+            logger.setLevel(logging.INFO)
+            logger.addHandler(handler)
     except OSError:
         pass  # A read-only log directory must not make the application unusable.
     window = MainWindow()

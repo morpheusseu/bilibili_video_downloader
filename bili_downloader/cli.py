@@ -6,11 +6,12 @@ import json
 from dataclasses import asdict
 from pathlib import Path
 
-from .api import Bilibili, safe_error
+from bilibili_client.api import Bilibili, safe_error
+from bilibili_client.browser_login import chrome_login
+from bilibili_client.sources import DownloadError, parse_source
+
 from .auth import load_session, save_session
-from .browser_login import chrome_login
 from .download import download_source
-from .sources import DownloadError, parse_source
 
 
 async def run(args):

@@ -2,11 +2,11 @@ import os
 import stat
 
 import pytest
+from bilibili_client import local_store
+from bilibili_client.api import safe_error
+from bilibili_client.sources import DownloadError
 
-from bili_downloader import local_store
-from bili_downloader.api import safe_error
 from bili_downloader.auth import Session, forget_session, load_session, save_session
-from bili_downloader.sources import DownloadError
 
 
 def session(account_id=42):

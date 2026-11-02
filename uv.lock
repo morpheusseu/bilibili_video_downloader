@@ -38,16 +38,32 @@ wheels = [
 ]
 
 [[package]]
+name = "bilibili-client"
+version = "0.1.0"
+source = { editable = "client" }
+dependencies = [
+    { name = "bpi-py" },
+    { name = "httpx" },
+    { name = "playwright" },
+    { name = "websockets" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "bpi-py", specifier = "==0.3.1" },
+    { name = "httpx", specifier = "==0.28.1" },
+    { name = "playwright", specifier = ">=1.50,<2" },
+    { name = "websockets", specifier = "==15.0.1" },
+]
+
+[[package]]
 name = "bilibili-video-downloader"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
-    { name = "bpi-py" },
-    { name = "httpx" },
+    { name = "bilibili-client" },
     { name = "imageio-ffmpeg" },
-    { name = "playwright" },
     { name = "pyqt5" },
-    { name = "websockets" },
 ]
 
 [package.dev-dependencies]
@@ -62,12 +78,9 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "bpi-py", specifier = "==0.3.1" },
-    { name = "httpx", specifier = "==0.28.1" },
+    { name = "bilibili-client", editable = "client" },
     { name = "imageio-ffmpeg", specifier = "==0.6.0" },
-    { name = "playwright", specifier = ">=1.50,<2" },
     { name = "pyqt5", specifier = "==5.15.11" },
-    { name = "websockets", specifier = "==15.0.1" },
 ]
 
 [package.metadata.requires-dev]

@@ -2,9 +2,8 @@ import asyncio
 
 import pytest
 from account_content_provider import content_provider, dynamic
-
-from bili_downloader.api import safe_error
-from bili_downloader.sources import DownloadError
+from bilibili_client.api import safe_error
+from bilibili_client.sources import DownloadError
 
 
 async def test_three_read_only_surfaces_paginate_through_real_sdk_and_shared_gate():

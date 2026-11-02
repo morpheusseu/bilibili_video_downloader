@@ -7,16 +7,15 @@ https://github.com/BACNext/bilibili-API-collect-backup/blob/master/docs/dynamic/
 
 import httpx
 import pytest
-from bpi.errors import ApiError, InvalidParameterError, MissingDataError, ResponseDecodeError
-
-from bili_downloader.api import Bilibili, RequestGate
-from bili_downloader.provider_views import (
+from bilibili_client.api import Bilibili, RequestGate
+from bilibili_client.provider_views import (
     FeedPage,
     own_dynamic_page,
     recent_coined_videos,
     recent_liked_videos,
 )
-from bili_downloader.sources import DownloadError
+from bilibili_client.sources import DownloadError
+from bpi.errors import ApiError, InvalidParameterError, MissingDataError, ResponseDecodeError
 
 
 def feed():

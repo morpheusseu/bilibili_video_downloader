@@ -3,6 +3,8 @@
 import logging
 import time
 
+from bilibili_client.account_content import local_time
+from bilibili_client.cache import canonical_image_url
 from PyQt5.QtCore import QSize, Qt, pyqtSignal
 from PyQt5.QtGui import QIcon
 from PyQt5.QtWidgets import (
@@ -20,9 +22,6 @@ from PyQt5.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-
-from .account_content import local_time
-from .cache import canonical_image_url
 
 log = logging.getLogger(__name__)
 

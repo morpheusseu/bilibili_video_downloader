@@ -2,6 +2,9 @@
 
 from datetime import datetime
 
+from bilibili_client.cache import canonical_image_url
+from bilibili_client.inbox import message_text
+from bilibili_client.message_content import MessageImage, message_content
 from PyQt5.QtCore import QSize, Qt, pyqtSignal
 from PyQt5.QtGui import QKeySequence, QPixmap
 from PyQt5.QtWidgets import (
@@ -23,9 +26,6 @@ from PyQt5.QtWidgets import (
 )
 
 from .artwork import avatar_icon
-from .cache import canonical_image_url
-from .inbox import message_text
-from .message_content import MessageImage, message_content
 from .message_rendering import CONTENT_ROLE, HEADER_ROLE, MessageDelegate
 from .theme import COLORS
 

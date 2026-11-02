@@ -11,9 +11,8 @@ from urllib.parse import urljoin, urlparse
 
 import httpx
 import imageio_ffmpeg
-
-from .api import Bilibili
-from .sources import DownloadError, Source, VideoPart
+from bilibili_client.api import Bilibili
+from bilibili_client.sources import DownloadError, Source, VideoPart
 
 
 @dataclass(frozen=True)

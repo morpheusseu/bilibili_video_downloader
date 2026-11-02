@@ -4,13 +4,12 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
+from bilibili_client import browser_login
+from bilibili_client.api import Bilibili, RequestGate
+from bilibili_client.sources import DownloadError, Source, VideoPart, parse_source
 from conftest import BV, Provider, favorite_item, folder_info, response
 from playwright.async_api import Error as BrowserError
 from playwright.async_api import TimeoutError as BrowserTimeout
-
-from bili_downloader import browser_login
-from bili_downloader.api import Bilibili, RequestGate
-from bili_downloader.sources import DownloadError, Source, VideoPart, parse_source
 
 
 @pytest.mark.parametrize(
@@ -136,7 +135,7 @@ async def test_spacing_and_risk_latch():
 
 @pytest.mark.parametrize("mode", ["read", "send", "unknown", "risk", "timeout", "cancel"])
 async def test_http_diagnostics_never_log_credentials_payloads_or_arbitrary_paths(caplog, mode):
-    caplog.set_level(logging.INFO, logger="bili_downloader")
+    caplog.set_level(logging.INFO, logger="bilibili_client")
 
     def handler(request):
         if mode == "timeout":
@@ -174,7 +173,7 @@ async def test_http_diagnostics_never_log_credentials_payloads_or_arbitrary_path
                 await api.http.send(request)
         else:
             await api.http.send(request)
-    records = [r.getMessage() for r in caplog.records if r.name == "bili_downloader.api"]
+    records = [r.getMessage() for r in caplog.records if r.name == "bilibili_client.api"]
     assert len(records) == 1
     text = records[0]
     assert "HTTP request=1 endpoint=" in text and "gap_ms=" in text and "duration_ms=" in text

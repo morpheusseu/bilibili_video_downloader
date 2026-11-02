@@ -3,6 +3,9 @@
 基于 **bpi-py 0.3.1** 的独立 PyQt5 桌面应用：下载视频和音频，浏览收藏、关注动态与观看历史，
 通过 Broadcast 接收私信通知。也提供共享同一下载引擎的 CLI；不依赖 Boxy。
 
+登录、接口解析和 Broadcast 实现在独立的[无界面 Python 客户端](client/README.md)中，
+可供 connector 复用；该包不依赖 PyQt 或 FFmpeg，默认不请求头像和封面。
+
 ## 快速开始
 
 需要 Python 3.11+、[uv](https://docs.astral.sh/uv/)；账号登录还需要已安装的 **Google Chrome**。

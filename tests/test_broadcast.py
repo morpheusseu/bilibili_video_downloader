@@ -3,16 +3,8 @@ from functools import partial
 from types import SimpleNamespace
 
 import pytest
-from broadcast_peer import BroadcastPeer, notice
-from conftest import inbox_provider, private_message
-from websockets.datastructures import Headers
-from websockets.exceptions import ConnectionClosedError, InvalidStatus
-from websockets.frames import Close
-from websockets.http11 import Response
-
-from bili_downloader.api import RequestGate
-from bili_downloader.auth import Session
-from bili_downloader.broadcast import (
+from bilibili_client.api import RequestGate
+from bilibili_client.broadcast import (
     WATCH,
     BroadcastClient,
     _blob,
@@ -20,7 +12,15 @@ from bili_downloader.broadcast import (
     _one,
     _wakeup,
 )
-from bili_downloader.sources import DownloadError
+from bilibili_client.sources import DownloadError
+from broadcast_peer import BroadcastPeer, notice
+from conftest import inbox_provider, private_message
+from websockets.datastructures import Headers
+from websockets.exceptions import ConnectionClosedError, InvalidStatus
+from websockets.frames import Close
+from websockets.http11 import Response
+
+from bili_downloader.auth import Session
 
 
 async def until(condition):
@@ -51,7 +51,7 @@ def test_current_official_nested_payload_and_private_routing():
 
 
 async def test_actual_transport_auth_subscribe_ack_and_heartbeats(monkeypatch):
-    import bili_downloader.broadcast as module
+    import bilibili_client.broadcast as module
 
     monkeypatch.setattr(module, "HEARTBEAT_SECONDS", 0.02)
     peer, states, hints = BroadcastPeer(), [], []
@@ -109,7 +109,7 @@ async def test_provider_or_protocol_rejection_closes_once_without_reconnecting(f
 async def test_missed_heartbeat_is_not_an_immediate_failure_but_full_silence_stops(
     monkeypatch, silent
 ):
-    import bili_downloader.broadcast as module
+    import bilibili_client.broadcast as module
 
     monkeypatch.setattr(module, "HEARTBEAT_SECONDS", 0.02)
     peer = BroadcastPeer(drop_heartbeats=range(1, 10) if silent else (2,))
@@ -220,7 +220,7 @@ async def test_incremental_backlog_drains_before_committing_cursor_and_preserves
 async def test_foreground_probe_recovers_half_open_connection_and_gap_without_replaying_writes(
     monkeypatch,
 ):
-    import bili_downloader.broadcast as module
+    import bilibili_client.broadcast as module
 
     monkeypatch.setattr(module, "CHECK_TIMEOUT_SECONDS", 0.02)
     monkeypatch.setattr(module, "RECONNECT_BASE_SECONDS", 0.01)
@@ -280,7 +280,7 @@ async def test_healthy_foreground_check_coalesces_without_dropping_simultaneous_
 
 
 async def test_reconnect_jitter_is_capped_and_foreground_never_bypasses_backoff(monkeypatch):
-    import bili_downloader.broadcast as module
+    import bilibili_client.broadcast as module
 
     monkeypatch.setattr(module, "RECONNECT_BASE_SECONDS", 0.04)
     monkeypatch.setattr(module, "RECONNECT_MAX_SECONDS", 0.06)
@@ -327,7 +327,7 @@ async def test_reconnect_jitter_is_capped_and_foreground_never_bypasses_backoff(
 
 @pytest.mark.parametrize("stable", [False, True])
 async def test_only_healthy_stability_not_auth_handshake_resets_retry_budget(monkeypatch, stable):
-    import bili_downloader.broadcast as module
+    import bilibili_client.broadcast as module
 
     monkeypatch.setattr(module, "HEARTBEAT_SECONDS", 0.005)
     monkeypatch.setattr(module, "STABLE_CONNECTION_SECONDS", 0.02 if stable else 1000)

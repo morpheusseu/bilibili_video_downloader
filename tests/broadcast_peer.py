@@ -2,7 +2,7 @@
 
 import asyncio
 
-from bili_downloader.broadcast import BASE, URL, WATCH, _blob, _fields, _number, _one
+from bilibili_client.broadcast import BASE, URL, WATCH, _blob, _fields, _number, _one
 
 
 def server_frame(path, sequence=0, *, body=b"", status=0, ack=False):

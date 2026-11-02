@@ -3,11 +3,11 @@
 import hashlib
 from html import escape
 
+from bilibili_client.message_content import MessageImage
 from PyQt5.QtCore import QRect, QSize, Qt, QUrl
 from PyQt5.QtGui import QIcon, QTextDocument
 from PyQt5.QtWidgets import QStyle, QStyledItemDelegate, QStyleOptionViewItem
 
-from .message_content import MessageImage
 from .theme import COLORS
 
 CONTENT_ROLE = Qt.UserRole + 3
